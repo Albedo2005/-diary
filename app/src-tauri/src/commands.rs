@@ -46,18 +46,59 @@ pub struct AppStatus {
 }
 
 /// 全局可共享的应用状态。
+///
+/// ⚠️ 为什么内部套一层 `Arc`，而不是把 `Arc<VaultState>` 注册给 Tauri：
+///   命令签名声明的是 `State<'_, VaultState>`，Tauri 按**具体类型**查找状态，
+///   所以注册进去的必须正好是 `VaultState`。
+///   注册 `Arc<VaultState>` 会导致运行时报
+///   "state not managed for field `state` on command ..."
+///   （这个错误在本项目里真实发生过）。
+///
+///   而 `VaultState` 又需要被两处共享：
+///     1. Tauri 的状态管理
+///     2. 后台自动备份线程
+///   解决办法：把真正需要共享的内容放进 `Arc<VaultStateInner>`，
+///   然后 `VaultState` 实现 `Clone`（克隆只是 Arc 计数 +1）。
+///   这样注册的是 `VaultState` 本身，而所有克隆共享同一份数据。
 pub struct VaultState {
-    pub data_dir: PathBuf,
+    inner: std::sync::Arc<VaultStateInner>,
+}
+
+/// 被共享的实际内容。所有字段都是 `Sync` 的。
+struct VaultStateInner {
+    data_dir: PathBuf,
     /// 已解锁的数据库连接。None 表示未解锁。
-    pub vault: Mutex<Option<Vault>>,
+    vault: Mutex<Option<Vault>>,
+}
+
+impl Clone for VaultState {
+    /// 克隆出的副本与原件**共享同一份数据**（Arc 语义），
+    /// 所以后台线程看到的解锁状态与命令层完全一致。
+    fn clone(&self) -> Self {
+        Self {
+            inner: std::sync::Arc::clone(&self.inner),
+        }
+    }
 }
 
 impl VaultState {
     pub fn new(data_dir: PathBuf) -> Self {
         Self {
-            data_dir,
-            vault: Mutex::new(None),
+            inner: std::sync::Arc::new(VaultStateInner {
+                data_dir,
+                vault: Mutex::new(None),
+            }),
         }
+    }
+
+    /// 数据目录。命令层与备份逻辑都用它。
+    pub fn data_dir(&self) -> &PathBuf {
+        &self.inner.data_dir
+    }
+
+    /// 借用已解锁的连接。
+    pub fn vault(&self) -> &Mutex<Option<Vault>> {
+        &self.inner.vault
     }
 }
 
@@ -113,7 +154,7 @@ pub fn resolve_data_dir() -> AppResult<PathBuf> {
 
 fn with_vault<T>(state: &State<'_, VaultState>, f: impl FnOnce(&Vault) -> AppResult<T>) -> AppResult<T> {
     let guard = state
-        .vault
+        .vault()
         .lock()
         .map_err(|_| AppError::State("内部状态锁已损坏".into()))?;
     match guard.as_ref() {
@@ -128,16 +169,16 @@ fn with_vault<T>(state: &State<'_, VaultState>, f: impl FnOnce(&Vault) -> AppRes
 
 #[tauri::command]
 pub fn app_status(state: State<'_, VaultState>) -> AppResult<AppStatus> {
-    let lock_path = crypto::lockout_path(&state.data_dir);
+    let lock_path = crypto::lockout_path(state.data_dir());
     let mut lockout = crypto::LockoutState::load(&lock_path);
-    let db_exists = state.data_dir.join("diary.db").exists();
+    let db_exists = state.data_dir().join("diary.db").exists();
 
     // 若锁定已过期，顺手清理（会写回文件）。
     let _ = lockout.check_not_locked(&lock_path);
     let remaining_secs = lockout.remaining_lock_secs();
 
     let unlocked = state
-        .vault
+        .vault()
         .lock()
         .map(|g| g.is_some())
         .unwrap_or(false);
@@ -153,7 +194,7 @@ pub fn app_status(state: State<'_, VaultState>) -> AppResult<AppStatus> {
         pin_min_len: lockout.pin_min_len,
         max_attempts: crypto::MAX_FAILED_ATTEMPTS,
         lockout_secs: crypto::LOCKOUT_DURATION.as_secs(),
-        data_dir: state.data_dir.to_string_lossy().to_string(),
+        data_dir: state.data_dir().to_string_lossy().to_string(),
     })
 }
 
@@ -174,7 +215,7 @@ pub fn initialize_vault(
     pin: String,
     hint: Option<String>,
 ) -> AppResult<()> {
-    let lock_path = crypto::lockout_path(&state.data_dir);
+    let lock_path = crypto::lockout_path(state.data_dir());
     let mut lockout = crypto::LockoutState::load(&lock_path);
 
     // 初始化也必须受锁定期约束，否则可以在锁定期内反复重建库绕过限制。
@@ -192,10 +233,10 @@ pub fn initialize_vault(
         }
     });
 
-    let vault = Vault::create(&state.data_dir, &pin, hint)?;
+    let vault = Vault::create(state.data_dir(), &pin, hint)?;
 
     let mut guard = state
-        .vault
+        .vault()
         .lock()
         .map_err(|_| AppError::State("内部状态锁已损坏".into()))?;
     *guard = Some(vault);
@@ -215,17 +256,17 @@ pub fn initialize_vault(
 ///   - 达到上限后进入锁定期
 #[tauri::command]
 pub fn unlock_vault(state: State<'_, VaultState>, pin: String) -> AppResult<AppStatus> {
-    let lock_path = crypto::lockout_path(&state.data_dir);
+    let lock_path = crypto::lockout_path(state.data_dir());
     let mut lockout = crypto::LockoutState::load(&lock_path);
 
     // 先检查锁定期。锁定中不消耗尝试次数，也不做密钥派生（省掉无谓的 0.8 秒）。
     lockout.check_not_locked(&lock_path)?;
 
-    match Vault::unlock(&state.data_dir, &pin) {
+    match Vault::unlock(state.data_dir(), &pin) {
         Ok(vault) => {
             {
                 let mut guard = state
-                    .vault
+                    .vault()
                     .lock()
                     .map_err(|_| AppError::State("内部状态锁已损坏".into()))?;
                 *guard = Some(vault);
@@ -252,7 +293,7 @@ pub fn unlock_vault(state: State<'_, VaultState>, pin: String) -> AppResult<AppS
 pub fn lock_vault(state: State<'_, VaultState>) -> AppResult<AppStatus> {
     {
         let mut guard = state
-            .vault
+            .vault()
             .lock()
             .map_err(|_| AppError::State("内部状态锁已损坏".into()))?;
         // 直接 drop 连接。密钥随连接对象一起被释放。
@@ -348,7 +389,7 @@ pub fn backup_now(state: State<'_, VaultState>, dest_dir: String) -> AppResult<B
         let (r, _deleted) = v.run_backup(&PathBuf::from(&dest_dir), &stamp_text)?;
         Ok(r)
     })?;
-    copy_crypto_meta(&state.data_dir, &dest_dir, &stamp_text)?;
+    copy_crypto_meta(state.data_dir(), &dest_dir, &stamp_text)?;
     Ok(result)
 }
 
@@ -379,7 +420,7 @@ pub fn default_backup_dir(data_dir: &std::path::Path) -> PathBuf {
 
 #[tauri::command]
 pub fn backup_status(state: State<'_, VaultState>) -> AppResult<BackupStatus> {
-    let dest = default_backup_dir(&state.data_dir);
+    let dest = default_backup_dir(state.data_dir());
     let dest_str = dest.to_string_lossy().to_string();
     let count = std::fs::read_dir(&dest)
         .map(|it| {
@@ -428,8 +469,11 @@ pub const AUTO_BACKUP_CHECK_INTERVAL: std::time::Duration =
 ///   SQLite 调用 —— 放在 async 里只会阻塞执行器线程，没有任何收益。
 ///   一个独立线程语义更清晰，也不需要额外引入运行时依赖。
 ///
+/// 参数是 `VaultState` 的克隆（内部共享同一份 Arc），
+/// 所以这个线程看到的解锁状态与命令层完全一致。
+///
 /// 线程会随进程退出而结束（detached），不需要 join。
-pub fn spawn_auto_backup(state: std::sync::Arc<VaultState>) {
+pub fn spawn_auto_backup(state: VaultState) {
     std::thread::Builder::new()
         .name("auto-backup".into())
         .spawn(move || loop {
@@ -446,7 +490,7 @@ pub fn spawn_auto_backup(state: std::sync::Arc<VaultState>) {
 fn try_auto_backup(state: &VaultState) -> AppResult<Option<BackupResult>> {
     // 未解锁：跳过。这是正常状态，不算错误。
     let guard = state
-        .vault
+        .vault()
         .lock()
         .map_err(|_| AppError::State("内部状态锁已损坏".into()))?;
     let Some(vault) = guard.as_ref() else {
@@ -472,13 +516,13 @@ fn try_auto_backup(state: &VaultState) -> AppResult<Option<BackupResult>> {
     }
 
     let stamp = now_stamp();
-    let dest = default_backup_dir(&state.data_dir);
+    let dest = default_backup_dir(state.data_dir());
     let (result, deleted) = vault.run_backup(&dest, &stamp)?;
     // 先释放锁再做文件复制，缩短持锁时间。
     drop(guard);
 
     // meta 文件必须一起写，否则备份根本无法解锁。
-    copy_crypto_meta(&state.data_dir, &dest.to_string_lossy(), &stamp)?;
+    copy_crypto_meta(state.data_dir(), &dest.to_string_lossy(), &stamp)?;
 
     eprintln!(
         "自动备份完成: {} ({} 字节)，清理旧备份 {} 个文件",
@@ -554,7 +598,7 @@ pub fn rebuild_indexes(state: State<'_, VaultState>) -> AppResult<usize> {
 /// 加密元信息摘要，仅供设置页展示（**不含 salt 与密钥**）。
 #[tauri::command]
 pub fn crypto_info(state: State<'_, VaultState>) -> AppResult<CryptoInfo> {
-    let meta_path = crypto::crypto_meta_path(&state.data_dir);
+    let meta_path = crypto::crypto_meta_path(state.data_dir());
     let meta = CryptoMeta::load(&meta_path)?.ok_or_else(|| AppError::State("缺少加密元信息".into()))?;
     Ok(CryptoInfo {
         kdf: meta.kdf.clone(),

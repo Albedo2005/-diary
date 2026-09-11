@@ -58,9 +58,18 @@ pub fn run() {
             // VaultState 需要被两处共享：
             //   1. Tauri 的状态管理（前端调用 command 时使用）
             //   2. 后台自动备份线程
-            // 所以包成 Arc，两处各持一个引用。
-            let state = std::sync::Arc::new(VaultState::new(data_dir));
+            //
+            // ⚠️ 必须注册 `VaultState` 本身，不能注册 `Arc<VaultState>`。
+            //    命令签名声明的是 `State<'_, VaultState>`，Tauri 按**具体类型**
+            //    查找状态；注册 Arc 会运行时报
+            //    "state not managed for field `state` on command ..."
+            //    （这个错误在本项目真实发生过）。
+            //
+            //    共享问题由 VaultState 内部持有的 Arc 解决：
+            //    `clone()` 只是 Arc 计数 +1，两份共享同一份数据。
+            let state = VaultState::new(data_dir);
             app.manage(state.clone());
+            // 后台线程持有另一个克隆，与命令层看到的是同一份解锁状态。
             commands::spawn_auto_backup(state);
             Ok(())
         })

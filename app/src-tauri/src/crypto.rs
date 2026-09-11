@@ -136,6 +136,12 @@ pub fn calibrate_kdf_params(salt: &[u8; SALT_LEN], sample_pin: &[u8]) -> KdfPara
         if elapsed >= KDF_TARGET_MIN_MS {
             return candidate;
         }
+        // 已经超过上限说明这台机器偏慢，再往上加只会让解锁更难受。
+        // 停在当前档位。这一条是重构时曾漏掉的判断，测试没覆盖到，
+        // 但编译器的 unused 警告把它暴露了出来。
+        if elapsed > KDF_TARGET_MAX_MS {
+            return candidate;
+        }
         // 还没到区间但已到内存上限 -> 只能用这一档了
         if mib >= KDF_CALIBRATE_MAX_MIB {
             return candidate;
