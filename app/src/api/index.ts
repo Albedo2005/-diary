@@ -49,6 +49,8 @@ export interface Entry {
   content_md: string;
   word_count: number;
   mood: number | null;
+  /** 锁定：true = 只读不可改。锁的是内容，排版原样保留。 */
+  locked: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -187,6 +189,13 @@ export const isDateWritten = (date: string) =>
 
 export const saveEntry = (date: string, title: string, contentMd: string) =>
   invoke<Entry>("save_entry", { date, title, contentMd });
+
+/** 锁定 / 解锁某天。只改"能否修改"，不动正文。 */
+export const setEntryLocked = (date: string, locked: boolean) =>
+  invoke<Entry>("set_entry_locked", { date, locked });
+
+/** 一次性锁上所有日记。切换日期、重新打开软件时调用。返回被锁的篇数。 */
+export const lockAllEntries = () => invoke<number>("lock_all_entries");
 
 export const deleteEntry = (date: string) =>
   invoke<void>("delete_entry", { date });

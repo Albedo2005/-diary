@@ -41,6 +41,11 @@ pub struct Entry {
     pub content_md: String,
     pub word_count: i64,
     pub mood: Option<i64>,
+    /// 锁定：true = 只读，不可修改。
+    ///
+    /// ⚠️ 锁的是**内容**，不是排版。锁定时正文按原文一字不改地显示，
+    ///    用户手动排的换行与空格全部保留。
+    pub locked: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -330,7 +335,7 @@ impl Vault {
 
     /// schema 版本检查与升级。
     ///
-    /// 当前只有版本 1。将来加字段时在这里按版本分支处理，并且**必须先备份**
+    /// 加字段时在这里按版本分支处理，并且**必须先备份**
     /// 再迁移 —— 迁移失败导致用户日记打不开是最严重的事故。
     fn migrate(&self) -> AppResult<()> {
         let version: Option<i64> = self
@@ -351,9 +356,52 @@ impl Vault {
                     schema::SCHEMA_VERSION
                 )));
             }
-            Some(_) => { /* 版本相同或更低：将来的升级分支写在这里 */ }
+            Some(v) if v < schema::SCHEMA_VERSION => {
+                self.upgrade_from(v)?;
+            }
+            Some(_) => { /* 版本相同：无需处理 */ }
         }
         Ok(())
+    }
+
+    /// 把旧版本的库升到 `schema::SCHEMA_VERSION`。
+    ///
+    /// 版本历史：
+    ///   - v1 -> v2：加 `entry.locked`（每篇日记各自记忆锁定状态）
+    fn upgrade_from(&self, from: i64) -> AppResult<()> {
+        // 先备份再动结构。备份失败就别升了 —— 宁可这次打不开，
+        // 也不能在没有退路的情况下去改用户唯一的一份数据。
+        self.backup_before_upgrade(from)?;
+
+        let tx = self.conn.unchecked_transaction()?;
+        if from < 2 {
+            tx.execute_batch("ALTER TABLE entry ADD COLUMN locked INTEGER NOT NULL DEFAULT 0")?;
+        }
+        tx.execute(
+            "UPDATE schema_version SET version = ?1",
+            params![schema::SCHEMA_VERSION],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 升级前留一份原库快照，返回快照路径。
+    ///
+    /// 用 `VACUUM INTO` 而不是复制文件：库开着 WAL，直接 copy 只能拿到主文件，
+    /// 最新写入还留在 -wal 里，快照会缺最后几次编辑。`VACUUM INTO` 产出的是
+    /// 已合并 WAL 的完整副本（和 `run_backup` 用的是同一条路）。
+    ///
+    /// 同名快照已存在就跳过，不覆盖 —— 上一次升级失败留下的那份，
+    /// 正是这次最需要的东西。
+    fn backup_before_upgrade(&self, from: i64) -> AppResult<PathBuf> {
+        let dir = self.db_path.parent().unwrap_or_else(|| Path::new("."));
+        let dest = dir.join(format!("diary.pre-v{from}.db"));
+        if dest.exists() {
+            return Ok(dest);
+        }
+        self.conn
+            .execute("VACUUM INTO ?1", params![dest.to_string_lossy()])?;
+        Ok(dest)
     }
 
     /// 打开某天的日记。
@@ -376,6 +424,7 @@ impl Vault {
                 content_md: String::new(),
                 word_count: 0,
                 mood: None,
+                locked: false,
                 created_at: String::new(),
                 updated_at: String::new(),
             }),
@@ -397,7 +446,7 @@ impl Vault {
         let entry = self
             .conn
             .query_row(
-                "SELECT id, entry_date, title, content_md, word_count, mood, created_at, updated_at
+                "SELECT id, entry_date, title, content_md, word_count, mood, created_at, updated_at, locked
                  FROM entry WHERE entry_date = ?1",
                 params![date],
                 map_entry,
@@ -413,6 +462,15 @@ impl Vault {
     ///   - 索引更新了但正文没存 -> 搜到一条打不开的日记
     pub fn save_entry(&self, date: &str, title: &str, content_md: &str) -> AppResult<Entry> {
         validate_date(date)?;
+
+        // 锁定是**硬约束**，不是界面上的置灰。
+        // 光靠前端把输入框设成 readonly 拦不住自动保存定时器：
+        // 解锁前排队的那次保存、或者组件卸载时的 flush，都会照样写进来。
+        if self.is_locked(date)? {
+            return Err(AppError::Validation(
+                "这篇日记已锁定，先解锁再修改".into(),
+            ));
+        }
 
         // 先把内容截断到合理上限，避免异常输入撑爆数据库。
         const MAX_TITLE: usize = 200;
@@ -479,8 +537,70 @@ impl Vault {
             .ok_or_else(|| AppError::State("保存后读取失败".into()))
     }
 
+    /// 某天是否处于锁定状态。不存在该行时返回 false。
+    pub fn is_locked(&self, date: &str) -> AppResult<bool> {
+        validate_date(date)?;
+        let v: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT locked FROM entry WHERE entry_date = ?1",
+                params![date],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.unwrap_or(0) != 0)
+    }
+
+    /// 把所有日记一次性锁上，返回被锁的篇数。
+    ///
+    /// 调用时机：**切换日期**、以及**应用启动**时。
+    ///
+    /// 为什么"关闭软件自动锁定"落在**启动**而不是关闭事件里：
+    /// 进程退出时执行的代码不保证跑完（强杀、断电、崩溃都跳过），
+    /// 而且窗口关闭事件在 Tauri 里异步、还可能被取消。
+    /// 放到启动时执行，"下次打开时全都是锁的"这个效果是**确定**的 ——
+    /// 而数据库本身有 PIN 加密，没解锁前谁也读不到，所以早锁晚锁没有安全差别。
+    ///
+    /// 只锁"写过"的行，并且跳过已经锁好的：一次切换日期不必写上百行。
+    pub fn lock_all_entries(&self) -> AppResult<usize> {
+        let n = self.conn.execute(
+            "UPDATE entry SET locked = 1 WHERE locked = 0",
+            [],
+        )?;
+        Ok(n)
+    }
+
+    /// 设置某天的锁定状态。
+    ///
+    /// 只改 `entry.locked` 一个字段，**不碰正文**。这正是"锁定"的全部语义：
+    /// 内容一个字符都不改，只是不再允许修改 —— 用户手写的换行和空格原样保留。
+    ///
+    /// 日期还没有落库行时不做任何事（返回空模板）：一天都没写，锁它没有意义，
+    /// 也不该因为点了锁定就在日历上留下一条记录。
+    pub fn set_entry_locked(&self, date: &str, locked: bool) -> AppResult<Entry> {
+        validate_date(date)?;
+        let flag: i64 = if locked { 1 } else { 0 };
+        self.conn.execute(
+            "UPDATE entry SET locked = ?2 WHERE entry_date = ?1",
+            params![date, flag],
+        )?;
+        // updated_at 刻意不动：锁定不是对内容的修改，
+        // 不该让"最后修改时间"跟着跳一下。
+        self.open_entry(date)
+    }
+
     /// 删除某天的日记，并清理两份索引。
+    ///
+    /// 锁定的日记**不允许删除**。只挡"修改"是不够的：整篇删掉同样是丢失内容，
+    /// 而且是不可恢复的那种。所以锁必须同时覆盖改和删。
     pub fn delete_entry(&self, date: &str) -> AppResult<()> {
+        validate_date(date)?;
+        if self.is_locked(date)? {
+            return Err(AppError::Validation(
+                "这篇日记已锁定，先解锁再删除".into(),
+            ));
+        }
+
         let tx = self.conn.unchecked_transaction()?;
         let id: Option<i64> = tx
             .query_row(
@@ -1075,6 +1195,7 @@ fn map_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
         content_md: r.get(3)?,
         word_count: r.get(4)?,
         mood: r.get(5)?,
+        locked: r.get::<_, i64>(8)? != 0,
         created_at: r.get(6)?,
         updated_at: r.get(7)?,
     })
@@ -1260,5 +1381,56 @@ mod tests {
         // 摘要不能 panic，要给出一段上下文。
         let s = make_snippet("今天去爬山了", "牛肉");
         assert!(!s.is_empty());
+    }
+
+    /// v1 -> v2 的真实升级路径。
+    ///
+    /// 这是整个改动里**唯一会碰用户既有数据**的地方，所以单独钉一条测试：
+    /// 把库退回 v1 的样子（没有 locked 列），再走一遍 migrate()。
+    #[test]
+    fn upgrade_from_v1_adds_locked_column_without_touching_content() {
+        let dir = std::env::temp_dir().join("dsh-diary-migrate-v1");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let vault = Vault::create(&dir, "135790", None).unwrap();
+        // 一段刻意"手工排版"的正文：单换行、行尾空格、行首缩进。
+        // 升级不能动它一个字符。
+        let original = "第一行\n第二行   行尾空格\n\n  三个空格开头的缩进\n\t制表符开头";
+        vault.save_entry("2026-09-11", "标题", original).unwrap();
+
+        // 退回 v1：删掉 locked 列 + 版本号改回 1。
+        vault
+            .conn
+            .execute_batch("ALTER TABLE entry DROP COLUMN locked")
+            .unwrap();
+        vault
+            .conn
+            .execute("UPDATE schema_version SET version = 1", [])
+            .unwrap();
+
+        vault.migrate().expect("v1 库必须能升到 v2");
+
+        // 版本号已推进
+        let v: i64 = vault
+            .conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, schema::SCHEMA_VERSION);
+
+        // 升级前的快照必须留下 —— 这是出事后唯一的退路。
+        assert!(
+            dir.join("diary.pre-v1.db").exists(),
+            "升级前必须产生 v1 快照"
+        );
+
+        // 正文一字未改，且旧数据默认未锁定。
+        let e = vault.open_entry("2026-09-11").unwrap();
+        assert_eq!(e.content_md, original, "迁移绝不能改动正文");
+        assert_eq!(e.title, "标题");
+        assert!(!e.locked, "升级上来的旧日记默认应该是未锁定的");
+        assert!(vault.is_locked("2026-09-11").is_ok(), "locked 列应已可用");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

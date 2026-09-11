@@ -2,9 +2,16 @@
 /**
  * 日记编辑器。
  *
- * 形态：**Markdown 源码 + 语法高亮**（形态 A），配一个一键切换的阅读模式。
+ * 形态：**Markdown 源码 + 语法高亮**（形态 A），配一个一键**锁定**。
  * 为什么不做所见即所得：那是 V1 的目标（见 docs/backlog.md），
  * 复杂度是现在的 5~8 倍。而写日记最需要的是"打开就能写"，排版好看是**回看**时的需求。
+ *
+ * ⚠️ 右上角按钮的历史：它原来是"阅读"，把正文当 Markdown 渲染成 HTML。
+ *    那个视图**会吃掉用户手动排的版** —— Markdown 的规矩是单个换行等于空格、
+ *    行首空格被吞掉。用户自己排的版很好看，一进"阅读"就全塌了。
+ *    所以改成了"锁定"：**正文一字不改地原样显示**，只是不可编辑。
+ *    结论：Markdown 渲染对"手工排版"是破坏性的，这也是将来上所见即所得（V1）
+ *    而不是继续加渲染开关的理由。
  *
  * ⚠️ 铁律：正文永远以 **Markdown 原文**落库。
  *    将来升级到所见即所得时，富文本只在内存里存在，存库前仍转回 Markdown。
@@ -14,11 +21,12 @@
  * 中文输入法组字期间**暂停保存** —— 否则会把打到一半的拼音存进数据库。
  */
 import { computed, nextTick, onUnmounted, ref, watch } from "vue";
-import { marked } from "marked";
 import {
   deleteEntry,
+  lockAllEntries,
   openEntry,
   saveEntry,
+  setEntryLocked,
   toAppError,
   type Entry,
 } from "../api";
@@ -38,7 +46,8 @@ const title = ref("");
 const content = ref("");
 /** '' | 'pending' | 'saving' | 'saved' | 'error' */
 const saveState = ref<"" | "pending" | "saving" | "saved" | "error">("");
-const previewMode = ref(false);
+/** 锁定：正文只读。注意锁的是**能否修改**，不是显示方式。 */
+const locked = ref(false);
 const entry = ref<Entry | null>(null);
 
 /** 输入法组字中。中文打字时输入法会先给出拼音候选，这段时间不能保存。 */
@@ -67,24 +76,25 @@ const wordCount = computed(
   () => content.value.replace(/\s/g, "").length
 );
 
-const renderedHtml = computed(() => {
+/**
+ * 切换锁定 / 解锁。
+ *
+ * 只调后端改一个标记位，**不提交任何正文** —— 这是"锁定不改变排版"的保证：
+ * 走的接口根本不带 title/content 参数，想改也改不了。
+ */
+async function toggleLock() {
+  const next = !locked.value;
+  errorText.value = "";
   try {
-    // marked 默认会转义内联 HTML 吗？不会 —— 所以这里显式做一层过滤：
-    // 日记是本机数据，风险低，但仍避免把 <script> 之类渲染进 DOM。
-    const raw = marked.parse(content.value || "", { async: false }) as string;
-    return sanitize(raw);
-  } catch {
-    return "<p>（内容渲染失败）</p>";
+    // 锁定前先把已改的内容落库，否则会丢掉"锁定前最后一次编辑"。
+    if (next && dirty) await flush();
+    const e = await setEntryLocked(props.date, next);
+    entry.value = e;
+    locked.value = e.locked;
+    saveState.value = "";
+  } catch (e) {
+    errorText.value = toAppError(e).message;
   }
-});
-
-/** 极简过滤：去掉 script/style/iframe 标签与内联事件处理器。 */
-function sanitize(html: string): string {
-  return html
-    .replace(/<\s*(script|style|iframe|object|embed)[\s\S]*?<\s*\/\s*\1\s*>/gi, "")
-    .replace(/<\s*(script|style|iframe|object|embed)[^>]*>/gi, "")
-    .replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "")
-    .replace(/javascript:/gi, "");
 }
 
 async function load() {
@@ -92,12 +102,16 @@ async function load() {
   errorText.value = "";
   cancelPendingSave();
   try {
+    // 先把所有日记锁上，再读要打开的这一篇。
+    // 于是"切换日期"和"重新打开软件"都会让上一篇自动回到锁定状态。
+    await lockAllEntries();
     // openEntry 是纯读取：没有内容时返回空模板（id = 0），不会写库。
     // 所以"点开日历"不会把这一天变成"写过"。
     const e = await openEntry(props.date);
     entry.value = e;
     title.value = e.title;
     content.value = e.content_md;
+    locked.value = e.locked;
     dirty = false;
     saveState.value = "";
   } catch (e) {
@@ -116,6 +130,9 @@ function cancelPendingSave() {
 
 /** 输入变化：标记脏数据并安排一次防抖保存。 */
 function scheduleSave() {
+  // 锁定时一律不保存。load() 会把内容写进 title/content，从而触发本函数 ——
+  // 没有这道闸，打开一篇锁定的日记就会立刻发起一次注定被后端拒绝的保存。
+  if (locked.value) return;
   // 关键：组字期间不保存，否则会存下未完成的拼音。
   if (composing) return;
   dirty = true;
@@ -141,7 +158,8 @@ function scheduleSave() {
  *      在内容为空的情况下也要通知 —— 因为可能刚刚删空了一篇，
  *      日历需要把这个标记去掉。
  */
-async function flush() {
+async function flush(forDate: string = props.date) {
+  if (locked.value) return; // 锁定的日记不写库
   if (!dirty) return;
   cancelPendingSave();
 
@@ -150,7 +168,7 @@ async function flush() {
     if (isPersisted()) {
       saveState.value = "saving";
       try {
-        await deleteEntry(props.date);
+        await deleteEntry(forDate);
         entry.value = null;
         dirty = false;
         saveState.value = "";
@@ -169,7 +187,7 @@ async function flush() {
 
   saveState.value = "saving";
   try {
-    const e = await saveEntry(props.date, title.value, content.value);
+    const e = await saveEntry(forDate, title.value, content.value);
     entry.value = e;
     dirty = false;
     saveState.value = "saved";
@@ -194,6 +212,9 @@ function onCompositionEnd() {
  * 日记里写代码块或列表时很需要。
  */
 function onKeydown(ev: KeyboardEvent) {
+  // 只读输入框仍然会触发 keydown。不挡住的话，在锁定状态下按 Tab 会悄悄改掉
+  // 内存里的 content —— 界面上看不见变化，解锁后那次编辑却会被保存进去。
+  if (locked.value) return;
   if (ev.key === "Tab") {
     ev.preventDefault();
     const el = ev.target as HTMLTextAreaElement;
@@ -228,8 +249,25 @@ const saveLabel = computed(() => {
   }
 });
 
-watch(() => props.date, load, { immediate: true });
+watch(
+  () => props.date,
+  async (_next, prev) => {
+    // ⚠️ 先保存，再锁定，顺序不能反。
+    //
+    // 两件事都容易踩错：
+    //   1. load() 会 lockAllEntries()。要是先锁再存，这次保存会被刚上的锁
+    //      拒绝，用户最后敲的几个字**静默消失**（界面上只闪一下"保存失败"）。
+    //   2. 必须写到 prev（旧日期）。此刻 props.date 已经是新日期了，
+    //      照 props.date 写会把 A 的正文覆盖到 B 那天上 —— 那比丢字更糟。
+    if (dirty && prev) await flush(prev);
+    await load();
+  }
+);
 watch([title, content], scheduleSave);
+
+// 首屏：load() 里的 lockAllEntries() 顺带实现了
+// "关掉软件再打开，所有日记都是锁的"。
+void load();
 
 // 关窗前尽力保存，减少意外丢失。
 function beforeUnload(e: BeforeUnloadEvent) {
@@ -258,10 +296,11 @@ onUnmounted(() => {
       </div>
       <button
         class="toggle"
-        :class="{ on: previewMode }"
-        @click="previewMode = !previewMode"
+        :class="{ on: locked }"
+        :title="locked ? '解锁后可继续修改' : '锁定后正文只读，排版原样保留'"
+        @click="toggleLock"
       >
-        {{ previewMode ? "编辑" : "阅读" }}
+        {{ locked ? "🔒 已锁定" : "🔓 锁定" }}
       </button>
     </header>
 
@@ -276,22 +315,23 @@ onUnmounted(() => {
         type="text"
         placeholder="标题（可留空）"
         maxlength="200"
+        :readonly="locked"
+        :class="{ locked }"
       />
 
-      <!-- 阅读模式：渲染 Markdown -->
-      <article
-        v-if="previewMode"
-        class="preview markdown-body"
-        v-html="renderedHtml"
-      />
-
-      <!-- 编辑模式：Markdown 源码 -->
+      <!--
+        锁定与编辑共用同一个 textarea，**刻意不切换成渲染视图**。
+        看得见的就是将要保存的原文：换行、空格、缩进全部原样，
+        所以"锁定"不会改变排版。只读靠 readonly（不是 disabled）——
+        disabled 的输入框不能选中、不能滚动，想复制一段都做不到。
+      -->
       <textarea
-        v-else
         v-model="content"
         class="content-input"
+        :class="{ locked }"
         placeholder="今天发生了什么…"
         spellcheck="false"
+        :readonly="locked"
         @compositionstart="onCompositionStart"
         @compositionend="onCompositionEnd"
         @keydown="onKeydown"
@@ -394,6 +434,12 @@ onUnmounted(() => {
   flex: 1;
   overflow-y: auto;
   min-height: 0;
+}
+/* 锁定态：文字淡一点表示只读，但仍然可选中、可复制、可滚动。 */
+.title-input.locked,
+.content-input.locked {
+  color: var(--text-2);
+  cursor: default;
 }
 .placeholder,
 .error {

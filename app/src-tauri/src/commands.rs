@@ -334,6 +334,27 @@ pub fn save_entry(
     with_vault(&state, |v| v.save_entry(&date, &title, &content_md))
 }
 
+/// 一次性锁上所有日记，返回被锁的篇数。
+///
+/// 由前端在**切换日期**和**应用启动**时调用 —— 效果等价于
+/// "离开一篇日记 / 关掉软件，所有日记就都锁上了"。
+#[tauri::command]
+pub fn lock_all_entries(state: State<'_, VaultState>) -> AppResult<usize> {
+    with_vault(&state, |v| v.lock_all_entries())
+}
+
+/// 锁定 / 解锁某天的日记。
+///
+/// 锁定只影响"能否修改"，**不改动正文一个字符** —— 用户手动排的版原样保留。
+#[tauri::command]
+pub fn set_entry_locked(
+    state: State<'_, VaultState>,
+    date: String,
+    locked: bool,
+) -> AppResult<Entry> {
+    with_vault(&state, |v| v.set_entry_locked(&date, locked))
+}
+
 #[tauri::command]
 pub fn delete_entry(state: State<'_, VaultState>, date: String) -> AppResult<()> {
     with_vault(&state, |v| v.delete_entry(&date))

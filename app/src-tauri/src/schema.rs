@@ -7,7 +7,7 @@
 ///
 /// 用一个独立的 `schema_version` 表记录，而不是 SQLite 的 `PRAGMA user_version`：
 /// 后者在加密库里行为正常，但用独立表更直观、也便于把版本信息一并导出。
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// 建表语句。
 ///
@@ -51,6 +51,12 @@ CREATE TABLE IF NOT EXISTS entry (
     content_md  TEXT    NOT NULL DEFAULT '',
     word_count  INTEGER NOT NULL DEFAULT 0,
     mood        INTEGER,
+    -- 锁定：1 = 这篇日记只读，不可修改。
+    -- 锁的是**内容**，不是排版 —— 锁定状态下正文一字不改地原样显示，
+    -- 包括用户手动排的换行与空格。（曾经右上角是"阅读"视图，用 Markdown
+    -- 渲染，会把手动排版吃掉：Markdown 里单个换行等于空格、行首空格被吞。
+    -- 详见 EditorPane.vue 顶部的说明。）
+    locked      INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT    NOT NULL,
     updated_at  TEXT    NOT NULL,
     -- 一天一篇靠数据库约束保证，不靠应用层"先查再插"。

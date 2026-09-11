@@ -903,3 +903,171 @@ fn run_backup_records_time_and_prunes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ---------------------------------------------------------------------------
+// 锁定
+//
+// 锁定的定义只有一句：**内容一个字符都不改，只是不再允许修改和删除**。
+// 这组测试存在的理由：右上角原来是"阅读"视图，用 Markdown 渲染，
+// 会吃掉用户手动排的换行与空格。换掉之后必须钉住"排版原样保留"这条底线。
+// ---------------------------------------------------------------------------
+
+/// 用户手排的版：单换行、行首缩进、制表符、连续空格、行尾空格。
+const HAND_LAYOUT: &str = "第一行\n第二行不空行\n\n  缩进两个空格\n\t制表符开头\n结尾三个空格   ";
+
+#[test]
+fn hand_made_layout_survives_lock_and_unlock_verbatim() {
+    let dir = temp_dir("lock-layout");
+    let vault = Vault::create(&dir, PIN, None).unwrap();
+    vault.save_entry("2026-09-11", "标题", HAND_LAYOUT).unwrap();
+
+    // 锁定再解锁，来回一趟
+    let locked = vault.set_entry_locked("2026-09-11", true).unwrap();
+    assert!(locked.locked);
+    assert_eq!(locked.content_md, HAND_LAYOUT, "锁定不得改动正文");
+
+    let unlocked = vault.set_entry_locked("2026-09-11", false).unwrap();
+    assert!(!unlocked.locked);
+    assert_eq!(unlocked.content_md, HAND_LAYOUT, "解锁不得改动正文");
+
+    // 落库的字节必须与写入时完全一致
+    let read = vault.open_entry("2026-09-11").unwrap();
+    assert_eq!(read.content_md, HAND_LAYOUT);
+    assert_eq!(read.content_md.as_bytes(), HAND_LAYOUT.as_bytes());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn locked_entry_rejects_save() {
+    let dir = temp_dir("lock-no-save");
+    let vault = Vault::create(&dir, PIN, None).unwrap();
+    vault.save_entry("2026-09-11", "标题", "原始内容").unwrap();
+    vault.set_entry_locked("2026-09-11", true).unwrap();
+
+    // 后端必须拒绝，而不是靠前端置灰。
+    // 自动保存定时器、组件卸载时的 flush 都会绕过界面。
+    let err = vault
+        .save_entry("2026-09-11", "改过的标题", "改过的内容")
+        .expect_err("锁定后写入必须被拒绝");
+    assert!(
+        matches!(err, AppError::Validation(_)),
+        "应返回可展示的校验错误，实际: {err:?}"
+    );
+
+    // 内容必须原封不动
+    let e = vault.open_entry("2026-09-11").unwrap();
+    assert_eq!(e.title, "标题");
+    assert_eq!(e.content_md, "原始内容");
+
+    // 解锁后恢复可写
+    vault.set_entry_locked("2026-09-11", false).unwrap();
+    vault.save_entry("2026-09-11", "改过的标题", "改过的内容").unwrap();
+    assert_eq!(
+        vault.open_entry("2026-09-11").unwrap().title,
+        "改过的标题"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn locked_entry_rejects_delete() {
+    let dir = temp_dir("lock-no-delete");
+    let vault = Vault::create(&dir, PIN, None).unwrap();
+    vault.save_entry("2026-09-11", "", "会被删掉的内容").unwrap();
+    vault.set_entry_locked("2026-09-11", true).unwrap();
+
+    // 只挡"改"不挡"删"是半个锁：整篇删掉同样不可恢复。
+    let err = vault
+        .delete_entry("2026-09-11")
+        .expect_err("锁定后删除必须被拒绝");
+    assert!(matches!(err, AppError::Validation(_)), "实际: {err:?}");
+
+    // 内容还在，日历标记也还在
+    assert!(vault.is_written("2026-09-11").unwrap());
+    assert_eq!(
+        vault.open_entry("2026-09-11").unwrap().content_md,
+        "会被删掉的内容"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lock_state_persists_across_reopen() {
+    let dir = temp_dir("lock-persist");
+    {
+        let vault = Vault::create(&dir, PIN, None).unwrap();
+        vault.save_entry("2026-09-11", "", "锁着的").unwrap();
+        vault.save_entry("2026-09-12", "", "没锁的").unwrap();
+        vault.set_entry_locked("2026-09-11", true).unwrap();
+    }
+
+    // 重新解锁整个库：每篇的锁定状态必须各自记住。
+    let vault = Vault::unlock(&dir, PIN).unwrap();
+    assert!(vault.open_entry("2026-09-11").unwrap().locked, "应记得锁过");
+    assert!(
+        !vault.open_entry("2026-09-12").unwrap().locked,
+        "不该连累没锁的那篇"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lock_all_entries_locks_everything() {
+    let dir = temp_dir("lock-all");
+    let vault = Vault::create(&dir, PIN, None).unwrap();
+    for day in 10..=13 {
+        vault
+            .save_entry(&format!("2026-09-{day}"), "", "内容")
+            .unwrap();
+    }
+    vault.set_entry_locked("2026-09-11", true).unwrap();
+
+    // 切换日期 / 重新打开软件时调用：一次全锁。
+    let n = vault.lock_all_entries().unwrap();
+    assert_eq!(n, 3, "4 篇里 1 篇本来就锁着，应只更新 3 篇");
+
+    for day in 10..=13 {
+        assert!(
+            vault
+                .open_entry(&format!("2026-09-{day}"))
+                .unwrap()
+                .locked,
+            "2026-09-{day} 应已锁定"
+        );
+    }
+
+    // 幂等：再调一次不再改任何行（避免每次切换日期都写库）
+    assert_eq!(vault.lock_all_entries().unwrap(), 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn locking_a_date_never_written_creates_no_row() {
+    let dir = temp_dir("lock-empty");
+    let vault = Vault::create(&dir, PIN, None).unwrap();
+
+    // 点开过但没写的日期：锁它没有意义，
+    // 更不该因为点了锁定就在日历上留下一条"写过"的记录。
+    let e = vault.set_entry_locked("2026-09-11", true).unwrap();
+    assert_eq!(e.id, 0, "不该创建数据库行");
+    assert!(!e.locked);
+    assert!(!vault.is_written("2026-09-11").unwrap());
+    assert_eq!(vault.stats().unwrap().total_entries, 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn new_entry_defaults_to_unlocked() {
+    let dir = temp_dir("lock-default");
+    let vault = Vault::create(&dir, PIN, None).unwrap();
+    let e = vault.save_entry("2026-09-11", "", "新写的").unwrap();
+    assert!(!e.locked, "新写的日记应该是可编辑的");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

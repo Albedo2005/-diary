@@ -88,6 +88,8 @@ pub fn run() {
             commands::open_entry,
             commands::is_date_written,
             commands::save_entry,
+            commands::set_entry_locked,
+            commands::lock_all_entries,
             commands::delete_entry,
             commands::list_month,
             commands::written_dates,
