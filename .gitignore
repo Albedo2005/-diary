@@ -1,0 +1,54 @@
+# Build artifacts
+# Note: target/ now lives at the workspace root because Cargo shares one target
+# directory across all workspace members.
+/target/
+
+# Cargo.lock IS committed on purpose.
+# This is an application, not a library: locking the dependency graph keeps the
+# SQLCipher/OpenSSL build reproducible across machines and reinstalls.
+# Do NOT add Cargo.lock to this file.
+
+# Node / frontend (app/ is created later)
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Tauri build output
+app/src-tauri/target/
+app/src-tauri/gen/
+
+# Editor / OS noise
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+Thumbs.db
+Desktop.ini
+
+# Local verification scratch: probe writes throwaway test databases here.
+probe/probe-out*/
+probe/*.db
+probe/*.db-journal
+probe/*.db-wal
+probe/*.db-shm
+
+# 构建日志（scripts 里的脚本会产生多种命名的日志，统一忽略）
+_build*.log
+_app*.log
+_dev*.log
+_bp*.log
+*.log
+
+# 本地验证时产生的临时文件
+probe-out/**
+target/**/*.d
+
+# Never commit real diary data or key material
+*.diarydb
+crypto_meta.bin
+lockout.json

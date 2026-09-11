@@ -1,0 +1,20 @@
+[package]
+name = "probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# This crate is a member of the workspace declared in ../Cargo.toml.
+# Dependencies are pulled from [workspace.dependencies] so the probe and the
+# real Tauri backend cannot drift apart on the SQLCipher build or feature flags.
+#
+# Note: the SQLCipher/OpenSSL feature flags live in the workspace root, not
+# here. Changing them there invalidates the build cache for every member.
+[dependencies]
+rusqlite = { workspace = true }
+argon2 = { workspace = true }
+rand = { workspace = true }
+
+# 中文分词。SQLite FTS5 的默认 tokenizer 对中文等于失效（已实测），
+# jieba 是中文分词的事实标准，纯 Rust 实现，无系统依赖。
+jieba-rs = { workspace = true }

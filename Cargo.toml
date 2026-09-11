@@ -1,0 +1,80 @@
+# Cargo workspace for the diary project.
+#
+# Why a workspace instead of one crate per directory:
+#   SQLCipher + OpenSSL take about 12 minutes to compile from source. Without a
+#   workspace, the probe and the Tauri backend would each maintain their own
+#   target/ directory and compile those heavy C dependencies twice. A shared
+#   workspace compiles each dependency once and shares the artifacts.
+#
+# Members are listed explicitly rather than with a glob. A glob such as
+# "app/*" would also try to treat app/src-tauri as a package, which is wrong.
+# Explicit members also make a typo fail loudly instead of silently.
+
+[workspace]
+resolver = "2"
+members = ["probe", "app/src-tauri"]
+
+# Shared dependency versions. Holding these in one place guarantees the probe
+# and the real application always agree on how SQLCipher is built. A mismatch
+# would produce the worst kind of bug: the prototype passes, the app fails.
+[workspace.dependencies]
+# SQLCipher compiled statically into the binary:
+#   bundled             -> compiles SQLite/SQLCipher from source
+#   vendored-openssl    -> bundles OpenSSL, so end users install nothing
+#   backup              -> SQLite online backup API, required by db::backup_to
+# Windows build prerequisites: MSVC, perl, nasm, make (see scripts\env.ps1).
+#
+# Why "backup" is not optional: the database runs in WAL mode, so copying the
+# .db file on its own can produce an inconsistent snapshot (or silently miss
+# recent commits). The online backup API copies a consistent image at a
+# transaction boundary, and it copies CIPHERTEXT -- no decryption needed, so
+# the backup is exactly as safe as the database itself.
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl", "backup"] }
+
+# Password -> database key derivation. Never hand-rolled crypto.
+# A 6-digit PIN has only 10^6 possibilities, so the Argon2id memory cost is the
+# only thing standing between a stolen database file and a full offline crack.
+argon2 = "0.5"
+rand = "0.9"
+
+# Chinese word segmentation. SQLite FTS5's built-in tokenizers treat a whole
+# Chinese sentence as ONE token (measured, see docs/schema-decisions.md), so the
+# index must store pre-segmented text. jieba is the de-facto standard and is
+# pure Rust, so it adds no system dependency.
+jieba-rs = "0.7"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-build = { version = "2", features = [] }
+thiserror = "2"
+directories = "6"
+
+# Release profile: balanced on purpose.
+#
+# The Tauri template ships lto = true + codegen-units = 1 for the smallest
+# binary. That is a bad trade here: this workspace statically compiles SQLCipher
+# and OpenSSL, and full LTO with one codegen unit multiplies an already long
+# build (measured: ~12 min without LTO). "thin" LTO keeps most of the size win
+# at a fraction of the compile time, and the per-package overrides below let the
+# application crate (small, our own code) still be optimized aggressively.
+#
+# NOTE: profiles MUST live at the workspace root. Cargo silently ignores a
+# [profile] section inside a workspace member's manifest.
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 16
+panic = "abort"
+strip = true
+
+# Our own crates are small, so full optimization there is cheap. Dependencies
+# (SQLCipher, OpenSSL, jieba) keep the cheaper settings. This works because
+# per-package profiles only affect that package's own compilation.
+[profile.release.package.app]
+opt-level = 3
+codegen-units = 1
+
+[profile.release.package.probe]
+opt-level = 2

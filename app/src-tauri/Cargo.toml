@@ -1,0 +1,47 @@
+[package]
+name = "app"
+version = "0.1.0"
+description = "单机加密日记"
+authors = ["you"]
+edition = "2021"
+publish = false
+
+# Member of the workspace declared in ../../Cargo.toml.
+# [profile.*] deliberately does NOT appear here: Cargo ignores profiles inside
+# workspace members, so the release profile lives at the workspace root.
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary to make the lib name
+# unique and to avoid conflicting with the bin name. See
+# https://github.com/rust-lang/cargo/issues/8519
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+tauri = { workspace = true }
+tauri-plugin-opener = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Database: SQLCipher (whole-file encryption). The key is derived in Rust and
+# never handed to the frontend, which is exactly why the official
+# tauri-plugin-sql is not used here -- it is built around passing SQL strings
+# from the frontend and does not support SQLCipher.
+rusqlite = { workspace = true }
+
+# PIN -> database key derivation.
+argon2 = { workspace = true }
+rand = { workspace = true }
+
+# Chinese full-text search segmentation.
+jieba-rs = { workspace = true }
+
+# Error types for the command boundary, so the UI can show something meaningful
+# instead of a raw driver error.
+thiserror = { workspace = true }
+
+# Platform data directory: where the encrypted database and attachments live.
+directories = { workspace = true }

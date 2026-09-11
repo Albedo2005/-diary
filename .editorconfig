@@ -1,0 +1,32 @@
+# Editor configuration.
+#
+# Why this file exists: the project's source and docs are UTF-8 with Chinese
+# comments. On a Chinese-locale Windows machine, several common tools default to
+# ANSI/GBK when the encoding is not declared, which silently corrupts the text.
+# This happened once already (a PowerShell text replacement turned every comment
+# into mojibake and lost line breaks). Declaring the encoding here prevents it.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.rs]
+indent_style = space
+indent_size = 4
+
+[*.{ts,vue,js,json,yml,yaml,md,css,html}]
+indent_style = space
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false
+
+# PowerShell scripts are deliberately ASCII-only.
+# Windows PowerShell 5.1 reads BOM-less .ps1 files as ANSI/GBK, so non-ASCII
+# characters in them break parsing. Keep them free of non-ASCII text.
+[*.ps1]
+charset = utf-8
