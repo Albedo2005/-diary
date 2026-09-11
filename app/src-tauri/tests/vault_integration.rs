@@ -705,3 +705,201 @@ fn hint_is_stored_outside_encryption_for_the_lock_screen() {
     assert!(!st.should_show_hint());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// 备份保留策略（P0 缺口补齐）
+// ---------------------------------------------------------------------------
+
+/// 造一个符合命名规范的备份文件（含配对的 meta）。
+fn fake_backup(dir: &std::path::Path, stamp: &str) -> String {
+    let stem = format!("diary-{stamp}");
+    std::fs::write(dir.join(format!("{stem}.db")), b"x").unwrap();
+    std::fs::write(dir.join(format!("{stem}.meta.json")), b"{}").unwrap();
+    stem
+}
+
+#[test]
+fn prune_keeps_recent_backups_and_removes_old_ones() {
+    let dir = temp_dir("prune-recent");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 同一个月里造 10 份备份（每天一份）
+    for day in 1..=10 {
+        fake_backup(&dir, &format!("202609{day:02}-100000"));
+    }
+
+    let (deleted, kept) = app_lib::db::prune_backups(&dir, 7).unwrap();
+
+    // 10 份里保留最近 7 份（09-10…09-04）；"每月最早一份"= 09-01，
+    // 它**已经**在那 7 份之外，所以被按月归档规则额外保留 -> 共 8 份。
+    // 删除 2 份 × 2 个文件（主文件 + 配对 meta）= 4 个文件。
+    //
+    // （我第一版把期望写成 kept=7 / deleted=6，是漏算了"本月最早那份本来
+    //   就不在最近 7 份里"这一点。）
+    assert_eq!(kept, 8, "应保留最近 7 份 + 本月归档 1 份");
+    assert_eq!(deleted, 4, "应删除 2 份 × 2 个文件");
+
+    assert!(
+        dir.join("diary-20260901-100000.db").exists(),
+        "本月最早一份应按月归档规则保留"
+    );
+    assert!(dir.join("diary-20260910-100000.db").exists(), "09-10 在最近 7 份内");
+    assert!(dir.join("diary-20260904-100000.db").exists(), "09-04 是最近 7 份的最后一份");
+    assert!(!dir.join("diary-20260903-100000.db").exists(), "09-03 应被删除");
+    assert!(!dir.join("diary-20260902-100000.db").exists(), "09-02 应被删除");
+
+    // meta 文件必须与被删的主文件一起清理，否则会留下孤立文件
+    assert!(
+        !dir.join("diary-20260903-100000.meta.json").exists(),
+        "配对 meta 应一起删除"
+    );
+    assert!(
+        dir.join("diary-20260901-100000.meta.json").exists(),
+        "被保留的备份，其 meta 也必须保留（否则无法解锁）"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prune_keeps_one_archive_per_month() {
+    let dir = temp_dir("prune-months");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 三个月，每月两份；keep_recent 设为 2
+    for (m, d) in [("202607", "01"), ("202607", "15"), ("202608", "01"),
+                   ("202608", "15"), ("202609", "01"), ("202609", "15")] {
+        fake_backup(&dir, &format!("{m}{d}-120000"));
+    }
+
+    let (_, kept) = app_lib::db::prune_backups(&dir, 2).unwrap();
+
+    // 最近 2 份 = 09-15, 09-01
+    // 每月最早一份 = 07-01, 08-01, 09-01
+    // 合并去重 = {09-15, 09-01, 07-01, 08-01} = 4 份
+    assert_eq!(kept, 4, "应保留最近 2 份 + 每月归档一份（去重后 4 份）");
+
+    assert!(dir.join("diary-20260701-120000.db").exists(), "7 月归档应保留");
+    assert!(dir.join("diary-20260801-120000.db").exists(), "8 月归档应保留");
+    assert!(!dir.join("diary-20260715-120000.db").exists(), "7 月第二份应删除");
+    assert!(!dir.join("diary-20260815-120000.db").exists(), "8 月第二份应删除");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prune_leaves_foreign_files_alone() {
+    let dir = temp_dir("prune-foreign");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 这些不是本程序生成的命名，绝不能被删
+    std::fs::write(dir.join("important.db"), b"user data").unwrap();
+    std::fs::write(dir.join("notes.txt"), b"hello").unwrap();
+    std::fs::write(dir.join("diary-backup.db"), b"odd name").unwrap();
+    fake_backup(&dir, "20260901-100000");
+
+    let (_, _) = app_lib::db::prune_backups(&dir, 0).unwrap();
+
+    assert!(dir.join("important.db").exists(), "不该碰用户自己的 .db 文件");
+    assert!(dir.join("notes.txt").exists(), "不该碰非 .db 文件");
+    assert!(dir.join("diary-backup.db").exists(), "命名不符规范的文件不该被删");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 自动备份设置（P0 缺口补齐）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn auto_backup_defaults_to_enabled() {
+    let dir = temp_dir("auto-default");
+    let vault = Vault::create(&dir, PIN, None).unwrap();
+
+    // 默认必须是**开启**的：对日记软件来说"用户忘了开备份"等于"没有备份"，
+    // 而丢日记不可挽回。
+    assert!(vault.auto_backup_enabled().unwrap(), "自动备份应默认开启");
+    assert_eq!(
+        vault.keep_recent_backups().unwrap(),
+        app_lib::db::DEFAULT_KEEP_RECENT
+    );
+    // 从未备份过 -> 距下次应为 0（即立刻就该备份）
+    assert_eq!(vault.secs_until_next_auto_backup().unwrap(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn auto_backup_toggle_and_timer_persist() {
+    let dir = temp_dir("auto-persist");
+    {
+        let vault = Vault::create(&dir, PIN, None).unwrap();
+        vault.set_setting(app_lib::db::setting_keys::AUTO_BACKUP_ENABLED, "false").unwrap();
+        vault
+            .set_setting(app_lib::db::setting_keys::KEEP_RECENT, "3")
+            .unwrap();
+    }
+
+    // 重新打开后设置必须还在（存在数据库里，不是内存状态）。
+    let vault = Vault::unlock(&dir, PIN).unwrap();
+    assert!(!vault.auto_backup_enabled().unwrap(), "关闭状态应持久化");
+    assert_eq!(vault.keep_recent_backups().unwrap(), 3, "保留份数应持久化");
+
+    // 模拟"24 小时前备份过" —— 距下次应接近 0（已到期）
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    vault
+        .set_setting(
+            app_lib::db::setting_keys::LAST_BACKUP_AT,
+            &(now - app_lib::db::AUTO_BACKUP_INTERVAL_SECS - 10).to_string(),
+        )
+        .unwrap();
+    assert_eq!(
+        vault.secs_until_next_auto_backup().unwrap(),
+        0,
+        "超过间隔即视为到期"
+    );
+
+    // 刚刚备份过 -> 距下次应接近完整间隔
+    vault
+        .set_setting(app_lib::db::setting_keys::LAST_BACKUP_AT, &now.to_string())
+        .unwrap();
+    let until = vault.secs_until_next_auto_backup().unwrap();
+    assert!(
+        until > app_lib::db::AUTO_BACKUP_INTERVAL_SECS - 60,
+        "刚备份过，应接近完整间隔，实际 {until}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_backup_records_time_and_prunes() {
+    let dir = temp_dir("run-backup");
+    let vault = Vault::create(&dir, PIN, None).unwrap();
+    seed(&vault);
+
+    let backups = dir.join("backups");
+    std::fs::create_dir_all(&backups).unwrap();
+    // 先造一批旧备份，验证 run_backup 会顺带清理
+    for day in 1..=12 {
+        fake_backup(&backups, &format!("202601{day:02}-100000"));
+    }
+    // 保留份数设为 3，方便观察清理
+    vault
+        .set_setting(app_lib::db::setting_keys::KEEP_RECENT, "3")
+        .unwrap();
+
+    assert_eq!(vault.last_backup_at().unwrap(), 0, "初始应无备份时间");
+
+    let (result, deleted) = vault.run_backup(&backups, "20260911-120000").unwrap();
+
+    assert!(result.bytes > 0, "备份产物不应为空");
+    assert!(vault.last_backup_at().unwrap() > 0, "备份后必须记录时间");
+    assert!(deleted > 0, "应清理了旧备份，实际删除 {deleted} 个文件");
+    // 新备份本身必须保留
+    assert!(backups.join("diary-20260911-120000.db").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

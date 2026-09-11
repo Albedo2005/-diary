@@ -43,5 +43,7 @@ jieba-rs = { workspace = true }
 # instead of a raw driver error.
 thiserror = { workspace = true }
 
-# Platform data directory: where the encrypted database and attachments live.
-directories = { workspace = true }
+# NOTE: the `directories` crate was removed on purpose.
+# The app is portable: its data lives in a `data/` folder found by walking up
+# from the executable, not in the platform AppData directory. See
+# commands::resolve_data_dir. Keeping the dependency would just be dead weight.

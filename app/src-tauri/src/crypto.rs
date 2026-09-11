@@ -95,24 +95,31 @@ const KDF_CALIBRATE_MIN_MIB: u32 = 64;
 ///
 /// 校准结果必须写入数据库，解锁时读出来用 —— 这也是 `KdfParams` 需要
 /// 持久化的原因。
+///
+/// 测试中断言参数时可用环境变量跳过校准：
+///   `DSH_DIARY_SKIP_KDF_CALIBRATION=1` -> 直接用 `KdfParams::default()`
+///
+/// 健壮性要求（这是本函数存在的第二个理由）：
+///   校准本身**绝不能让初始化失败**。低配机器上任何一档分配失败，
+///   都应该继续尝试更小的档；全部失败才回退到最小可用参数。
+///   如果这里 panic 或返回错误，用户就永远建不了日记。
 pub fn calibrate_kdf_params(salt: &[u8; SALT_LEN], sample_pin: &[u8]) -> KdfParams {
-    let mut mib = KDF_CALIBRATE_MIN_MIB;
-    let mut chosen = KdfParams {
-        m_cost: mib * 1024,
-        t_cost: 3,
-        p_cost: 1,
-    };
+    // 环境变量显式跳过：让测试能断言确定的参数。
+    if std::env::var("DSH_DIARY_SKIP_KDF_CALIBRATION").is_ok() {
+        return KdfParams::default();
+    }
 
-    loop {
+    // 逐档尝试。注意每一档都会真正跑一次派生，所以总共约 0.1+0.2+0.4+0.8 秒。
+    // 这比"猜一次就定"慢，但换来的是任何一档失败都能优雅降级。
+    for mib in [64u32, 128, 256, KDF_CALIBRATE_MAX_MIB] {
         let candidate = KdfParams {
             m_cost: mib * 1024,
             t_cost: 3,
             p_cost: 1,
         };
 
-        // 分配失败说明内存不够，退回上一档。
         let Ok(argon) = candidate.to_argon2() else {
-            return chosen;
+            continue; // 这一档参数非法，试下一档
         };
 
         let mut probe = [0u8; KEY_LEN];
@@ -122,20 +129,27 @@ pub fn calibrate_kdf_params(salt: &[u8; SALT_LEN], sample_pin: &[u8]) -> KdfPara
         zeroize(&mut probe);
 
         if !ok {
-            return chosen;
+            continue; // 内存分配失败，试更小的一档
         }
 
-        chosen = candidate;
-
-        // 达到目标区间，或已到上限，就停。
-        if elapsed >= KDF_TARGET_MIN_MS || mib >= KDF_CALIBRATE_MAX_MIB {
-            return chosen;
+        // 耗时进入目标区间 -> 就用这一档
+        if elapsed >= KDF_TARGET_MIN_MS {
+            return candidate;
         }
-        if elapsed > KDF_TARGET_MAX_MS {
-            return chosen;
+        // 还没到区间但已到内存上限 -> 只能用这一档了
+        if mib >= KDF_CALIBRATE_MAX_MIB {
+            return candidate;
         }
+        // 否则继续放大
+    }
 
-        mib = (mib * 2).min(KDF_CALIBRATE_MAX_MIB);
+    // 所有档位都失败（极端低配或异常环境）。
+    // 回退到最小可用参数，而不是报错 —— 宁可安全性弱一点，
+    // 也要让用户能建起自己的日记。这个取舍在此明确写下。
+    KdfParams {
+        m_cost: KDF_CALIBRATE_MIN_MIB * 1024,
+        t_cost: 3,
+        p_cost: 1,
     }
 }
 
@@ -549,5 +563,48 @@ mod tests {
         assert_eq!(loaded.params.p_cost, params.p_cost);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn calibration_returns_usable_params_and_never_fails() {
+        // 校准的**健壮性**是本测试的重点：它绝不能让初始化失败。
+        // 无论机器多弱，都必须返回一组能实际派生出密钥的参数。
+        //
+        // 注意：这里不碰 DSH_DIARY_SKIP_KDF_CALIBRATION 环境变量 ——
+        // 改进程环境变量会影响并行运行的其他测试，是测试污染的经典来源。
+        let salt = generate_salt();
+        let params = calibrate_kdf_params(&salt, b"135790");
+
+        // 必须落在合理区间内
+        assert!(
+            params.m_cost >= KDF_CALIBRATE_MIN_MIB * 1024,
+            "内存开销不应低于下限，实际 {} KiB",
+            params.m_cost
+        );
+        assert!(
+            params.m_cost <= KDF_CALIBRATE_MAX_MIB * 1024,
+            "内存开销不应高于上限，实际 {} KiB",
+            params.m_cost
+        );
+        assert_eq!(params.t_cost, 3);
+        assert_eq!(params.p_cost, 1);
+
+        // 最关键的一条：返回的参数必须真的能派生出密钥。
+        // 如果这一步失败，用户就永远建不了日记 —— 本测试就是防这个。
+        let key = derive_key(b"135790", &salt, &params)
+            .expect("校准出的参数必须能实际派生密钥");
+        assert_eq!(key.len(), KEY_LEN);
+    }
+
+    #[test]
+    fn default_params_are_within_calibration_bounds() {
+        // 默认值必须落在校准的上限内，否则低配机器上"跳过校准"这条路径
+        // 会分配失败。
+        let d = KdfParams::default();
+        assert!(
+            d.m_cost <= KDF_CALIBRATE_MAX_MIB * 1024,
+            "默认 m_cost 不应超过校准上限"
+        );
+        assert!(d.m_cost >= KDF_CALIBRATE_MIN_MIB * 1024);
     }
 }

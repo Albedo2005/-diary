@@ -52,3 +52,11 @@ target/**/*.d
 *.diarydb
 crypto_meta.bin
 lockout.json
+
+# 日记数据目录 —— 绝对不要提交。
+# 应用是便携式的，数据存在项目里的 data/ 目录（见 commands::resolve_data_dir）。
+# 里面有：加密数据库、加密元信息(salt+KDF参数)、锁定状态、附件。
+# 这些是用户的私人数据：加密库不该进版本库，而 crypto_meta.json 与
+# lockout.json 是明文，更不该提交。
+/data/
+app/data/

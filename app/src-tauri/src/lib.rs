@@ -27,6 +27,10 @@ pub mod error;
 pub mod schema;
 pub mod seg;
 
+// `Manager` trait 必须显式引入：`App` 上的 `manage()` / `state()` 等方法是
+// 由这个 trait 提供的，不在作用域内会报 "no method named `manage`"。
+use tauri::Manager;
+
 use commands::VaultState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -50,7 +54,16 @@ pub fn run() {
     }
 
     tauri::Builder::default()
-        .manage(VaultState::new(data_dir))
+        .setup(move |app| {
+            // VaultState 需要被两处共享：
+            //   1. Tauri 的状态管理（前端调用 command 时使用）
+            //   2. 后台自动备份线程
+            // 所以包成 Arc，两处各持一个引用。
+            let state = std::sync::Arc::new(VaultState::new(data_dir));
+            app.manage(state.clone());
+            commands::spawn_auto_backup(state);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             // 状态
             commands::app_status,
@@ -72,8 +85,10 @@ pub fn run() {
             commands::stats,
             // 搜索
             commands::search_entries,
-            // 维护
+            // 维护与备份
             commands::backup_now,
+            commands::backup_status,
+            commands::set_auto_backup,
             commands::list_backups,
             commands::integrity_check,
             commands::rebuild_indexes,

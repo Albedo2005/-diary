@@ -13,12 +13,15 @@ import UnlockScreen from "./components/UnlockScreen.vue";
 import {
   backupNow,
   cryptoInfo,
+  getBackupStatus,
   getStats,
   getStatus,
   integrityCheck,
   lockVault,
+  setAutoBackup,
   toAppError,
   type AppStatus,
+  type BackupStatus,
   type CryptoInfo,
   type Stats,
 } from "./api";
@@ -35,6 +38,7 @@ const refreshToken = ref(0);
 
 const stats = ref<Stats | null>(null);
 const crypto = ref<CryptoInfo | null>(null);
+const backup = ref<BackupStatus | null>(null);
 const showAbout = ref(false);
 
 const toast = ref("");
@@ -63,9 +67,14 @@ async function boot() {
 
 async function loadAux() {
   try {
-    const [s, c] = await Promise.all([getStats(), cryptoInfo()]);
+    const [s, c, b] = await Promise.all([
+      getStats(),
+      cryptoInfo(),
+      getBackupStatus(),
+    ]);
     stats.value = s;
     crypto.value = c;
+    backup.value = b;
   } catch {
     // 辅助信息失败不应阻塞主流程。
   }
@@ -86,20 +95,50 @@ async function doLock() {
     status.value = await lockVault();
     stats.value = null;
     crypto.value = null;
+    backup.value = null;
   } catch (e) {
     flash(toAppError(e).message);
   }
 }
 
+/**
+ * 立即备份。
+ * 备份目录固定是数据目录下的 backups —— 前端不再传路径，
+ * 改由后端用默认目录，避免界面与后端对"备份放哪"产生分歧。
+ */
 async function doBackup() {
-  const dir = status.value?.data_dir;
+  const dir = backup.value?.dest_dir;
   if (!dir) return;
   try {
     const r = await backupNow(dir);
-    flash(`已备份到 ${r.path}（${humanBytes(r.bytes)}）`);
+    flash(`已备份（${humanBytes(r.bytes)}）`);
+    backup.value = await getBackupStatus();
   } catch (e) {
     flash(`备份失败：${toAppError(e).message}`);
   }
+}
+
+/** 开关自动备份。 */
+async function toggleAutoBackup() {
+  if (!backup.value) return;
+  const next = !backup.value.auto_enabled;
+  try {
+    await setAutoBackup(next);
+    backup.value = await getBackupStatus();
+    flash(next ? "已开启自动备份（每天一次）" : "已关闭自动备份");
+  } catch (e) {
+    flash(toAppError(e).message);
+  }
+}
+
+/** 把"距下次备份"的秒数变成人话。 */
+function humanInterval(secs: number): string {
+  if (secs <= 0) return "即将执行";
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  if (h >= 24) return `${Math.floor(h / 24)} 天后`;
+  if (h > 0) return `${h} 小时后`;
+  return `${Math.max(m, 1)} 分钟后`;
 }
 
 async function doIntegrity() {
@@ -233,6 +272,27 @@ onUnmounted(() => {
                 <br />从 {{ stats.first_date }} 到 {{ stats.last_date }}
               </template>
             </dd>
+
+            <!-- 备份：这是日记软件最重要的一项，所以放在靠近底部但仍显眼的位置 -->
+            <dt>备份</dt>
+            <dd v-if="backup">
+              <label class="toggle-row">
+                <input
+                  type="checkbox"
+                  :checked="backup.auto_enabled"
+                  @change="toggleAutoBackup"
+                />
+                <span>每天自动备份</span>
+              </label>
+              <div class="backup-meta">
+                已有 {{ backup.backup_count }} 份
+                <template v-if="backup.auto_enabled">
+                  · 下次{{ humanInterval(backup.secs_until_next) }}
+                </template>
+                <br />保留最近 {{ backup.keep_recent }} 份，并按月各留一份
+              </div>
+              <div class="mono backup-path">{{ backup.dest_dir }}</div>
+            </dd>
           </dl>
 
           <div class="actions">
@@ -242,9 +302,8 @@ onUnmounted(() => {
           </div>
 
           <p class="warn">
-            备份文件与数据库使用同一密码，恢复时用同一个密码即可打开。备份是<strong
-              >密文</strong
-            >，可以直接放到网盘。
+            备份是<strong>密文</strong>，与数据库使用同一个密码，恢复时用那个密码即可打开。
+            可以直接把 <code>backups</code> 目录整体复制到网盘或其他硬盘。
           </p>
         </div>
       </div>
@@ -395,6 +454,36 @@ dd {
   font-family: var(--mono);
   font-size: 12px;
   word-break: break-all;
+}
+/* 自动备份开关：用一个朴素的原生 checkbox，不引入组件库 */
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
+  user-select: none;
+}
+.toggle-row input {
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+.backup-meta {
+  margin-top: 5px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-3);
+}
+.backup-path {
+  margin-top: 5px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.warn code {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 1px 4px;
+  background: var(--hover);
+  border-radius: 3px;
 }
 .actions {
   display: flex;

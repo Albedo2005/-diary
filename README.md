@@ -67,6 +67,12 @@ diary/
     check-persisted-env.ps1     读注册表看真实永久配置
     migrate-to-d.ps1            C 盘→D 盘迁移（已完成，备查）
   target/                       workspace 共用的构建产物
+  data/                         **日记数据（不进 git）**
+    diary.db                    加密数据库
+    crypto_meta.json            salt 与 KDF 参数（明文，但不可泄漏）
+    lockout.json                密码错误次数与锁定状态（明文）
+    backups/                    自动备份（密文，按保留策略清理）
+  发布/                          交付物：可执行文件、安装包、使用说明
   probe/                        Rust 技术验证原型（已验证完毕，保留作证据）
   app/                          正式应用
     src/                        Vue 前端
@@ -76,13 +82,29 @@ diary/
       styles/global.css         主题变量与 Markdown 阅读样式
     src-tauri/                  Rust 后端
       src/lib.rs                应用入口与 command 注册
-      src/commands.rs           前端唯一能调用的接口
-      src/db.rs                 数据层：CRUD、双索引搜索、备份
+      src/commands.rs           前端唯一能调用的接口 + 后台自动备份线程
+      src/db.rs                 数据层：CRUD、双索引搜索、备份、保留策略
       src/crypto.rs             加密与密码策略（风险最高，改动前先读注释）
       src/schema.rs             建表 SQL（每条设计决定都写了理由）
       src/seg.rs                中文分词
       src/error.rs              前端可消费的错误类型
 ```
+
+## 数据放在哪
+
+**便携式**：数据跟着项目走，不塞进 AppData。这样你能自己看见、
+自己备份自己的日记文件。
+
+解析顺序（`commands::resolve_data_dir`）：
+1. 环境变量 `DSH_DIARY_DATA_DIR`
+2. 从 exe 所在目录**向上查找**名为 `data` 的目录（最多 4 层）
+   —— 开发时 exe 在 `target/release/` 下距根三层，打包后在安装目录里一层就到
+3. 都找不到就建在 exe 旁边
+
+⚠️ `data/` 已在 `.gitignore` 里。`diary.db` 本身是加密的，但
+`crypto_meta.json`（salt + KDF 参数）与 `lockout.json` 是**明文**，
+而且都是私人数据 —— **绝不要提交**。
+
 
 ## 开发命令
 

@@ -61,14 +61,54 @@ impl VaultState {
     }
 }
 
-/// 解析应用数据目录。
+/// 解析数据目录：日记到底存在哪。
 ///
-/// 用系统标准的应用数据目录，而不是程序所在目录 —— 后者在安装到
-/// Program Files 后通常不可写。
+/// 这是一个**便携式应用**：数据跟着项目走，而不是塞进 AppData。
+/// 用户要能自己看见、自己备份自己的日记文件。
+///
+/// 解析顺序（先命中者胜）：
+///   1. 环境变量 `DSH_DIARY_DATA_DIR` —— 用于测试与多套数据并存
+///   2. 从可执行文件所在目录**向上查找**名为 `data` 的目录，
+///      最多找 4 层。之所以要向上找：开发时 exe 在 `target/release/` 下，
+///      距项目根有三层；打包安装后 exe 在安装目录里，一层就到。
+///   3. 都找不到就用可执行文件旁边的 `data`（首次运行时创建）
+///
+/// 为什么不沿用"系统标准应用数据目录"（AppData）：
+///   那会让用户找不到自己的日记文件，也不符合"完全离线、数据在本地"的定位。
+///   代价是安装到 Program Files 后可能不可写 —— 但本应用是便携式的，
+///   不会装到那里。
 pub fn resolve_data_dir() -> AppResult<PathBuf> {
-    let proj = directories::ProjectDirs::from("com", "dsh", "Diary")
-        .ok_or_else(|| AppError::State("无法确定应用数据目录".into()))?;
-    Ok(proj.data_dir().to_path_buf())
+    // 1. 环境变量覆盖
+    if let Ok(dir) = std::env::var("DSH_DIARY_DATA_DIR") {
+        let p = PathBuf::from(dir);
+        if !p.as_os_str().is_empty() {
+            return Ok(p);
+        }
+    }
+
+    // 2. 从 exe 所在目录向上找已有的 data 目录
+    let exe = std::env::current_exe()
+        .map_err(|e| AppError::State(format!("无法确定程序位置: {e}")))?;
+
+    if let Some(mut dir) = exe.parent().map(|p| p.to_path_buf()) {
+        for _ in 0..4 {
+            let candidate = dir.join("data");
+            if candidate.is_dir() {
+                return Ok(candidate);
+            }
+            match dir.parent() {
+                Some(parent) => dir = parent.to_path_buf(),
+                None => break,
+            }
+        }
+        // 3. 找不到就建在 exe 旁边
+        return Ok(exe
+            .parent()
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| PathBuf::from("data")));
+    }
+
+    Err(AppError::State("无法确定数据目录".into()))
 }
 
 fn with_vault<T>(state: &State<'_, VaultState>, f: impl FnOnce(&Vault) -> AppResult<T>) -> AppResult<T> {
@@ -296,35 +336,178 @@ pub fn search_entries(
 
 /// 备份到指定目录。文件名自动带时间戳。
 ///
-/// ⚠️ 会同时写一个 `crypto_meta-<时间戳>.meta.json`。
+/// ⚠️ 会同时写一个 `diary-<时间戳>.meta.json`。
 ///    这不是可选项：`crypto_meta.json` 含 salt 与 KDF 参数，
 ///    **缺了它，即使 PIN 完全正确也派生不出密钥，备份永久打不开。**
 ///    所以备份产物永远是"两个文件一组"，界面上必须一起提示用户。
 ///    它是明文，但 salt 与 KDF 参数本身不是秘密，放在一起不会降低安全性。
 #[tauri::command]
 pub fn backup_now(state: State<'_, VaultState>, dest_dir: String) -> AppResult<BackupResult> {
-    let meta_src = crypto::crypto_meta_path(&state.data_dir);
+    let stamp_text = now_stamp();
     let result = with_vault(&state, |v| {
-        let stamp = std::time::SystemTime::now()
+        let (r, _deleted) = v.run_backup(&PathBuf::from(&dest_dir), &stamp_text)?;
+        Ok(r)
+    })?;
+    copy_crypto_meta(&state.data_dir, &dest_dir, &stamp_text)?;
+    Ok(result)
+}
+
+/// 备份相关状态，供界面展示。
+#[derive(Debug, Clone, Serialize)]
+pub struct BackupStatus {
+    /// 备份目录（默认是数据目录下的 backups 子目录）。
+    pub dest_dir: String,
+    /// 自动备份是否开启。
+    pub auto_enabled: bool,
+    /// 下次自动备份还需多少秒。0 表示很快就会执行。
+    pub secs_until_next: u64,
+    /// 备份间隔（秒），用于界面显示"每天一次"。
+    pub interval_secs: u64,
+    /// 保留的最近份数。
+    pub keep_recent: usize,
+    /// 已有备份数量。
+    pub backup_count: usize,
+}
+
+/// 默认备份目录：数据目录下的 `backups`。
+///
+/// 放在数据目录里而不是让用户随便选，理由：备份是密文，
+/// 和数据放一起是安全的；而且用户能在一个地方看到全部相关文件。
+pub fn default_backup_dir(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("backups")
+}
+
+#[tauri::command]
+pub fn backup_status(state: State<'_, VaultState>) -> AppResult<BackupStatus> {
+    let dest = default_backup_dir(&state.data_dir);
+    let dest_str = dest.to_string_lossy().to_string();
+    let count = std::fs::read_dir(&dest)
+        .map(|it| {
+            it.filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".db"))
+                .count()
+        })
+        .unwrap_or(0);
+
+    with_vault(&state, |v| {
+        Ok(BackupStatus {
+            dest_dir: dest_str,
+            auto_enabled: v.auto_backup_enabled()?,
+            secs_until_next: v.secs_until_next_auto_backup()?,
+            interval_secs: crate::db::AUTO_BACKUP_INTERVAL_SECS,
+            keep_recent: v.keep_recent_backups()?,
+            backup_count: count,
+        })
+    })
+}
+
+/// 开关自动备份。
+#[tauri::command]
+pub fn set_auto_backup(state: State<'_, VaultState>, enabled: bool) -> AppResult<()> {
+    with_vault(&state, |v| {
+        v.set_setting(crate::db::setting_keys::AUTO_BACKUP_ENABLED, if enabled { "true" } else { "false" })
+    })
+}
+
+/// 后台自动备份的检查间隔。
+///
+/// 为什么不直接 sleep 24 小时再备份：应用可能中途被关闭、电脑可能休眠，
+/// 一次长睡眠会直接错过。改成每 5 分钟醒来检查一次
+/// "距上次备份是否已超过 24 小时"，无论是刚开机还是长期运行，
+/// 都能在合理时间内补上备份。
+///
+/// 计时依据是**上次备份的时间戳**（存在库里），不是内存状态，
+/// 所以重启应用不会重置计时。
+pub const AUTO_BACKUP_CHECK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
+/// 启动后台自动备份线程。
+///
+/// 为什么用普通线程而不是 async task：
+///   备份全程都要持有 Vault 的 Mutex，并且做的是阻塞式文件 I/O 与
+///   SQLite 调用 —— 放在 async 里只会阻塞执行器线程，没有任何收益。
+///   一个独立线程语义更清晰，也不需要额外引入运行时依赖。
+///
+/// 线程会随进程退出而结束（detached），不需要 join。
+pub fn spawn_auto_backup(state: std::sync::Arc<VaultState>) {
+    std::thread::Builder::new()
+        .name("auto-backup".into())
+        .spawn(move || loop {
+            std::thread::sleep(AUTO_BACKUP_CHECK_INTERVAL);
+            if let Err(e) = try_auto_backup(&state) {
+                // 自动备份属于后台维护，失败不该打扰用户，但要在日志留痕。
+                eprintln!("自动备份跳过: {e}");
+            }
+        })
+        .ok();
+}
+
+/// 执行一次自动备份（仅在开启、已解锁且到期时）。
+fn try_auto_backup(state: &VaultState) -> AppResult<Option<BackupResult>> {
+    // 未解锁：跳过。这是正常状态，不算错误。
+    let guard = state
+        .vault
+        .lock()
+        .map_err(|_| AppError::State("内部状态锁已损坏".into()))?;
+    let Some(vault) = guard.as_ref() else {
+        return Ok(None);
+    };
+
+    if !vault.auto_backup_enabled()? {
+        return Ok(None);
+    }
+    if vault.secs_until_next_auto_backup()? > 0 {
+        return Ok(None);
+    }
+
+    // 一篇都没写就不备份，省得备份目录里堆一堆空库。
+    // 但仍要推进计时器，否则每 5 分钟都会重复走到这里。
+    if vault.stats()?.total_entries == 0 {
+        let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let stamp_text = format_unix_compact(stamp);
-        let dest = PathBuf::from(&dest_dir).join(format!("diary-{stamp_text}.db"));
-        v.backup_to(&dest)
-    })?;
-
-    // 把加密元信息复制到备份旁边。
-    if meta_src.exists() {
-        let stem = PathBuf::from(&result.path)
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "diary".into());
-        let meta_dst = PathBuf::from(&dest_dir).join(format!("{stem}.meta.json"));
-        std::fs::copy(&meta_src, &meta_dst)?;
+        vault.set_setting(crate::db::setting_keys::LAST_BACKUP_AT, &now.to_string())?;
+        return Ok(None);
     }
 
-    Ok(result)
+    let stamp = now_stamp();
+    let dest = default_backup_dir(&state.data_dir);
+    let (result, deleted) = vault.run_backup(&dest, &stamp)?;
+    // 先释放锁再做文件复制，缩短持锁时间。
+    drop(guard);
+
+    // meta 文件必须一起写，否则备份根本无法解锁。
+    copy_crypto_meta(&state.data_dir, &dest.to_string_lossy(), &stamp)?;
+
+    eprintln!(
+        "自动备份完成: {} ({} 字节)，清理旧备份 {} 个文件",
+        result.path, result.bytes, deleted
+    );
+    Ok(Some(result))
+}
+
+/// 当前时间戳，格式 `YYYYMMDD-HHMMSS`（UTC）。
+pub fn now_stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format_unix_compact(secs)
+}
+
+/// 把 `crypto_meta.json` 复制到备份目录，命名与备份主文件配对。
+///
+/// 这是备份能否恢复的**必要条件**：meta 里有 salt 与 KDF 参数，
+/// 没有它即使密码正确也派生不出密钥。
+fn copy_crypto_meta(data_dir: &std::path::Path, dest_dir: &str, stamp: &str) -> AppResult<()> {
+    let meta_src = crypto::crypto_meta_path(data_dir);
+    if !meta_src.exists() {
+        return Ok(());
+    }
+    let meta_dst = PathBuf::from(dest_dir).join(format!("diary-{stamp}.meta.json"));
+    std::fs::copy(&meta_src, &meta_dst)?;
+    Ok(())
 }
 
 /// 列出备份目录里已有的备份，按时间倒序。

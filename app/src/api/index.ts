@@ -83,6 +83,22 @@ export interface BackupResult {
   created_at: number;
 }
 
+/** 备份相关状态，供界面展示。 */
+export interface BackupStatus {
+  /** 备份目录（数据目录下的 backups 子目录）。 */
+  dest_dir: string;
+  /** 自动备份是否开启。默认开启。 */
+  auto_enabled: boolean;
+  /** 距下次自动备份还有多少秒。0 表示很快执行。 */
+  secs_until_next: number;
+  /** 备份间隔（秒）。 */
+  interval_secs: number;
+  /** 保留的最近份数。 */
+  keep_recent: number;
+  /** 已有备份数量。 */
+  backup_count: number;
+}
+
 export interface IntegrityReport {
   entry_count: number;
   orphan_word_index: number;
@@ -203,6 +219,13 @@ export const searchEntries = (query: string, limit = 50) =>
 
 export const backupNow = (destDir: string) =>
   invoke<BackupResult>("backup_now", { destDir });
+
+/** 备份状态：目录、是否自动、距下次多长时间、已有几份。 */
+export const getBackupStatus = () => invoke<BackupStatus>("backup_status");
+
+/** 开关自动备份。默认开启 —— 对日记来说"忘了开备份"等于"没有备份"。 */
+export const setAutoBackup = (enabled: boolean) =>
+  invoke<void>("set_auto_backup", { enabled });
 
 export const listBackups = (destDir: string) =>
   invoke<BackupResult[]>("list_backups", { destDir });

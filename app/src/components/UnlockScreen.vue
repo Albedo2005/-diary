@@ -142,7 +142,13 @@ async function submit() {
 <template>
   <div class="unlock">
     <div class="card">
-      <h1>{{ isInit ? "创建你的日记" : "解锁" }}</h1>
+      <!-- 标题居中，两行：主标题 + 副标题 -->
+      <header class="hero">
+        <h1>日记</h1>
+        <p class="subtitle">
+          {{ isInit ? "记录每天的自己" : "输入密码，继续写下去" }}
+        </p>
+      </header>
 
       <p v-if="isInit" class="lead">
         日记内容会加密保存在这台电脑上。请设置一个密码 ——
@@ -232,9 +238,17 @@ async function submit() {
           首次创建需要约 1 秒 —— 这是在用 Argon2id 把密码推导成加密密钥，
           高计算成本正是为了抵抗暴力破解。
         </p>
-      </template>
 
-      <p class="path-note">数据目录：{{ local.data_dir }}</p>
+        <!--
+          数据目录只在**首次创建**时告知一次，日常解锁界面不显示。
+          理由：解锁页每次打开都会看到，重复显示一个用户改变不了的路径
+          只是噪音。但它又必须被说过一次，否则用户不知道自己的日记存在哪、
+          该备份什么。
+        -->
+        <p v-if="isInit" class="path-note">
+          日记会保存在：<code>{{ local.data_dir }}</code>
+        </p>
+      </template>
     </div>
   </div>
 </template>
@@ -256,10 +270,23 @@ async function submit() {
   padding: 32px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.06);
 }
+/* 标题区：居中，主标题 + 副标题 */
+.hero {
+  text-align: center;
+  margin-bottom: 24px;
+}
 h1 {
-  margin: 0 0 12px;
-  font-size: 22px;
+  margin: 0 0 6px;
+  font-size: 28px;
   font-weight: 600;
+  letter-spacing: 2px;
+  color: var(--text-1);
+}
+.subtitle {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-3);
+  letter-spacing: 0.5px;
 }
 .lead {
   margin: 0 0 22px;
@@ -391,10 +418,20 @@ h1 {
   line-height: 1.6;
   color: var(--text-3);
 }
+/* 只在初始化时出现一次的数据目录提示 */
 .path-note {
-  margin: 20px 0 0;
+  margin: 18px 0 0;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
   font-size: 11px;
+  line-height: 1.7;
   color: var(--text-3);
+  text-align: center;
+}
+.path-note code {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-2);
   word-break: break-all;
 }
 </style>

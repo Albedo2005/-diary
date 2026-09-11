@@ -18,6 +18,19 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// 自动备份：两次备份之间的最小间隔（秒）。默认每天一次。
+pub const AUTO_BACKUP_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+/// 自动备份默认保留的最近份数。
+pub const DEFAULT_KEEP_RECENT: usize = 7;
+
+/// 设置项的键名。集中在这里，避免拼写漂移。
+pub mod setting_keys {
+    pub const AUTO_BACKUP_ENABLED: &str = "auto_backup_enabled";
+    pub const LAST_BACKUP_AT: &str = "last_backup_at";
+    pub const KEEP_RECENT: &str = "keep_recent";
+}
+
 /// 一条日记。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
@@ -852,6 +865,179 @@ impl Vault {
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
+
+    // -----------------------------------------------------------------------
+    // 应用设置（键值对，存在 app_setting 表）
+    // -----------------------------------------------------------------------
+
+    /// 读取一个设置项。不存在时返回 None。
+    pub fn get_setting(&self, key: &str) -> AppResult<Option<String>> {
+        let v = self
+            .conn
+            .query_row(
+                "SELECT value FROM app_setting WHERE key = ?1",
+                params![key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
+    /// 写入一个设置项（存在则覆盖）。
+    pub fn set_setting(&self, key: &str, value: &str) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT INTO app_setting (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// 自动备份是否开启。**默认开启** —— 对日记软件来说，
+    /// "用户忘了开备份"和"没有备份"是等价的，而丢日记不可挽回。
+    pub fn auto_backup_enabled(&self) -> AppResult<bool> {
+        Ok(self
+            .get_setting(setting_keys::AUTO_BACKUP_ENABLED)?
+            .map(|v| v == "true")
+            .unwrap_or(true))
+    }
+
+    /// 上次备份时间（Unix 秒）。从未备份过则返回 0。
+    pub fn last_backup_at(&self) -> AppResult<u64> {
+        Ok(self
+            .get_setting(setting_keys::LAST_BACKUP_AT)?
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0))
+    }
+
+    /// 自动备份保留的最近份数。
+    pub fn keep_recent_backups(&self) -> AppResult<usize> {
+        Ok(self
+            .get_setting(setting_keys::KEEP_RECENT)?
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_KEEP_RECENT))
+    }
+
+    /// 到下次自动备份还差多少秒。0 表示现在就该备份。
+    ///
+    /// 为什么用"距上次备份的间隔"而不是固定时刻：
+    /// 用户不一定每天开机，固定时刻会整天错过。按间隔算，
+    /// 只要距上次超过 24 小时就会补上。
+    pub fn secs_until_next_auto_backup(&self) -> AppResult<u64> {
+        let last = self.last_backup_at()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // 系统时间被往回调过时（now < last），视为到期，避免永远不再备份。
+        if now < last {
+            return Ok(0);
+        }
+        Ok(AUTO_BACKUP_INTERVAL_SECS.saturating_sub(now - last))
+    }
+
+    /// 执行一次备份，记录时间，并按保留策略清理旧备份。
+    ///
+    /// 返回 (备份结果, 删除的旧文件数)。调用方（命令层）负责同时复制
+    /// `crypto_meta.json` —— 少了它备份无法解锁。
+    pub fn run_backup(&self, dest_dir: &Path, stamp: &str) -> AppResult<(BackupResult, usize)> {
+        let dest = dest_dir.join(format!("diary-{stamp}.db"));
+        let result = self.backup_to(&dest)?;
+
+        // 记录时间，成功后才记 —— 否则失败也会把计时器重置。
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.set_setting(setting_keys::LAST_BACKUP_AT, &now.to_string())?;
+
+        // 清理旧备份。失败不影响备份本身。
+        let keep = self.keep_recent_backups()?;
+        let (deleted, _kept) = prune_backups(dest_dir, keep).unwrap_or((0, 0));
+
+        Ok((result, deleted))
+    }
+}
+
+/// 备份保留策略：在备份目录里清理过期的备份。
+///
+/// 规则（两条同时生效）：
+///   1. **保留最近 N 份**（默认 7 份）—— 应付"最近写坏了想回退"的场景
+///   2. **每个月保留最早的 1 份** —— 即"每月归档"，应付"想看看半年前的状态"
+///
+/// 为什么需要这个：P0 要求自动备份，而自动备份如果没有清理，
+/// 备份目录会无限增长。日记一年也就几 MB，但备份是**整库复制**，
+/// 每天一份、一年就是 365 份文件，用户会看到一个塞满的目录。
+///
+/// 安全约束（很重要）：
+///   - 只处理形如 `diary-*.db` 与配对的 `diary-*.meta.json`，不碰其他文件
+///   - **任何删除失败都只记录、不中断备份流程** ——
+///     清理是维护动作，不该让"备份成功"这件事变成失败
+///   - 被保留的文件绝不删除
+///
+/// 返回 (删除的文件数, 保留的文件数)。
+pub fn prune_backups(dir: &Path, keep_recent: usize) -> AppResult<(usize, usize)> {
+    if !dir.is_dir() {
+        return Ok((0, 0));
+    }
+
+    // 收集所有备份主文件（.db），以及它们的创建时间。
+    // 时间取自文件名里的时间戳（diary-YYYYMMDD-HHMMSS.db），
+    // 不依赖文件系统时间 —— 后者在复制/恢复后会变。
+    let mut backups: Vec<(String, String)> = Vec::new(); // (文件名stem, 时间戳)
+    for item in std::fs::read_dir(dir)? {
+        let item = item?;
+        let name = item.file_name().to_string_lossy().to_string();
+        if !name.starts_with("diary-") || !name.ends_with(".db") {
+            continue;
+        }
+        let stem = name.trim_end_matches(".db").to_string();
+        // 期望格式 diary-YYYYMMDD-HHMMSS
+        let stamp = stem.strip_prefix("diary-").unwrap_or("").to_string();
+        if stamp.len() != 15 || !stamp.chars().all(|c| c.is_ascii_digit() || c == '-') {
+            continue; // 不是本程序生成的命名，不动它
+        }
+        backups.push((stem, stamp));
+    }
+
+    // 按时间戳倒序（新的在前）
+    backups.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // 决定保留哪些：
+    //   - 前 keep_recent 份
+    //   - 每个月（YYYYMM）出现的最早那一份
+    let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (stem, _) in backups.iter().take(keep_recent) {
+        keep.insert(stem.clone());
+    }
+    // 从旧到新遍历，每个月第一个遇到的（即该月最早）标记保留
+    let mut seen_months: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (stem, stamp) in backups.iter().rev() {
+        let month = stamp.get(0..6).unwrap_or("").to_string();
+        if month.len() == 6 && seen_months.insert(month) {
+            keep.insert(stem.clone());
+        }
+    }
+
+    let mut deleted = 0usize;
+    for (stem, _) in &backups {
+        if keep.contains(stem) {
+            continue;
+        }
+        // 删除主文件与配对的 meta 文件。失败只记录，不中断。
+        let db = dir.join(format!("{stem}.db"));
+        let meta = dir.join(format!("{stem}.meta.json"));
+        for f in [db, meta] {
+            if f.exists() {
+                match std::fs::remove_file(&f) {
+                    Ok(()) => deleted += 1,
+                    Err(e) => eprintln!("清理备份失败（忽略）: {} -> {e}", f.display()),
+                }
+            }
+        }
+    }
+
+    Ok((deleted, keep.len()))
 }
 
 #[derive(Debug, Clone, Serialize)]
