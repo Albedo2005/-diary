@@ -1071,3 +1071,43 @@ fn new_entry_defaults_to_unlocked() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 空日记不该被锁定。
+///
+/// 回归测试：1.3 的 lock_all_entries 是 `WHERE locked = 0`，**没看内容**，
+/// 把"有行、正文却是空的"旧草稿一起锁上了。症状是用户看到**空日记也显示已锁定**，
+/// 而且那一天再也写不进第一个字。
+#[test]
+fn empty_draft_is_never_locked() {
+    let dir = temp_dir("lock-empty-draft");
+    let vault = Vault::create(&dir, PIN, None).unwrap();
+
+    // 只打了标题、正文没写：表里有行，但按 has_content 的规则不算"写过"。
+    vault.save_entry("2026-09-11", "只打了标题", "").unwrap();
+
+    // 全量锁定不能碰它
+    assert_eq!(
+        vault.lock_all_entries().unwrap(),
+        0,
+        "没有正文的草稿不该被锁定"
+    );
+
+    let e = vault.open_entry("2026-09-11").unwrap();
+    assert!(e.id != 0, "这一行确实存在");
+    assert!(!e.locked, "空日记不该显示为锁定");
+    assert!(!vault.is_locked("2026-09-11").unwrap());
+
+    // 关键：这一天必须还能写进第一个字
+    vault
+        .save_entry("2026-09-11", "只打了标题", "终于写了正文")
+        .expect("空草稿必须可写");
+    let e = vault.open_entry("2026-09-11").unwrap();
+    assert_eq!(e.content_md, "终于写了正文");
+    assert!(!e.locked);
+
+    // 有了正文之后，全量锁定才应该生效
+    assert_eq!(vault.lock_all_entries().unwrap(), 1);
+    assert!(vault.is_locked("2026-09-11").unwrap());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

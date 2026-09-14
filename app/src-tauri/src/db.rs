@@ -537,16 +537,19 @@ impl Vault {
             .ok_or_else(|| AppError::State("保存后读取失败".into()))
     }
 
-    /// 某天是否处于锁定状态。不存在该行时返回 false。
+    /// 某天是否处于锁定状态。
+    ///
+    /// 不存在该行、或者该行**没有正文**时一律返回 false。
+    /// 空草稿必须永远可写 —— 否则用户没法在那一天写下第一个字。
     pub fn is_locked(&self, date: &str) -> AppResult<bool> {
         validate_date(date)?;
+        let sql = format!(
+            "SELECT locked FROM entry WHERE entry_date = ?1 AND ({})",
+            has_content_sql()
+        );
         let v: Option<i64> = self
             .conn
-            .query_row(
-                "SELECT locked FROM entry WHERE entry_date = ?1",
-                params![date],
-                |r| r.get(0),
-            )
+            .query_row(&sql, params![date], |r| r.get(0))
             .optional()?;
         Ok(v.unwrap_or(0) != 0)
     }
@@ -563,8 +566,24 @@ impl Vault {
     ///
     /// 只锁"写过"的行，并且跳过已经锁好的：一次切换日期不必写上百行。
     pub fn lock_all_entries(&self) -> AppResult<usize> {
+        // 先把"被锁住但没有正文"的行解锁。
+        // 这是 1.3 留下的脏数据：当时的 lock_all_entries 不看内容，
+        // 把正文为空的旧草稿一起锁了，用户看着空日记显示"已锁定"却写不进去。
+        // 放在这里修，是因为这个方法每次启动和切换日期都会跑。
+        self.conn.execute(
+            &format!(
+                "UPDATE entry SET locked = 0 WHERE locked = 1 AND NOT ({})",
+                has_content_sql()
+            ),
+            [],
+        )?;
+
+        // 只锁"写过"的日记。
         let n = self.conn.execute(
-            "UPDATE entry SET locked = 1 WHERE locked = 0",
+            &format!(
+                "UPDATE entry SET locked = 1 WHERE locked = 0 AND ({})",
+                has_content_sql()
+            ),
             [],
         )?;
         Ok(n)
@@ -579,11 +598,24 @@ impl Vault {
     /// 也不该因为点了锁定就在日历上留下一条记录。
     pub fn set_entry_locked(&self, date: &str, locked: bool) -> AppResult<Entry> {
         validate_date(date)?;
-        let flag: i64 = if locked { 1 } else { 0 };
-        self.conn.execute(
-            "UPDATE entry SET locked = ?2 WHERE entry_date = ?1",
-            params![date, flag],
-        )?;
+        if locked {
+            // 只锁"写过"的日记。给空行设 locked=1 是个陷阱：
+            // 界面上看不出锁（map_entry 会按内容否掉），但等用户终于写下正文，
+            // 这一行会**突然变成锁定的**，用户完全不知道为什么。
+            // 所以宁可在写入那一刻就拦住，不留下这种会事后发作的标记。
+            self.conn.execute(
+                &format!(
+                    "UPDATE entry SET locked = 1 WHERE entry_date = ?1 AND ({})",
+                    has_content_sql()
+                ),
+                params![date],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE entry SET locked = 0 WHERE entry_date = ?1",
+                params![date],
+            )?;
+        }
         // updated_at 刻意不动：锁定不是对内容的修改，
         // 不该让"最后修改时间"跟着跳一下。
         self.open_entry(date)
@@ -1188,14 +1220,21 @@ impl IntegrityReport {
 }
 
 fn map_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
+    let content_md: String = r.get(3)?;
+    // ⚠️ 没内容的行一律不算锁定。
+    //    数据库里可能存在"有行、正文却是空的"旧草稿（只打了标题，或早期版本
+    //    点一下日历就建了行）。这种行一旦被标记成锁定，那一天就**永远写不进
+    //    第一个字** —— 用户看到的是"空日记也是锁着的"，而且怎么点都解不开。
+    //    locked 只对"写过"的日记成立，判定规则和日历、搜索共用同一条。
+    let locked = r.get::<_, i64>(8)? != 0 && has_content(&content_md);
     Ok(Entry {
         id: r.get(0)?,
         entry_date: r.get(1)?,
         title: r.get(2)?,
-        content_md: r.get(3)?,
+        content_md,
         word_count: r.get(4)?,
         mood: r.get(5)?,
-        locked: r.get::<_, i64>(8)? != 0,
+        locked,
         created_at: r.get(6)?,
         updated_at: r.get(7)?,
     })
@@ -1430,6 +1469,57 @@ mod tests {
         assert_eq!(e.title, "标题");
         assert!(!e.locked, "升级上来的旧日记默认应该是未锁定的");
         assert!(vault.is_locked("2026-09-11").is_ok(), "locked 列应已可用");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 1.3 留下的脏数据：**空行被标记成 locked=1**。
+    ///
+    /// 这类行必须被当成"未锁定"，而且还能写进正文 —— 否则用户看着空日记
+    /// 显示"已锁定"，怎么点都改不了。全量锁定时还要顺手把锁标清掉。
+    #[test]
+    fn locked_flag_on_an_empty_row_is_ignored_and_cleaned_up() {
+        let dir = std::env::temp_dir().join("dsh-diary-lock-legacy");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let vault = Vault::create(&dir, "135790", None).unwrap();
+        // 两条只有标题、没有正文的旧草稿
+        vault.save_entry("2026-09-11", "只打了标题", "").unwrap();
+        vault.save_entry("2026-09-12", "也只打了标题", "").unwrap();
+        // 直接写库，模拟 1.3 的 lock_all_entries 干过的事
+        vault
+            .conn
+            .execute(
+                "UPDATE entry SET locked = 1 WHERE entry_date IN ('2026-09-11','2026-09-12')",
+                [],
+            )
+            .unwrap();
+
+        // 读出来必须是"未锁定"：没正文的行不算锁定
+        assert!(
+            !vault.open_entry("2026-09-11").unwrap().locked,
+            "空日记不该显示为锁定"
+        );
+        assert!(!vault.is_locked("2026-09-11").unwrap());
+        // save_entry / delete_entry 的锁定拦截也不能误伤它
+        vault
+            .save_entry("2026-09-11", "只打了标题", "终于写了正文")
+            .expect("空草稿必须能写进第一个字");
+
+        // 全量锁定会先把无正文的锁标清掉（09-12 仍是空的），
+        // 再把有正文的锁上（09-11 已写了正文）
+        vault.lock_all_entries().unwrap();
+        let stale: i64 = vault
+            .conn
+            .query_row(
+                "SELECT locked FROM entry WHERE entry_date = '2026-09-12'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 0, "无正文的锁标必须被清掉，否则以后会突然发作");
+        assert!(vault.is_locked("2026-09-11").unwrap(), "写过之后应正常锁上");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
