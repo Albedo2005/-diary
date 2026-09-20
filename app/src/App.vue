@@ -6,6 +6,7 @@
  * 所以主界面直接是"日历 + 编辑器"，没有首页、没有列表页中转。
  */
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import CalendarPanel from "./components/CalendarPanel.vue";
 import EditorPane from "./components/EditorPane.vue";
 import SearchPanel from "./components/SearchPanel.vue";
@@ -15,18 +16,22 @@ import {
   backupNow,
   cryptoInfo,
   DEFAULT_AUTO_LOCK_SECS,
+  DEFAULT_WINDOW_MODE,
   getBackupStatus,
   getSettings,
   getStats,
   getStatus,
+  getWindowMode,
   integrityCheck,
   lockVault,
   setAutoBackup,
+  setWindowMode,
   toAppError,
   type AppStatus,
   type BackupStatus,
   type CryptoInfo,
   type Stats,
+  type WindowMode,
 } from "./api";
 import { humanBytes, todayKey } from "./utils/date";
 
@@ -54,6 +59,18 @@ const showSettings = ref(false);
  */
 const autoLockSecs = ref(DEFAULT_AUTO_LOCK_SECS);
 
+/**
+ * 当前窗口形态。
+ *
+ * ⚠️ 与 autoLockSecs 的关键区别：它存在**库外明文文件**（`ui_prefs.json`）里，
+ *    **未解锁也能读到** —— 所以它必须在"解锁之前"就加载好，
+ *    否则设置页打开时会显示一个错的当前档位。
+ *
+ * 启动时的窗口形态其实是**后端**在 setup 里应用的（那时前端还没跑起来），
+ * 这里只是把同一个值读回来给界面显示，两边共用同一个文件。
+ */
+const windowMode = ref<WindowMode>(DEFAULT_WINDOW_MODE);
+
 const toast = ref("");
 let toastTimer: number | null = null;
 
@@ -68,6 +85,10 @@ function flash(msg: string) {
 async function boot() {
   booting.value = true;
   fatal.value = "";
+  // 窗口形态存在**库外**明文文件里，不需要解锁 —— 所以放在这里，
+  // 而不是"解锁成功之后"那一段。放到后面的话，设置页在未解锁时
+  // 会显示一个错的当前档位。
+  await loadWindowMode();
   try {
     status.value = await getStatus();
     if (status.value.unlocked) {
@@ -80,6 +101,20 @@ async function boot() {
     fatal.value = toAppError(e).message;
   } finally {
     booting.value = false;
+  }
+}
+
+/**
+ * 读窗口形态。
+ *
+ * 单独一个 try：读不到就用默认档，不值得为它挡住整个启动 ——
+ * 后端本身也不报错（文件缺失 / 值非法一律回落 "window"）。
+ */
+async function loadWindowMode() {
+  try {
+    windowMode.value = await getWindowMode();
+  } catch {
+    windowMode.value = DEFAULT_WINDOW_MODE;
   }
 }
 
@@ -245,14 +280,58 @@ watch(unlocked, (ok) => {
   if (!ok) clearLockTimer();
 });
 
+/**
+ * 应用窗口形态：后端一条命令同时完成"落盘"和"改窗口"。
+ * 成功后同步本地值；失败如实提示，本地值不动。
+ */
+async function applyWindowMode(mode: WindowMode) {
+  try {
+    await setWindowMode(mode);
+    windowMode.value = mode;
+  } catch (e) {
+    flash(toAppError(e).message);
+  }
+}
+
+/**
+ * 全屏下的兜底出口：**F11 或 Esc** 回到"窗口"档。
+ *
+ * 顺序是刻意的 —— **先真的退出全屏（脱困优先），再落盘**。
+ * 不能只调 `setWindowMode("window")`：那是"落盘 + 改窗口"的组合，
+ * 万一写盘抛错，人就被留在全屏里出不来了。
+ * 所以第一步先直接 `setFullscreen(false)`，它的成败都不阻塞第二步。
+ *
+ * 只在"当前是全屏"时生效，其余情况一概不碰按键 ——
+ * 否则会把编辑器里的 Esc 也吃掉。
+ *
+ * ⚠️ 这里是前端直接调窗口 API，依赖 capabilities 里的
+ *    `core:window:allow-set-fullscreen` —— 缺了只在**运行时**报错，
+ *    编译期完全看不见。
+ */
+function onKeydown(e: KeyboardEvent) {
+  if (windowMode.value !== "fullscreen") return;
+  if (e.key !== "F11" && e.key !== "Escape") return;
+  e.preventDefault();
+  void (async () => {
+    try {
+      await getCurrentWindow().setFullscreen(false); // ① 先脱困
+    } catch {
+      // 脱不掉也无所谓：下面还会走一次完整的 setWindowMode 再试。
+    }
+    await applyWindowMode("window"); // ② 再落盘
+  })();
+}
+
 onMounted(() => {
   void boot();
   window.addEventListener("blur", onBlur);
   window.addEventListener("focus", onFocus);
+  window.addEventListener("keydown", onKeydown);
 });
 onUnmounted(() => {
   window.removeEventListener("blur", onBlur);
   window.removeEventListener("focus", onFocus);
+  window.removeEventListener("keydown", onKeydown);
 });
 </script>
 
@@ -329,11 +408,13 @@ onUnmounted(() => {
         :crypto="crypto"
         :stats="stats"
         :auto-lock-secs="autoLockSecs"
+        :window-mode="windowMode"
         @close="showSettings = false"
         @backup="doBackup"
         @integrity="doIntegrity"
         @toggle-auto-backup="toggleAutoBackup"
         @auto-lock-secs="(s) => (autoLockSecs = s)"
+        @window-mode="(m) => (windowMode = m)"
         @notice="flash"
       />
     </template>

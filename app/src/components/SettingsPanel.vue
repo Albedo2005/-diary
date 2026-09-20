@@ -9,10 +9,11 @@
  * 已接线的项：
  *   - 数据与备份 三项 —— 逻辑留在 App.vue，这里只发信号
  *   - **自动锁定时长**（指令 11）—— 见下面 onChangeAutoLock 的说明
+ *   - **窗口模式**（指令 12）—— 见下面 onChangeWindowMode 的说明
  * 仍是占位的项（点了会明说"尚未接入"并立刻复位，不留"看着开了其实没开"）：
- *   - 主密码 → 指令 3；免密打开 → 指令 4；窗口模式 → 指令 12
+ *   - 主密码 → 指令 3；免密打开 → 指令 4
  *
- * 组件不自己拉状态：status / backup / crypto / stats / autoLockSecs
+ * 组件不自己拉状态：status / backup / crypto / stats / autoLockSecs / windowMode
  * 全部从 App.vue 传入，免得两份状态各走各的、切个分类就对不上。
  */
 import { computed, ref } from "vue";
@@ -20,11 +21,14 @@ import pkg from "../../package.json";
 import {
   AUTO_LOCK_OPTIONS,
   setAutoLockSecs,
+  setWindowMode,
   toAppError,
+  WINDOW_MODE_OPTIONS,
   type AppStatus,
   type BackupStatus,
   type CryptoInfo,
   type Stats,
+  type WindowMode,
 } from "../api";
 
 const props = defineProps<{
@@ -34,6 +38,8 @@ const props = defineProps<{
   stats: Stats | null;
   /** 自动锁定时长（秒）。0 = 永不。由 App.vue 持有，是唯一真值源。 */
   autoLockSecs: number;
+  /** 当前窗口形态。同样由 App.vue 持有，是唯一真值源。 */
+  windowMode: WindowMode;
 }>();
 
 const emit = defineEmits<{
@@ -46,6 +52,8 @@ const emit = defineEmits<{
   (e: "toggle-auto-backup"): void;
   /** 自动锁定时长已成功写入后端，通知 App.vue 更新本地值。 */
   (e: "auto-lock-secs", secs: number): void;
+  /** 窗口形态已成功写入后端，通知 App.vue 更新本地值。 */
+  (e: "window-mode", mode: WindowMode): void;
   /** 一句提示，由 App.vue 的 toast 显示。 */
   (e: "notice", message: string): void;
 }>();
@@ -147,13 +155,35 @@ function onToggleAutoUnlock(e: Event) {
   notYet("免密打开", "指令 4");
 }
 
-/** 窗口模式。三档就是任务栏右键那三个选项。 */
-const windowMode = ref<"window" | "maximized" | "fullscreen">("window");
+// ---------------------------------------------------------------------------
+// 窗口模式（指令 12，已接线）
+// ---------------------------------------------------------------------------
 
-function onChangeWindowMode(e: Event) {
-  // TODO(指令 12)：持久化到 data/ui_prefs.json，并在启动时应用。
-  (e.target as HTMLSelectElement).value = windowMode.value;
-  notYet("窗口模式", "指令 12");
+/**
+ * 切换窗口形态。
+ *
+ * 和自动锁定同一套路：**自己调后端**，因为"失败要把下拉恢复成原值"
+ * 需要拿到调用结果，而 emit 是单向的（父组件没法把失败回传）。
+ *
+ * 与自动锁定的一点区别：这条命令后端是"**先落盘、再改窗口**"，
+ * 所以失败时窗口根本不会变，不存在"界面变了但没生效"的中间态。
+ * 仍然手动把 DOM 拨回去，理由和上一条一样：
+ * 用户已选中新项而 props 没变，Vue 认为"绑定的值没变化"、不会重渲染它。
+ *
+ * ⚠️ 切换后**不要重挂本组件** —— 弹窗会闪一下、右栏滚动位置也会丢。
+ *    弹窗宽被 min(632px, 93vw) 卡住、高 72vh，随窗口变大而变高是正常的。
+ */
+async function onChangeWindowMode(e: Event) {
+  const el = e.target as HTMLSelectElement;
+  const next = el.value as WindowMode;
+  if (next === props.windowMode) return;
+  try {
+    await setWindowMode(next);
+    emit("window-mode", next);
+  } catch (err) {
+    el.value = props.windowMode; // 回滚，不留假状态
+    emit("notice", toAppError(err).message);
+  }
 }
 </script>
 
@@ -242,9 +272,13 @@ function onChangeWindowMode(e: Event) {
               </div>
               <div class="ctl">
                 <select :value="windowMode" @change="onChangeWindowMode">
-                  <option value="window">窗口</option>
-                  <option value="maximized">最大化</option>
-                  <option value="fullscreen">全屏</option>
+                  <option
+                    v-for="o in WINDOW_MODE_OPTIONS"
+                    :key="o.value"
+                    :value="o.value"
+                  >
+                    {{ o.label }}
+                  </option>
                 </select>
               </div>
             </div>

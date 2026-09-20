@@ -67,10 +67,41 @@ pub fn run() {
             //
             //    共享问题由 VaultState 内部持有的 Arc 解决：
             //    `clone()` 只是 Arc 计数 +1，两份共享同一份数据。
-            let state = VaultState::new(data_dir);
+            let state = VaultState::new(data_dir.clone());
             app.manage(state.clone());
             // 后台线程持有另一个克隆，与命令层看到的是同一份解锁状态。
             commands::spawn_auto_backup(state);
+
+            // 窗口形态必须在"窗口出现"**之前**定下来，所以它存在**库外**
+            // 明文文件（ui_prefs.json）里，不放加密库 —— 放加密库会变成
+            // "每次启动先出小窗口、解锁后才撑开"，每次都跳一下。
+            //
+            // 把"读文件 + 应用"包进闭包并**忽略其错误**，然后无条件 show()：
+            // 下面 tauri.conf.json 里设了 "visible": false（为启动零跳动），
+            // 一旦在中途 return Err 或 panic，窗口就永远不出现 ——
+            // 用户会得到"点了没反应"的隐形应用，只能去任务管理器杀。
+            if let Some(window) = app.get_webview_window("main") {
+                let apply = |w: &tauri::WebviewWindow| -> crate::error::AppResult<()> {
+                    let mode = commands::load_window_mode(&data_dir);
+                    commands::apply_window_mode_at_startup(w, &mode)
+                };
+                if let Err(e) = apply(&window) {
+                    eprintln!("应用窗口形态失败（不影响启动）：{e}");
+                }
+
+                // ⚠️ 硬要求：无论上面读到什么、成功还是失败，窗口必须显示出来。
+                if let Err(e) = window.show() {
+                    eprintln!("显示主窗口失败：{e}");
+                }
+            } else {
+                // 理论上不会走到：窗口 label 未显式设置，Tauri 默认就是 "main"。
+                // 但配上 "visible": false 之后，任何一条漏掉 show 的路径都会
+                // 变成"隐形应用"，所以宁可把全部窗口兜一遍。
+                for (label, w) in app.webview_windows() {
+                    eprintln!("未找到 main 窗口，兜底显示 {label}");
+                    let _ = w.show();
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -111,6 +142,10 @@ pub fn run() {
             // 写是"专用写"（每项一条，因为写入要校验、要有明确语义）。
             commands::get_settings,
             commands::set_auto_lock_secs,
+            // 窗口形态：存**库外明文文件** ui_prefs.json，
+            // 未解锁也能读改（理由见 commands.rs 里 get_window_mode 的说明）。
+            commands::get_window_mode,
+            commands::set_window_mode,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");
