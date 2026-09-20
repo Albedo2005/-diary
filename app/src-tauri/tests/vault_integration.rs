@@ -1111,3 +1111,286 @@ fn empty_draft_is_never_locked() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ---------------------------------------------------------------------------
+// 修改主密码（指令 3 · PRAGMA rekey）
+// ---------------------------------------------------------------------------
+
+/// 改成这个新密码。与 PIN 位数相同、内容不同，能验出"密钥真的变了"。
+const NEW_PIN: &str = "246813";
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 把一份备份（连同它的 meta）还原成一个能独立解锁的数据目录。
+///
+/// 备份能否打开取决于**配对**的那份 `crypto_meta.json`（含 salt 与 KDF 参数），
+/// 缺了它即使密码正确也派生不出密钥 —— 所以还原动作必须两个文件一起搬。
+fn restore_backup(backup_db: &std::path::Path, meta_src: &std::path::Path, tag: &str) -> std::path::PathBuf {
+    let dir = temp_dir(tag);
+    std::fs::copy(backup_db, dir.join("diary.db")).expect("复制备份失败");
+    std::fs::copy(meta_src, dir.join("crypto_meta.json")).expect("复制 meta 失败");
+    dir
+}
+
+#[test]
+fn change_password_rekeys_and_old_pin_stops_working() {
+    let dir = temp_dir("chpw-ok");
+    let old_backup = dir.join("老备份.db");
+    {
+        let vault = Vault::create(&dir, PIN, Some("旧提示".into())).unwrap();
+        seed(&vault);
+        // 改密码**之前**先留一份备份，后面用它验证"历史备份不受影响"。
+        vault.backup_to(&old_backup).unwrap();
+
+        let warnings =
+            app_lib::commands::change_password_core(&dir, &vault, PIN, NEW_PIN, Some("新提示".into()))
+                .expect("改密码应成功");
+        assert!(warnings.is_empty(), "正常环境下不该有收尾警告: {warnings:?}");
+    }
+
+    // 新密码能开、旧密码作废 —— 这是"改密码"的定义。
+    let vault = Vault::unlock(&dir, NEW_PIN).expect("新密码必须能解锁");
+    let err = Vault::unlock(&dir, PIN).expect_err("旧密码必须失效");
+    assert!(
+        matches!(err, AppError::WrongPin),
+        "旧密码应返回 WrongPin，实际: {err:?}"
+    );
+
+    // 数据不能有任何变化：正文、日历标记、搜索索引、统计全都要原样。
+    assert_eq!(vault.stats().unwrap().total_entries, 4);
+    assert_eq!(vault.list_month("2026-09").unwrap().len(), 4);
+    assert_eq!(vault.written_dates("2026-09-01", "2026-09-30").unwrap().len(), 4);
+    assert_eq!(vault.search("火锅", 10).unwrap().len(), 1, "搜索索引必须原样");
+    assert_eq!(
+        vault.open_entry("2026-09-12").unwrap().content_md,
+        "今天去爬山，看到了很美的日落，山顶风很大。"
+    );
+
+    // ① 改密码前做的备份：仍用**旧**密码打开 —— rekey 只重新加密主库，
+    //    历史备份文件一个字节都没被碰过。这也是界面上必须写明
+    //    "此前的备份仍需用旧密码打开"的原因。
+    let r1 = restore_backup(&old_backup, &dir.join("crypto_meta.json"), "chpw-restore-old");
+    Vault::unlock(&r1, PIN).expect("改密码前做的备份必须仍能用旧密码打开");
+    assert!(Vault::unlock(&r1, NEW_PIN).is_err(), "旧备份不该被新密码打开");
+
+    // ② 改密码**随手做**的那份新备份：必须已经对齐到新密码。
+    //    否则用户手里的备份全是旧密码的，而他很可能会忘掉那个旧密码。
+    let fresh: Vec<_> = std::fs::read_dir(dir.join("backups"))
+        .expect("改密码后应顺手做一次备份")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("db"))
+        .collect();
+    assert_eq!(fresh.len(), 1, "应恰好有一份随改密码产生的新备份");
+    let r2 = restore_backup(&fresh[0], &dir.join("crypto_meta.json"), "chpw-restore-new");
+    Vault::unlock(&r2, NEW_PIN).expect("改密码后的备份应能用新密码打开");
+    assert!(Vault::unlock(&r2, PIN).is_err(), "新备份不该还能用旧密码打开");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&r1);
+    let _ = std::fs::remove_dir_all(&r2);
+}
+
+#[test]
+fn change_password_with_wrong_old_pin_leaves_the_vault_untouched() {
+    let dir = temp_dir("chpw-badold");
+    let vault = Vault::create(&dir, PIN, None).unwrap();
+    seed(&vault);
+
+    let err = app_lib::commands::change_password_core(&dir, &vault, "999999", NEW_PIN, None)
+        .expect_err("旧密码不对必须失败");
+    assert!(matches!(err, AppError::WrongPin), "实际: {err:?}");
+
+    // 关键断言：库没被改坏 —— 旧密码照用，新密码进不来。
+    // 这一条防的是"验证旧密码时把连接或密钥弄脏"的写法。
+    drop(vault);
+    let v = Vault::unlock(&dir, PIN).expect("失败的改密码不该动到库");
+    assert_eq!(v.stats().unwrap().total_entries, 4);
+    assert!(Vault::unlock(&dir, NEW_PIN).is_err());
+
+    // 失败必须计数。否则"改密码"就是一个能无限次试旧密码的后门。
+    let st = LockoutState::load(&app_lib::crypto::lockout_path(&dir));
+    assert_eq!(st.failed_attempts, 1, "改密码失败必须计入失败次数");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn change_password_rejects_invalid_new_pin_without_touching_anything() {
+    let dir = temp_dir("chpw-badnew");
+    let vault = Vault::create(&dir, PIN, None).unwrap();
+    seed(&vault);
+
+    // 太短。
+    let e = app_lib::commands::change_password_core(&dir, &vault, PIN, "12345", None)
+        .expect_err("新密码太短必须拒绝");
+    assert!(matches!(e, AppError::InvalidPin(_)), "实际: {e:?}");
+
+    // 含字母。
+    let e = app_lib::commands::change_password_core(&dir, &vault, PIN, "abcdef", None)
+        .expect_err("新密码含字母必须拒绝");
+    assert!(matches!(e, AppError::InvalidPin(_)), "实际: {e:?}");
+
+    // 格式非法属于"还没开始改"，不该消耗尝试次数 —— 它和"猜密码"是两回事。
+    let st = LockoutState::load(&app_lib::crypto::lockout_path(&dir));
+    assert_eq!(st.failed_attempts, 0, "格式非法不该计入失败次数");
+
+    drop(vault);
+    let v = Vault::unlock(&dir, PIN).expect("旧密码必须仍然有效");
+    assert_eq!(v.stats().unwrap().total_entries, 4);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn change_password_updates_the_hint_and_survives_the_attempt_reset() {
+    let dir = temp_dir("chpw-hint");
+    let vault = Vault::create(&dir, PIN, Some("生日".into())).unwrap();
+    let lock_path = app_lib::crypto::lockout_path(&dir);
+    assert_eq!(LockoutState::load(&lock_path).hint.as_deref(), Some("生日"));
+
+    app_lib::commands::change_password_core(
+        &dir,
+        &vault,
+        PIN,
+        NEW_PIN,
+        Some("  和门牌号有关  ".into()),
+    )
+    .unwrap();
+
+    // 提示语必须跟着换：旧提示是照着旧密码写的，留着会直接把用户带沟里。
+    // 顺带验证首尾空白被清掉（清洗规则与初始化共用一份）。
+    let st = LockoutState::load(&lock_path);
+    assert_eq!(st.hint.as_deref(), Some("和门牌号有关"));
+    assert_eq!(st.failed_attempts, 0, "成功后失败计数必须清零");
+
+    // 留空 = 明确不要提示，不能把旧提示留着。
+    app_lib::commands::change_password_core(&dir, &vault, NEW_PIN, PIN, None).unwrap();
+    assert_eq!(LockoutState::load(&lock_path).hint, None, "留空应清掉旧提示");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 免密钥匙文件（指令 4 的文件）在改密码时的两种行为。
+///
+/// 指令 4 尚未实施，所以真实数据目录里没有这个文件 —— 但**两种行为现在就得定死**：
+///   · 文件不存在 → 什么都不做（绝不能替用户创建，那等于替他开了免密）
+///   · 文件存在   → 必须同步成新密钥（否则用户重启后免密失效，而他刚做的是改密码）
+#[test]
+fn change_password_only_syncs_an_existing_auto_login_file() {
+    let dir = temp_dir("chpw-autologin");
+    let vault = Vault::create(&dir, PIN, None).unwrap();
+    let auto_path = app_lib::crypto::auto_login_path(&dir);
+
+    // ① 不存在 → 不创建。
+    app_lib::commands::change_password_core(&dir, &vault, PIN, NEW_PIN, None).unwrap();
+    assert!(!auto_path.exists(), "免密未开启时不得创建钥匙文件");
+
+    // ② 存在 → 同步，且不能冲掉文件里的其它字段。
+    let mut key = app_lib::db::derive_and_verify(&dir, NEW_PIN).unwrap();
+    let key_before = hex(&key);
+    app_lib::crypto::zeroize(&mut key);
+    std::fs::write(
+        &auto_path,
+        format!("{{\"key_hex\":\"{key_before}\",\"enabled\":true}}"),
+    )
+    .unwrap();
+
+    const NEWEST_PIN: &str = "112233";
+    app_lib::commands::change_password_core(&dir, &vault, NEW_PIN, NEWEST_PIN, None).unwrap();
+
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&auto_path).unwrap()).unwrap();
+    let mut key = app_lib::db::derive_and_verify(&dir, NEWEST_PIN).unwrap();
+    let key_after = hex(&key);
+    app_lib::crypto::zeroize(&mut key);
+
+    assert_eq!(
+        doc["key_hex"],
+        serde_json::Value::String(key_after),
+        "钥匙文件必须同步成新密钥，否则重启后免密失效"
+    );
+    assert_eq!(
+        doc["enabled"],
+        serde_json::Value::Bool(true),
+        "同步只该改 key_hex，文件里其它字段不能被冲掉"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 改密码必须计入锁定期 —— 否则它就是一条免费爆破旧密码的通道。
+///
+/// 这是本指令最容易被漏掉的一条：`change_password` 里有一次"验证旧密码"，
+/// 如果只验证不计数，攻击者（或捡到电脑的人）就能挂着一个脚本慢慢试 ——
+/// 每次约 0.8 秒，6 位数字 100 万种，一夜跑完。
+#[test]
+fn change_password_counts_attempts_and_locks_out() {
+    let dir = temp_dir("chpw-lockout");
+    let vault = Vault::create(&dir, PIN, None).unwrap();
+
+    // 前 4 次：只是密码错。
+    // ⚠️ 上界用常量而不是写死 4：`1..MAX` 是**开区间**，正好试够 MAX-1 次，
+    //    与 crypto.rs 里那条锁定测试同一写法。写死数字的话，
+    //    将来调 MAX_FAILED_ATTEMPTS 时这条测试会以一个看不懂的方式挂掉。
+    for i in 1..app_lib::crypto::MAX_FAILED_ATTEMPTS {
+        let e = app_lib::commands::change_password_core(&dir, &vault, "999999", NEW_PIN, None)
+            .expect_err("错误旧密码必须失败");
+        assert!(matches!(e, AppError::WrongPin), "第 {i} 次实际: {e:?}");
+    }
+
+    // 第 5 次（= MAX_FAILED_ATTEMPTS）：触发锁定。
+    let e = app_lib::commands::change_password_core(&dir, &vault, "999999", NEW_PIN, None)
+        .expect_err("第 5 次必须触发锁定");
+    assert!(matches!(e, AppError::Locked { .. }), "实际: {e:?}");
+
+    // 锁定期间**即使旧密码正确也必须被拒**。否则改密码就成了绕过锁定期的后门：
+    // 主界面已经进不去了，却还能靠这个命令反复试。
+    let e = app_lib::commands::change_password_core(&dir, &vault, PIN, NEW_PIN, None)
+        .expect_err("锁定期内必须直接拒绝");
+    assert!(matches!(e, AppError::Locked { .. }), "实际: {e:?}");
+
+    // 密码自始至终没被改动。
+    drop(vault);
+    Vault::unlock(&dir, PIN).expect("锁定期内不该有任何密码被改掉");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 改密码之后，把**整个数据目录复制一份搬走**，也必须能用新密码读全。
+///
+/// 为什么要单测这一条：`PRAGMA rekey` 跑在 WAL 模式下，而 WAL 文件里可能
+/// 还留着**旧密钥加密的页**。万一它们没被一起重新加密、之后又被 checkpoint
+/// 折回主库，用户的日记就会变成"一半新钥匙、一半旧钥匙" —— 谁也打不开。
+/// 那属于不可逆丢数据，不能只凭"改完那一下还能打开"来推定。
+///
+/// 顺带这也是用户的真实操作：换电脑、备份，都是直接复制 data 目录。
+#[test]
+fn rekey_leaves_no_old_key_pages_behind() {
+    let dir = temp_dir("chpw-copy");
+    {
+        let vault = Vault::create(&dir, PIN, None).unwrap();
+        seed(&vault);
+        app_lib::commands::change_password_core(&dir, &vault, PIN, NEW_PIN, None).unwrap();
+    }
+
+    // 整个目录照搬：diary.db 连同可能存在的 -wal / -shm 一起，
+    // 等于用户直接把 data 目录复制走。
+    let copy = temp_dir("chpw-copy-dest");
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let p = entry.unwrap().path();
+        if p.is_file() {
+            std::fs::copy(&p, copy.join(p.file_name().unwrap())).unwrap();
+        }
+    }
+
+    let v = Vault::unlock(&copy, NEW_PIN).expect("整目录搬走后必须能用新密码读全");
+    assert_eq!(v.stats().unwrap().total_entries, 4);
+    assert_eq!(v.search("火锅", 10).unwrap().len(), 1);
+    assert!(Vault::unlock(&copy, PIN).is_err(), "搬出来的库里不该还有旧密钥能解开的页");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&copy);
+}
+

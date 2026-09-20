@@ -171,9 +171,11 @@ pub fn has_content(content_md: &str) -> bool {
 pub struct Vault {
     conn: Connection,
     seg: Segmenter,
-    /// 数据库文件路径。目前只用于诊断日志；保留是因为将来做
-    /// "在文件管理器里打开数据目录"这类功能时需要它。
-    #[allow(dead_code)]
+    /// 数据库文件路径。
+    ///
+    /// 两个用途：诊断日志，以及**改密码时倒推出数据目录** ——
+    /// lockout.json / auto_login.json / crypto_meta.json 都躺在库文件旁边，
+    /// 而 `change_password` 需要同时动后面那两份库外文件。
     pub db_path: PathBuf,
 }
 
@@ -227,6 +229,92 @@ fn unix_to_rfc3339(secs: u64) -> String {
 /// 那对中文会得出几乎为零的结果。
 fn count_words(text: &str) -> i64 {
     text.chars().filter(|c| !c.is_whitespace()).count() as i64
+}
+
+// ---------------------------------------------------------------------------
+// 密钥校验：全应用只留一份实现
+// ---------------------------------------------------------------------------
+
+/// 给连接设密钥并**主动验证**它能不能真正读库。
+///
+/// 这是加密体系里最容易写错、也最不能写错的一段，所以只留一份。
+/// 三处入口走的都是这里：开库（`Vault::open_with_key`）、
+/// 改密码前验证旧密码（`derive_and_verify`）、免密打开（指令 4 复用同一函数）。
+/// 各写一份的后果是某条路径的校验慢慢漂移，表现就是
+/// **某个入口错误密码也能进去**，而加密从外面看还一切正常。
+///
+/// ⚠️ 三个致命细节（改动前先读懂）：
+///
+/// 1. **`PRAGMA key` 必须是连接后的第一条语句**。在它之前执行任何其他 SQL，
+///    SQLite 会先以明文方式创建/读取文件头，之后再设密钥也**无法**加密已有内容。
+///    所以本函数只做这一件事，绝不"顺手先查一下版本号"。
+///
+/// 2. **用 `x'...'` 十六进制形式传密钥**，不要拼字符串。原始密钥是 32 字节
+///    二进制，直接转字符串会引入转义与编码问题。
+///
+/// 3. **必须主动执行一次查询来验证**。`PRAGMA key` 对错误密钥**不报错**
+///    （SQLCipher 是惰性的），要到第一次真正读取才炸，
+///    实测报 `hmac check failed for pgno=1` / `error decrypting page 1`。
+///    把这个"第一次读取"提前到这里，错误密码才能在解锁界面被立即发现，
+///    而不是等用户点开某篇日记才炸。
+fn apply_key_and_verify(conn: &Connection, key: &[u8; KEY_LEN]) -> AppResult<()> {
+    let hex_key = key.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    conn.pragma_update(None, "key", format!("x'{hex_key}'"))?;
+
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .map_err(|_| AppError::WrongPin)?;
+
+    Ok(())
+}
+
+/// 用给定密钥开一个**一次性连接**并验证，不改任何 pragma、不建任何表。
+///
+/// 用途：在不打扰当前已解锁连接的前提下，验证"另一把密钥对不对"。
+/// 改密码前验证旧密码就是靠它 —— 验完随即丢弃，主连接自始至终没被碰过。
+///
+/// ⚠️ 必须先确认库文件存在：`Connection::open` 对不存在的路径会**创建**一个
+///    空文件，那就等于凭空造出一个明文空库，把用户的数据目录搞脏。
+pub fn open_verified_connection(db_path: &Path, key: &[u8; KEY_LEN]) -> AppResult<Connection> {
+    if !db_path.exists() {
+        return Err(AppError::State("数据库不存在，无法验证密码".into()));
+    }
+    let conn = Connection::open(db_path)?;
+    apply_key_and_verify(&conn, key)?;
+    Ok(conn)
+}
+
+/// 从 PIN 派生密钥，并**实际打开库验证**它是对的，返回那把密钥。
+///
+/// ⚠️ 调用方拿到密钥后**必须**在用完后 `crypto::zeroize` 掉。
+///
+/// 为什么返回密钥而不是一个 bool：免密打开（指令 4）需要把
+/// "已经验证过的密钥"写进钥匙文件，而派生一次约 0.8 秒 ——
+/// 让调用方为了拿密钥再派生一遍纯属浪费，且那第二把密钥大概率没人清零。
+pub fn derive_and_verify(data_dir: &Path, pin: &str) -> AppResult<[u8; KEY_LEN]> {
+    let db_path = data_dir.join("diary.db");
+    let meta = CryptoMeta::load(&crypto::crypto_meta_path(data_dir))?
+        .ok_or_else(|| AppError::State("缺少加密元信息，无法验证密码".into()))?;
+
+    // ⚠️ 必须用**元信息里存储的参数**派生，绝不能退回 KdfParams::default()。
+    //    否则一旦默认值调整过，老用户会发现"密码明明对却打不开"。
+    let salt = meta.salt()?;
+    let mut key = crypto::derive_key(pin.as_bytes(), &salt, &meta.params)?;
+
+    match open_verified_connection(&db_path, &key) {
+        Ok(conn) => {
+            // 校验用的连接必须在这里就丢掉：改密码紧接着要 PRAGMA rekey，
+            // 而 rekey 需要独占，多留一个连接会让它拿到 SQLITE_BUSY。
+            drop(conn);
+            Ok(key)
+        }
+        Err(e) => {
+            // 失败路径也要清零 —— 错的密钥同样是密钥材料，没理由留着。
+            crypto::zeroize(&mut key);
+            Err(e)
+        }
+    }
 }
 
 impl Vault {
@@ -306,32 +394,120 @@ impl Vault {
         Ok(vault)
     }
 
+    /// 修改主密码。
+    ///
+    /// 原理：在**已解锁的连接**上执行 `PRAGMA rekey`，SQLCipher 会把整个库
+    /// 用新密钥重新加密一遍。不需要自己解密再重写，表结构与数据都不变。
+    ///
+    /// 为什么绝不用"解密导出 → 用新密码重建"那套：那要求把全部日记解密到
+    /// 某个地方（临时文件或内存），而"明文日记在磁盘上停留哪怕一瞬"
+    /// 正是这个应用存在的意义所不允许的。
+    ///
+    /// 步骤顺序不能乱 —— 每一步失败都对应一个"用户以为改了、其实没改"的坑：
+    ///   ① 校验新密码格式 —— 此时什么都还没动，不合格就在这里结束
+    ///   ② 验证旧密码     —— 用**独立连接**验证，主库纹丝未动
+    ///   ③ 派生新密钥     —— 沿用同一份 salt 与 KDF 参数
+    ///   ④ `PRAGMA rekey` —— 分界线：这一步成功，密码就真的换了
+    ///   ⑤ 换提示语 / ⑥ 同步免密钥匙 —— ④ 之后的收尾
+    ///
+    /// ⑤⑥ 失败**不算改密码失败**：那时密码已经是新的了，报错只会让用户
+    /// 拿旧密码反复试。所以它们被收集成 warnings 交给界面显示，而不是变成 Err。
+    ///
+    /// 返回"收尾阶段的警告列表"，空列表 = 全部干净。
+    ///
+    /// ⚠️ 调用方必须保证本方法在**未解锁时不会被调到**（命令层用 with_vault 兜住），
+    ///    并且整个调用期间独占连接：rekey 需要独占，后台备份线程会被
+    ///    那把 Mutex 自然挡住，不需要额外加锁。
+    pub fn change_password(
+        &self,
+        old_pin: &str,
+        new_pin: &str,
+        new_hint: Option<String>,
+        min_len: usize,
+    ) -> AppResult<Vec<String>> {
+        // ① 新密码格式。放在最前：不合格时连一次 KDF 都不用跑，更没碰过库。
+        crypto::validate_pin(new_pin, min_len)?;
+
+        let data_dir = self
+            .db_path
+            .parent()
+            .ok_or_else(|| AppError::State("无法定位数据目录".into()))?
+            .to_path_buf();
+
+        // ② 旧密码必须真的能开库。打不开 → WrongPin，到此为止。
+        let mut old_key = derive_and_verify(&data_dir, old_pin)?;
+        // 只拿它做验证，用完立刻清掉：新密钥才是接下来要用的那把。
+        crypto::zeroize(&mut old_key);
+
+        // ③ 派生新密钥：沿用**同一份 salt 与 KDF 参数**（crypto_meta.json 一个字节都不改）。
+        //    换 salt 会让所有历史备份与这份元信息对不上，而备份是救命的 ——
+        //    用户真正需要备份的时刻，正是他连密码都搞不清的时候。
+        let meta = CryptoMeta::load(&crypto::crypto_meta_path(&data_dir))?
+            .ok_or_else(|| AppError::State("缺少加密元信息，无法派生新密钥".into()))?;
+        let salt = meta.salt()?;
+        let mut new_key = crypto::derive_key(new_pin.as_bytes(), &salt, &meta.params)?;
+
+        let outcome = self.rekey_and_followups(&new_key, &data_dir, new_hint);
+        // 无论成功还是中途返回，新密钥都在这里被清掉。
+        // 这也是把 ④⑤⑥ 拆出去的唯一理由：留在本方法里任何一个 `?`
+        // 都会提前 return，那把密钥就永远留在内存里了。
+        crypto::zeroize(&mut new_key);
+        outcome
+    }
+
+    /// ④⑤⑥：rekey 本体与它之后的收尾。
+    fn rekey_and_followups(
+        &self,
+        new_key: &[u8; KEY_LEN],
+        data_dir: &Path,
+        new_hint: Option<String>,
+    ) -> AppResult<Vec<String>> {
+        // ④ 重新加密整个库。成功的瞬间，密码就已经换了。
+        //    传法与 PRAGMA key 完全一致（同样是 x'...' 十六进制）。
+        let hex_key = new_key.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        self.conn
+            .pragma_update(None, "rekey", format!("x'{hex_key}'"))
+            .map_err(|e| {
+                AppError::State(format!(
+                    "重新加密失败（密码很可能未改动，请先用原密码试解锁）: {e}"
+                ))
+            })?;
+
+        // ── 以下两步都已经在"密码换掉了"之后：失败只记警告，不返回 Err。──
+        let mut warnings = Vec::new();
+
+        // ⑤ 提示语必须一起换。它存在 lockout.json（库外明文），而
+        //    record_success 只清失败次数、不清提示 —— 不改的话，
+        //    用户下次输错密码会看到照着**旧密码**写的提示，直接把人带沟里。
+        if let Err(e) =
+            crypto::LockoutState::update_hint(&crypto::lockout_path(data_dir), new_hint)
+        {
+            warnings.push(format!("提示语未能更新（{e}），请稍后到设置里重设"));
+        }
+
+        // ⑥ 免密开着时必须同步钥匙文件，否则用户重启后免密失效 ——
+        //    而他刚做的是"改密码"，完全看不出两者的关联。
+        //    文件不存在（免密未开）时是空操作，**不会**凭空创建。
+        if let Err(e) = crypto::sync_auto_login_key(data_dir, new_key) {
+            warnings.push(format!(
+                "免密钥匙文件未能同步（{e}），请关掉免密再重新打开一次"
+            ));
+        }
+
+        Ok(warnings)
+    }
+
     /// 建立连接并设置密钥。
     ///
-    /// ⚠️ 三个容易致命的细节：
-    ///
-    /// 1. **`PRAGMA key` 必须是连接后的第一条语句**。在它之前执行任何其他 SQL，
-    ///    SQLite 会先以明文方式创建/读取文件头，之后再设密钥也无法加密已有内容。
-    ///
-    /// 2. **用 `x'...'` 十六进制形式传密钥**，不要拼字符串。原始密钥是 32 字节
-    ///    二进制，直接转字符串会引入转义与编码问题。
-    ///
-    /// 3. **必须主动执行一次查询来验证密钥**。`PRAGMA key` 本身对错误密钥不会
-    ///    报错（SQLCipher 是惰性的）。密钥错时第一次真正读取会失败，
-    ///    实测报 `hmac check failed for pgno=1` / `error decrypting page 1`。
-    ///    这里把这个"第一次读取"提前到打开阶段，好处是错误密码能在解锁界面
-    ///    被立即发现，而不是等到用户点开某篇日记才炸。
+    /// 设密钥与验证那一小段是整个加密体系的命门，已抽到模块级的
+    /// `apply_key_and_verify()` —— 那里写了三条铁律，改动前请先读它。
+    /// 这里只负责"建连接 → 验密钥 → 打开两个必要 pragma"。
     fn open_with_key(db_path: &Path, key: &[u8; KEY_LEN]) -> AppResult<Self> {
         let conn = Connection::open(db_path)?;
 
-        let hex_key = key.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        conn.pragma_update(None, "key", format!("x'{hex_key}'"))?;
-
-        // 触发密钥验证。这一步失败 = 密码错误（或数据库损坏）。
-        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
-            r.get::<_, i64>(0)
-        })
-        .map_err(|_| AppError::WrongPin)?;
+        // ⚠️ 这一行必须是连接后的第一条语句：在它之前执行任何其他 SQL，
+        //    SQLite 会先按明文读一遍文件头，之后再设密钥也救不回来。
+        apply_key_and_verify(&conn, key)?;
 
         // 外键约束默认关闭，必须显式打开，否则删除日记时附件与标签不会级联清理。
         conn.pragma_update(None, "foreign_keys", "ON")?;

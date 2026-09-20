@@ -25,6 +25,7 @@ import {
   toAppError,
   type AppStatus,
   type BackupStatus,
+  type ChangePasswordResult,
   type CryptoInfo,
   type Stats,
 } from "./api";
@@ -167,6 +168,36 @@ async function toggleAutoBackup() {
   } catch (e) {
     flash(toAppError(e).message);
   }
+}
+
+/** 重新拉一次状态。改密码失败会改变剩余尝试次数 / 是否已锁定。 */
+async function refreshStatus() {
+  try {
+    status.value = await getStatus();
+  } catch {
+    // 保持旧状态。为这一项弹错误不值得 —— 下一次操作还会再拉一次。
+  }
+}
+
+/**
+ * 主密码已更换。
+ *
+ * 状态用后端返回的那一份**整体替换**，而不是只改提示语：
+ * 改密码会同时影响提示语、剩余尝试次数（清零）与锁定状态，
+ * 前端自己拼一份必然漏项。
+ *
+ * 收尾警告必须如实显示：它们都发生在"密码已经换掉"之后，
+ * 不显示用户就会以为一切都好了（比如以为免密还能用）。
+ */
+function onPasswordChanged(res: ChangePasswordResult) {
+  status.value = res.status;
+  flash(
+    res.warnings.length > 0
+      ? `密码已更换；${res.warnings.join("；")}`
+      : "密码已更换"
+  );
+  // 换完密码会自动备份一份新的，备份数量跟着变了。
+  void loadAux();
 }
 
 /** 检查搜索索引与正文是否对得上。结果用 toast 汇报，不弹新窗口。 */
@@ -334,6 +365,8 @@ onUnmounted(() => {
         @integrity="doIntegrity"
         @toggle-auto-backup="toggleAutoBackup"
         @auto-lock-secs="(s) => (autoLockSecs = s)"
+        @password-changed="onPasswordChanged"
+        @refresh-status="refreshStatus"
         @notice="flash"
       />
     </template>

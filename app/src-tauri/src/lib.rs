@@ -77,10 +77,11 @@ pub fn run() {
             // 状态
             commands::app_status,
             commands::estimate_kdf_ms,
-            // 初始化 / 解锁 / 锁定
+            // 初始化 / 解锁 / 锁定 / 改密码
             commands::initialize_vault,
             commands::unlock_vault,
             commands::lock_vault,
+            commands::change_password,
             // 日记读写
             // 注意：这里注册的是 open_entry（纯读取、不写库），
             // 而不是早期版本的 get_or_create_entry。后者会让"点开日历"

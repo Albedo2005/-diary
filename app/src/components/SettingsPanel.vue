@@ -9,8 +9,9 @@
  * 已接线的项：
  *   - 数据与备份 三项 —— 逻辑留在 App.vue，这里只发信号
  *   - **自动锁定时长**（指令 11）—— 见下面 onChangeAutoLock 的说明
+ *   - **修改主密码**（指令 3）—— 见下面 submitChangePin 的说明
  * 仍是占位的项（点了会明说"尚未接入"并立刻复位，不留"看着开了其实没开"）：
- *   - 主密码 → 指令 3；免密打开 → 指令 4
+ *   - 免密打开 → 指令 4
  *
  * ⚠️ 【外观】分类已撤销（2026-09-20）：它当初只为装"窗口模式"而建，
  * 而窗口模式（指令 12）连同【全屏】档一起被用户否掉了 —— 他不需要沉浸式，
@@ -20,15 +21,18 @@
  *
  * 组件不自己拉状态：status / backup / crypto / stats / autoLockSecs
  * 全部从 App.vue 传入，免得两份状态各走各的、切个分类就对不上。
+ * 例外只有一处：改密码成功后由 App.vue 用返回的新状态覆盖（见 password-changed）。
  */
-import { computed, ref } from "vue";
+import { computed, nextTick, ref } from "vue";
 import pkg from "../../package.json";
 import {
   AUTO_LOCK_OPTIONS,
+  changePassword,
   setAutoLockSecs,
   toAppError,
   type AppStatus,
   type BackupStatus,
+  type ChangePasswordResult,
   type CryptoInfo,
   type Stats,
 } from "../api";
@@ -52,6 +56,10 @@ const emit = defineEmits<{
   (e: "toggle-auto-backup"): void;
   /** 自动锁定时长已成功写入后端，通知 App.vue 更新本地值。 */
   (e: "auto-lock-secs", secs: number): void;
+  /** 主密码已更换。带上后端返回的最新状态与收尾警告，由 App.vue 落库。 */
+  (e: "password-changed", res: ChangePasswordResult): void;
+  /** 请 App.vue 重新拉一次 status（改密码失败会改变剩余尝试次数 / 锁定状态）。 */
+  (e: "refresh-status"): void;
   /** 一句提示，由 App.vue 的 toast 显示。 */
   (e: "notice", message: string): void;
 }>();
@@ -127,6 +135,106 @@ async function onChangeAutoLock(e: Event) {
 }
 
 // ---------------------------------------------------------------------------
+// 修改主密码（指令 3，已接线）
+// ---------------------------------------------------------------------------
+
+/**
+ * 子表单是否展开。
+ *
+ * 为什么"就地展开"而不是再叠一层弹窗：设置页本身已经是模态遮罩了，
+ * 再叠一层就要处理 z-index、Esc 该关哪一层、点外面算点哪一层 ——
+ * 为一个三格表单付这些代价不值得。展开在「主密码」那一行下面，
+ * 在哪儿点开就在哪儿填，视线不用跳。
+ */
+const changePinOpen = ref(false);
+const pinBusy = ref(false);
+const pinError = ref("");
+
+const pinForm = ref({ old: "", next: "", confirm: "", hint: "" });
+const oldPinInput = ref<HTMLInputElement | null>(null);
+
+/**
+ * 当前提示语。它是**明文**存在 lockout.json 里的（解锁前就要显示，
+ * 放不进加密库），所以在设置页里显示它不会多泄漏什么 ——
+ * 但它正是"改密码时必须顺手换掉"的那条信息，所以必须让人看得见。
+ */
+const currentHint = computed(() => props.status.hint ?? "未设置");
+
+function openChangePin() {
+  changePinOpen.value = true;
+  pinError.value = "";
+  // 展开后自动聚焦第一格：这是"就地展开"相对弹窗唯一丢掉的便利，补回来。
+  void nextTick(() => oldPinInput.value?.focus());
+}
+
+function closeChangePin() {
+  changePinOpen.value = false;
+  pinBusy.value = false;
+  pinError.value = "";
+  // 连输入框里的明文密码一起清掉 —— 表单收起了，值不该还留在内存/界面上。
+  pinForm.value = { old: "", next: "", confirm: "", hint: "" };
+}
+
+/**
+ * 提交改密码。
+ *
+ * 这一项和自动锁定时长一样**自己调后端**，理由相同：要拿到结果才知道
+ * 该收起表单还是留着让人改（emit 是单向的，父组件没法把失败回传）。
+ * 但状态的唯一真值源仍是 App.vue —— 成功后把返回的 status 交给它。
+ *
+ * 前端这几条检查只是"省一次往返"：挡的都是**必然失败**的手误，
+ * 每挡一次就省掉后端两次 KDF（约 1.6 秒）和一次可能触发锁定的失败计数。
+ * 真正的规则（纯数字、长度、白名单）始终以后端为准，前端不重复实现。
+ */
+async function submitChangePin() {
+  if (pinBusy.value) return;
+  const { old, next, confirm, hint } = pinForm.value;
+
+  if (!old) {
+    pinError.value = "请输入当前密码";
+    return;
+  }
+  if (!/^\d+$/.test(next)) {
+    pinError.value = "新密码只能包含数字";
+    return;
+  }
+  if (next.length < props.status.pin_min_len) {
+    pinError.value = `新密码至少需要 ${props.status.pin_min_len} 位数字`;
+    return;
+  }
+  if (next !== confirm) {
+    pinError.value = "两次输入的新密码不一致";
+    return;
+  }
+
+  pinBusy.value = true;
+  pinError.value = "";
+  try {
+    const res = await changePassword(old, next, hint.trim() ? hint.trim() : null);
+    // 成功：先收起表单（输入框里的明文密码一并清掉），再把结果交给 App.vue。
+    closeChangePin();
+    emit("password-changed", res);
+  } catch (err) {
+    const e = toAppError(err);
+    // 后端的 message 已经是给用户看的人话（"密码不正确" / "已锁定，请在 N 秒后重试"…），
+    // 不在前端重写一份 —— 两份文案迟早对不上。
+    pinError.value = e.message;
+
+    if (e.kind === "wrong_pin") {
+      // 旧密码错了就把那一格清掉并聚焦：留着它只会让人再点一次"确认"。
+      pinForm.value.old = "";
+      void nextTick(() => oldPinInput.value?.focus());
+      // 失败次数变了（可能已进入锁定期），让顶层状态跟上。
+      emit("refresh-status");
+    } else if (e.kind === "locked") {
+      emit("refresh-status");
+    }
+  } finally {
+    pinBusy.value = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 占位控件（还没接线的那些）
 // ---------------------------------------------------------------------------
 
@@ -136,11 +244,6 @@ async function onChangeAutoLock(e: Event) {
  */
 function notYet(what: string, cmd: string) {
   emit("notice", `${what}尚未接入（${cmd}），本次只搭了界面`);
-}
-
-function onEditPin() {
-  // TODO(指令 3)：打开"修改主密码"对话框（后端走 PRAGMA rekey）。
-  notYet("修改主密码", "指令 3");
 }
 
 /** 免密打开。未接入前只显示"关"，点了立刻拨回去，绝不留假状态。 */
@@ -184,9 +287,92 @@ function onToggleAutoUnlock(e: Event) {
                 <div class="d">用于解锁日记，也用于打开备份文件</div>
               </div>
               <div class="ctl">
-                <button class="btn" @click="onEditPin">修改</button>
+                <button v-if="!changePinOpen" class="btn" @click="openChangePin">
+                  修改
+                </button>
+                <button v-else class="btn ghost" @click="closeChangePin">取消</button>
               </div>
             </div>
+
+            <!-- 改密码子表单：就地展开，不叠第二层弹窗 -->
+            <form v-if="changePinOpen" class="sub" @submit.prevent="submitChangePin">
+              <div class="field">
+                <label for="cp-old">当前密码</label>
+                <input
+                  id="cp-old"
+                  ref="oldPinInput"
+                  v-model="pinForm.old"
+                  type="password"
+                  inputmode="numeric"
+                  autocomplete="off"
+                  :disabled="pinBusy"
+                />
+              </div>
+
+              <div class="field">
+                <label for="cp-new">新密码</label>
+                <input
+                  id="cp-new"
+                  v-model="pinForm.next"
+                  type="password"
+                  inputmode="numeric"
+                  autocomplete="new-password"
+                  :disabled="pinBusy"
+                  :placeholder="`${status.pin_min_len} 位以上数字`"
+                />
+              </div>
+
+              <div class="field">
+                <label for="cp-confirm">确认新密码</label>
+                <input
+                  id="cp-confirm"
+                  v-model="pinForm.confirm"
+                  type="password"
+                  inputmode="numeric"
+                  autocomplete="new-password"
+                  :disabled="pinBusy"
+                />
+              </div>
+
+              <div class="field">
+                <label for="cp-hint">新提示语（可留空）</label>
+                <input
+                  id="cp-hint"
+                  v-model="pinForm.hint"
+                  type="text"
+                  maxlength="60"
+                  :disabled="pinBusy"
+                  :placeholder="`当前：${currentHint}`"
+                />
+                <p class="tip">
+                  提示是<strong>明文</strong>存在数据目录里的 —— 它要在解锁之前
+                  就显示在锁屏界面，所以放不进加密库。写得模糊一些，别写成密码本身。
+                  留空 = 不要提示。
+                </p>
+              </div>
+
+              <p v-if="pinError" class="err">{{ pinError }}</p>
+
+              <p class="warn">
+                ⚠️ 改完密码后，<strong>此前的备份仍需用旧密码打开</strong> ——
+                重新加密只作用于主库，备份文件不会被改动（那正是备份的意义）。
+                换完会自动备份一份<strong>新</strong>的，那一份用新密码。
+              </p>
+
+              <div class="actions">
+                <button class="btn" type="submit" :disabled="pinBusy">
+                  {{ pinBusy ? "更换中…" : "确认更换" }}
+                </button>
+                <button
+                  class="btn ghost"
+                  type="button"
+                  :disabled="pinBusy"
+                  @click="closeChangePin"
+                >
+                  取消
+                </button>
+              </div>
+            </form>
 
             <div class="row">
               <div class="label">
@@ -481,6 +667,62 @@ select {
 }
 .toggle input:disabled {
   cursor: default;
+}
+
+/* 改密码子表单：贴在「主密码」那一行下面就地展开 */
+.sub {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding: 14px 0 16px;
+  border-bottom: 1px solid var(--border);
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.field label {
+  font-size: 12px;
+  color: var(--text-3);
+}
+.field input {
+  width: 100%;
+  padding: 7px 10px;
+  font-size: 13px;
+  color: var(--text-1);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+/* 密码格：等宽 + 字距，纯数字串更好数位，少输错一位 */
+.field input[type="password"] {
+  max-width: 230px;
+  font-family: var(--mono);
+  letter-spacing: 2px;
+}
+.field input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+.field input:disabled {
+  color: var(--text-3);
+}
+.tip {
+  margin: 2px 0 0;
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--text-3);
+}
+.err {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--danger);
+}
+.actions {
+  display: flex;
+  gap: 8px;
 }
 
 /* 只读信息块 */

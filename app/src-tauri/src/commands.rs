@@ -17,7 +17,7 @@ use crate::db::{
 };
 use crate::error::{AppError, AppResult};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::State;
 
@@ -226,15 +226,7 @@ pub fn initialize_vault(
 
     crypto::validate_pin(&pin, lockout.pin_min_len)?;
 
-    let hint = hint.and_then(|h| {
-        let t = h.trim().to_string();
-        if t.is_empty() {
-            None
-        } else {
-            // 提示会明文存储并显示在锁屏界面，长度做个限制避免被当备忘录用。
-            Some(t.chars().take(60).collect::<String>())
-        }
-    });
+    let hint = crypto::normalize_hint(hint);
 
     let vault = Vault::create(state.data_dir(), &pin, hint)?;
 
@@ -303,6 +295,141 @@ pub fn lock_vault(state: State<'_, VaultState>) -> AppResult<AppStatus> {
         *guard = None;
     }
     app_status(state)
+}
+
+// ---------------------------------------------------------------------------
+// 修改主密码
+// ---------------------------------------------------------------------------
+
+/// 修改主密码的结果。
+///
+/// 为什么不直接返回 `AppStatus`：改密码**成功之后**还有两件收尾
+/// （换提示语、同步免密钥匙文件），而收尾失败时密码其实**已经换掉了**。
+/// 用 `Err` 表达会把用户带向"再试一次旧密码"，而真相是旧密码已经作废；
+/// 闷着不说又会让人以为一切都好了。所以收尾问题单独走 `warnings`，
+/// 由界面如实显示。
+#[derive(Debug, Clone, Serialize)]
+pub struct ChangePasswordResult {
+    /// 改完之后的最新状态（提示语、剩余尝试次数都可能变了）。
+    pub status: AppStatus,
+    /// 收尾阶段的非致命问题。空 = 全部干净。
+    pub warnings: Vec<String>,
+}
+
+/// 修改主密码。
+///
+/// 前端落点：设置页【安全】→「主密码」→「修改」，子表单三格
+/// （旧密码 / 新密码 / 确认新密码）+ 一个可选的新提示语。
+///
+/// ⚠️ 本命令**必须**计入锁定期，否则它会变成一条真实的后门：
+///    只校验不计数的话，"改密码"就成了可以无限次试旧密码的入口 ——
+///    每次约 0.8 秒，6 位数字共 100 万种，挂着跑一夜就爆破了。
+///    所以：锁定中直接拒绝、失败记一次 failure、成功清空计数。
+#[tauri::command]
+pub fn change_password(
+    state: State<'_, VaultState>,
+    old_pin: String,
+    new_pin: String,
+    new_hint: Option<String>,
+) -> AppResult<ChangePasswordResult> {
+    // 先克隆一份路径：with_vault 的闭包里借不到 state 的其它部分。
+    let data_dir = state.data_dir().clone();
+
+    // 整个 rekey 都在 with_vault 持锁期间执行 —— 后台备份线程会被这把锁
+    // 自然挡住，而 rekey 恰好要求独占，不需要额外加锁。
+    let warnings =
+        with_vault(&state, |v| change_password_core(&data_dir, v, &old_pin, &new_pin, new_hint))?;
+
+    // with_vault 的守卫已在上面释放，这里再取一次不会自锁。
+    Ok(ChangePasswordResult {
+        status: app_status(state)?,
+        warnings,
+    })
+}
+
+/// 改密码的完整流程 —— 可以被测试直接驱动的那部分。
+///
+/// 为什么不把这段写在命令体里：命令体要 `State`，集成测试拿不到。
+/// 而这里恰恰是最该被测的一段 —— 锁定期计数、以及
+/// **提示语写回与 record_success 的先后顺序**（顺序错一个新提示语就没了）。
+pub fn change_password_core(
+    data_dir: &Path,
+    vault: &Vault,
+    old_pin: &str,
+    new_pin: &str,
+    new_hint: Option<String>,
+) -> AppResult<Vec<String>> {
+    let lock_path = crypto::lockout_path(data_dir);
+    let mut lockout = crypto::LockoutState::load(&lock_path);
+
+    // 锁定中直接拒绝，且不消耗尝试次数 —— 与 unlock_vault 同一口径。
+    lockout.check_not_locked(&lock_path)?;
+
+    let hint = crypto::normalize_hint(new_hint);
+    let min_len = lockout.pin_min_len;
+
+    match vault.change_password(old_pin, new_pin, hint, min_len) {
+        Ok(warnings) => {
+            // ⚠️ 必须**重新读一遍**再 record_success，不能拿上面那份 lockout：
+            //    change_password 刚把新提示语写进文件，而 record_success 是
+            //    **整份覆盖写** —— 用改密码之前读的旧副本写回，新提示语会被
+            //    悄无声息地抹掉（用户下次输错密码，看到的是照着旧密码写的提示）。
+            //    这与 initialize_vault 里那句 "let mut fresh = ..." 是同一个道理。
+            let mut fresh = crypto::LockoutState::load(&lock_path);
+            fresh.record_success(&lock_path)?;
+
+            Ok(post_change_backup(data_dir, vault, warnings))
+        }
+        Err(AppError::WrongPin) => {
+            let locked_now = lockout.record_failure(&lock_path)?;
+            if locked_now {
+                Err(AppError::Locked {
+                    remaining_secs: crypto::LOCKOUT_DURATION.as_secs(),
+                })
+            } else {
+                Err(AppError::WrongPin)
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 改密码成功后的收尾：立刻备份一份，让最新备份与**新密码**对齐。
+///
+/// 对齐这件事为什么重要：历史备份全部是旧密码加密的，改密码不会动它们
+/// （那正是备份的意义）。所以"最新那一份用新密码"必须由我们主动做出来，
+/// 否则用户手里可用的备份全都是旧密码的，而他很可能会忘掉那个旧密码。
+///
+/// 失败**只记警告、不算改密码失败**：密码此刻已经是新的了，
+/// 让"改密码"报错就是骗人。处理口径与后台自动备份一致（记日志、不打断用户）。
+fn post_change_backup(data_dir: &Path, vault: &Vault, mut warnings: Vec<String>) -> Vec<String> {
+    // 一篇都没写就不备份 —— 与自动备份同一口径，免得备份目录里堆空库。
+    match vault.stats() {
+        Ok(s) if s.total_entries == 0 => return warnings,
+        Ok(_) => {}
+        Err(e) => {
+            warnings.push(format!("改密码后的备份被跳过（{e}）"));
+            return warnings;
+        }
+    }
+
+    let stamp = now_stamp();
+    let dest = default_backup_dir(data_dir);
+    match vault.run_backup(&dest, &stamp) {
+        Ok((result, _deleted)) => {
+            // meta 文件必须跟着复制，否则这份备份永远打不开。
+            if let Err(e) = copy_crypto_meta(data_dir, &dest.to_string_lossy(), &stamp) {
+                warnings.push(format!("改密码后的备份缺少加密元信息（{e}），这一份打不开"));
+            } else {
+                eprintln!("改密码后已备份: {} ({} 字节)", result.path, result.bytes);
+            }
+        }
+        Err(e) => {
+            eprintln!("改密码后的备份失败: {e}");
+            warnings.push(format!("改密码后自动备份失败（{e}），建议手动备份一次"));
+        }
+    }
+    warnings
 }
 
 // ---------------------------------------------------------------------------

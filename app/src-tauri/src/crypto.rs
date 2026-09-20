@@ -218,6 +218,26 @@ pub fn validate_pin(pin: &str, min_len: usize) -> AppResult<()> {
     Ok(())
 }
 
+/// 提示语的统一清洗：去首尾空白、空串视为"没有"、最多 60 字。
+///
+/// 为什么必须只有一处：**初始化**与**改密码**都要写这个值。
+/// 两处各写一份，迟早一处截 60 字、另一处不截 —— 而它会被渲染在锁屏界面，
+/// 超长提示会把排版挤坏，而且用户看到的两条路径行为不一致。
+///
+/// 为什么限制 60 字：提示是**明文存储**且在解锁前就要显示。
+/// 放开长度等于给用户一个"把密码本身写进去"的机会，
+/// 那这个功能就从"提示"变成"泄漏"了。
+pub fn normalize_hint(hint: Option<String>) -> Option<String> {
+    hint.and_then(|h| {
+        let t = h.trim().to_string();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.chars().take(60).collect::<String>())
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 锁定期状态
 // ---------------------------------------------------------------------------
@@ -358,6 +378,22 @@ impl LockoutState {
         Ok(())
     }
 
+    /// **只**改提示语并写回，完全不动失败计数与锁定状态。
+    ///
+    /// ⚠️ 必须自己重新从文件读一遍再改，不能让调用方把内存里的状态传进来：
+    ///    `save` 是整份覆盖写，而调用方手里那份往往是"更早"读的。
+    ///    直接写回会把中间落盘的东西覆盖掉。
+    ///
+    ///    改密码流程恰好踩这个坑：命令层在开头读了一份 lockout 用于查锁定期，
+    ///    改密码过程中提示语被换新，最后 record_success 用那份旧副本整份写回，
+    ///    新提示语就被抹掉了 —— 用户第二次输错时会看到照着**旧密码**写的提示。
+    ///    所以"重新读"封死在函数内部，不给调用方犯错的机会。
+    pub fn update_hint(path: &Path, hint: Option<String>) -> AppResult<()> {
+        let mut st = Self::load(path);
+        st.hint = hint;
+        st.save(path)
+    }
+
     /// 是否应该显示提示。
     pub fn should_show_hint(&self) -> bool {
         self.hint.is_some() && self.failed_attempts >= HINT_AFTER_ATTEMPTS
@@ -372,6 +408,75 @@ impl LockoutState {
 /// 锁定状态文件的路径。与数据库同目录。
 pub fn lockout_path(data_dir: &Path) -> PathBuf {
     data_dir.join("lockout.json")
+}
+
+// ---------------------------------------------------------------------------
+// 免密打开：钥匙文件（库外明文）
+// ---------------------------------------------------------------------------
+//
+// ⚠️ 本文件由**指令 4（免密打开）**引入。指令 4 尚未实施，所以现在这个文件
+//    在真实数据目录里根本不存在 —— 下面的函数在"文件不存在"时直接返回，
+//    这正是设计要求的路径（见函数文档）。
+
+/// 免密打开用的钥匙文件路径。
+///
+/// 库里存的是"由 PIN 派生的 32 字节密钥"的十六进制，不是 PIN 本身。
+/// 它必须放在**加密库之外**：要在解锁之前就用它把库打开，
+/// 放进库里会形成"要开库得先开库"的循环。
+pub fn auto_login_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("auto_login.json")
+}
+
+/// 把免密钥匙文件里的 `key_hex` 换成新密钥。返回 `true` 表示确实改写了文件。
+///
+/// **什么时候必须调**：改主密码之后。漏了这一步，用户改完密码重启会发现
+/// 免密失效 —— 而他刚做的是"改密码"，看起来与免密毫无关系，
+/// 除了"这软件坏了"想不出第二个解释。
+///
+/// **什么时候必须什么都不做**：文件不存在就返回，**绝不顺手创建**。
+/// 创建一个就等于替用户把"免密打开"给打开了，这是越过用户意愿的动作。
+///
+/// 写法是读原文、只改一个键、再写回，而不是序列化一个全新结构：
+/// 将来指令 4 往这个文件里加字段时，这里不会把那些字段冲掉。
+///
+/// ⚠️ 调用顺序必须是【先 rekey 成功、再调本函数】。
+///    中途失败时文件里还是旧钥匙：免密虽会失败，但用**新密码**能进，
+///    且指令 4 的回退逻辑会把免密关掉，不会把人卡在门外。
+///    反过来先写文件再 rekey，就可能出现"文件是新钥匙、库还是旧钥匙"的死局。
+pub fn sync_auto_login_key(data_dir: &Path, key: &[u8; KEY_LEN]) -> AppResult<bool> {
+    let path = auto_login_path(data_dir);
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let text = std::fs::read_to_string(&path)?;
+    let mut doc: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| AppError::Crypto(format!("免密钥匙文件损坏，无法解析: {e}")))?;
+    let Some(obj) = doc.as_object_mut() else {
+        return Err(AppError::Crypto(
+            "免密钥匙文件格式异常（顶层不是 JSON 对象）".into(),
+        ));
+    };
+    obj.insert("key_hex".into(), serde_json::Value::String(hex_encode(key)));
+
+    write_json_atomic(&path, &doc)?;
+    Ok(true)
+}
+
+/// "临时文件 + 原子改名"写一个 JSON 文件。
+///
+/// 与 `LockoutState::save` / `CryptoMeta::save` 是同一套手法：直接覆盖写，
+/// 写到一半断电就会留下一个残缺文件。这些文件残了都会导致用户进不去或丢设置。
+fn write_json_atomic(path: &Path, value: &serde_json::Value) -> AppResult<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string_pretty(value)
+        .map_err(|e| AppError::State(format!("序列化 JSON 失败: {e}")))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// salt 与 KDF 参数的存放路径。
