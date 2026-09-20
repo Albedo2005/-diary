@@ -122,11 +122,6 @@ watch(
       本月写了 <strong>{{ monthCount }}</strong> 天
       <span v-if="loading" class="loading">· 读取中</span>
     </p>
-
-    <div class="legend">
-      <span class="dot written-dot" /> 写过
-      <span class="dot today-dot" /> 今天
-    </div>
   </aside>
 </template>
 
@@ -248,27 +243,5 @@ watch(
   margin: 16px 0 0;
   font-size: 12px;
   color: var(--danger);
-}
-.legend {
-  margin-top: auto;
-  padding-top: 14px;
-  font-size: 11px;
-  color: var(--text-3);
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  display: inline-block;
-}
-.written-dot {
-  background: var(--accent);
-}
-.today-dot {
-  background: transparent;
-  box-shadow: inset 0 0 0 1.5px var(--accent);
 }
 </style>
