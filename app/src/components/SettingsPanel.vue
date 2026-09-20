@@ -9,11 +9,16 @@
  * 已接线的项：
  *   - 数据与备份 三项 —— 逻辑留在 App.vue，这里只发信号
  *   - **自动锁定时长**（指令 11）—— 见下面 onChangeAutoLock 的说明
- *   - **窗口模式**（指令 12）—— 见下面 onChangeWindowMode 的说明
  * 仍是占位的项（点了会明说"尚未接入"并立刻复位，不留"看着开了其实没开"）：
  *   - 主密码 → 指令 3；免密打开 → 指令 4
  *
- * 组件不自己拉状态：status / backup / crypto / stats / autoLockSecs / windowMode
+ * ⚠️ 【外观】分类已撤销（2026-09-20）：它当初只为装"窗口模式"而建，
+ * 而窗口模式（指令 12）连同【全屏】档一起被用户否掉了 —— 他不需要沉浸式，
+ * 保留"窗口 / 最大化"两档也没有意义（系统标题栏本来就有那两个按钮）。
+ * 唯一的项没了，分类就成了空壳，点进去什么都没有 = 界面骗人，故整组删除。
+ * 将来真要做主题切换，再按需要重建这个分类。
+ *
+ * 组件不自己拉状态：status / backup / crypto / stats / autoLockSecs
  * 全部从 App.vue 传入，免得两份状态各走各的、切个分类就对不上。
  */
 import { computed, ref } from "vue";
@@ -21,14 +26,11 @@ import pkg from "../../package.json";
 import {
   AUTO_LOCK_OPTIONS,
   setAutoLockSecs,
-  setWindowMode,
   toAppError,
-  WINDOW_MODE_OPTIONS,
   type AppStatus,
   type BackupStatus,
   type CryptoInfo,
   type Stats,
-  type WindowMode,
 } from "../api";
 
 const props = defineProps<{
@@ -38,8 +40,6 @@ const props = defineProps<{
   stats: Stats | null;
   /** 自动锁定时长（秒）。0 = 永不。由 App.vue 持有，是唯一真值源。 */
   autoLockSecs: number;
-  /** 当前窗口形态。同样由 App.vue 持有，是唯一真值源。 */
-  windowMode: WindowMode;
 }>();
 
 const emit = defineEmits<{
@@ -52,17 +52,14 @@ const emit = defineEmits<{
   (e: "toggle-auto-backup"): void;
   /** 自动锁定时长已成功写入后端，通知 App.vue 更新本地值。 */
   (e: "auto-lock-secs", secs: number): void;
-  /** 窗口形态已成功写入后端，通知 App.vue 更新本地值。 */
-  (e: "window-mode", mode: WindowMode): void;
   /** 一句提示，由 App.vue 的 toast 显示。 */
   (e: "notice", message: string): void;
 }>();
 
-type TabKey = "security" | "appearance" | "data" | "about";
+type TabKey = "security" | "data" | "about";
 
 const TABS: { key: TabKey; label: string }[] = [
   { key: "security", label: "安全" },
-  { key: "appearance", label: "外观" },
   { key: "data", label: "数据与备份" },
   { key: "about", label: "关于" },
 ];
@@ -154,37 +151,6 @@ function onToggleAutoUnlock(e: Event) {
   (e.target as HTMLInputElement).checked = autoUnlock.value;
   notYet("免密打开", "指令 4");
 }
-
-// ---------------------------------------------------------------------------
-// 窗口模式（指令 12，已接线）
-// ---------------------------------------------------------------------------
-
-/**
- * 切换窗口形态。
- *
- * 和自动锁定同一套路：**自己调后端**，因为"失败要把下拉恢复成原值"
- * 需要拿到调用结果，而 emit 是单向的（父组件没法把失败回传）。
- *
- * 与自动锁定的一点区别：这条命令后端是"**先落盘、再改窗口**"，
- * 所以失败时窗口根本不会变，不存在"界面变了但没生效"的中间态。
- * 仍然手动把 DOM 拨回去，理由和上一条一样：
- * 用户已选中新项而 props 没变，Vue 认为"绑定的值没变化"、不会重渲染它。
- *
- * ⚠️ 切换后**不要重挂本组件** —— 弹窗会闪一下、右栏滚动位置也会丢。
- *    弹窗宽被 min(632px, 93vw) 卡住、高 72vh，随窗口变大而变高是正常的。
- */
-async function onChangeWindowMode(e: Event) {
-  const el = e.target as HTMLSelectElement;
-  const next = el.value as WindowMode;
-  if (next === props.windowMode) return;
-  try {
-    await setWindowMode(next);
-    emit("window-mode", next);
-  } catch (err) {
-    el.value = props.windowMode; // 回滚，不留假状态
-    emit("notice", toAppError(err).message);
-  }
-}
 </script>
 
 <template>
@@ -259,27 +225,6 @@ async function onChangeWindowMode(e: Event) {
               <div class="label">
                 <div class="t">密码尝试与锁定期</div>
                 <div class="d">{{ attemptText }}</div>
-              </div>
-            </div>
-          </section>
-
-          <!-- ── 外观 ─────────────────────────────────────────────── -->
-          <section v-else-if="tab === 'appearance'">
-            <div class="row">
-              <div class="label">
-                <div class="t">窗口模式</div>
-                <div class="d">启动后窗口怎么摆放</div>
-              </div>
-              <div class="ctl">
-                <select :value="windowMode" @change="onChangeWindowMode">
-                  <option
-                    v-for="o in WINDOW_MODE_OPTIONS"
-                    :key="o.value"
-                    :value="o.value"
-                  >
-                    {{ o.label }}
-                  </option>
-                </select>
               </div>
             </div>
           </section>
