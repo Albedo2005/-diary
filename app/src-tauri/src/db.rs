@@ -29,6 +29,43 @@ pub mod setting_keys {
     pub const AUTO_BACKUP_ENABLED: &str = "auto_backup_enabled";
     pub const LAST_BACKUP_AT: &str = "last_backup_at";
     pub const KEEP_RECENT: &str = "keep_recent";
+    pub const AUTO_LOCK_SECS: &str = "auto_lock_secs";
+}
+
+/// 自动锁定时长的**档位白名单**（秒）。`0` 表示"永不"。
+///
+/// 为什么钉死四档而不是让用户填任意秒数：
+///   这个值决定"离开多久之后密钥从内存里消失"，属于安全参数。
+///   放开成任意值，一定有人填 3 秒（自己被烦死）或 8 小时（等于没设），
+///   最后都退化成"这人不用自动锁定了"。四档覆盖从"很快"到"不要"，
+///   每一档都是能长期用的选择。
+pub const AUTO_LOCK_ALLOWED_SECS: [u32; 4] = [0, 60, 300, 600];
+
+/// 自动锁定时长的默认值：10 分钟。
+///
+/// ⚠️ 这是一次**行为变更**：1.6 及之前这个值是硬编码的 15 分钟。
+///    四档里没有 15，取最接近的一档 —— 10 分钟。
+///    老库（从没设过这一项）走同一个默认值。
+pub const DEFAULT_AUTO_LOCK_SECS: u32 = 600;
+
+/// 应用设置。
+///
+/// 为什么用一个结构体返回、而不是每项一个读取命令：
+///   以后加设置项只需往这里加字段，前端那条读命令不用动。
+///   写入则相反 —— 每项一条独立命令，因为写入要校验、要有明确语义，
+///   不能开放"前端随便写 key"（见 `set_auto_lock_secs`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSettings {
+    /// 窗口失去焦点后多久自动锁定（秒）。`0` = 永不。
+    pub auto_lock_secs: u32,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            auto_lock_secs: DEFAULT_AUTO_LOCK_SECS,
+        }
+    }
 }
 
 /// 一条日记。
@@ -1150,6 +1187,42 @@ impl Vault {
             .unwrap_or(DEFAULT_KEEP_RECENT))
     }
 
+    /// 读取应用设置。
+    ///
+    /// **刻意不报错**：缺失 / 解析失败 / 值不在白名单，一律回落默认值。
+    /// 理由：老库（1.6 及之前）里根本没有 `auto_lock_secs` 这个 key，
+    /// 而这是一条"每次解锁都要读"的路径 —— 为它抛错会让升级上来的库
+    /// 一打开就报错，而用户什么都没做错。
+    /// 库里的值被外部工具改坏（比如写了 123）也是同一条兜底。
+    pub fn get_settings(&self) -> AppResult<AppSettings> {
+        let secs = self
+            .get_setting(setting_keys::AUTO_LOCK_SECS)?
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| AUTO_LOCK_ALLOWED_SECS.contains(v))
+            .unwrap_or(DEFAULT_AUTO_LOCK_SECS);
+        Ok(AppSettings {
+            auto_lock_secs: secs,
+        })
+    }
+
+    /// 写入自动锁定时长（秒）。
+    ///
+    /// 白名单之外的值返回 `validation` 错误 —— 这个值安全相关，
+    /// 让界面能写进任意数字，等于把"自动锁定"交给一个可能出错的 UI。
+    pub fn set_auto_lock_secs(&self, secs: u32) -> AppResult<()> {
+        if !AUTO_LOCK_ALLOWED_SECS.contains(&secs) {
+            let allowed = AUTO_LOCK_ALLOWED_SECS
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(" / ");
+            return Err(AppError::Validation(format!(
+                "自动锁定时长只能是 {allowed} 秒之一（0 表示永不）"
+            )));
+        }
+        self.set_setting(setting_keys::AUTO_LOCK_SECS, &secs.to_string())
+    }
+
     /// 到下次自动备份还差多少秒。0 表示现在就该备份。
     ///
     /// 为什么用"距上次备份的间隔"而不是固定时刻：
@@ -1706,6 +1779,60 @@ mod tests {
         assert_eq!(got.len(), 1, "只应有 09-11：既有正文又有心情，实际: {got:?}");
         assert_eq!(got[0].entry_date, "2026-09-11");
         assert_eq!(got[0].mood, 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 自动锁定时长：默认值、白名单、以及"库里被写坏"的兜底。
+    ///
+    /// 这条路径每次解锁都要走，所以它**不允许报错** ——
+    /// 三种坏情况（没设过 / 填了非法数 / 不是数字）都必须安静地回落默认值。
+    #[test]
+    fn auto_lock_secs_defaults_and_falls_back() {
+        let dir = std::env::temp_dir().join("dsh-diary-auto-lock");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let vault = Vault::create(&dir, "135790", None).unwrap();
+
+        // 老库：从来没有这个 key。默认 10 分钟，且不能报错。
+        assert_eq!(
+            vault.get_settings().unwrap().auto_lock_secs,
+            600,
+            "1.6 及之前的库没有这个 key，必须安静地用默认值"
+        );
+
+        // 四档都能写能读（0 = 永不 是个合法值，不能和"没设过"混为一谈）
+        for secs in AUTO_LOCK_ALLOWED_SECS {
+            vault.set_auto_lock_secs(secs).unwrap();
+            assert_eq!(vault.get_settings().unwrap().auto_lock_secs, secs);
+        }
+
+        // 白名单之外：写入被拒，且不能把库里的值改坏
+        vault.set_auto_lock_secs(300).unwrap();
+        let err = vault.set_auto_lock_secs(123).unwrap_err();
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "非白名单档位必须以 validation 拒绝，实际: {err:?}"
+        );
+        assert_eq!(
+            vault.get_settings().unwrap().auto_lock_secs,
+            300,
+            "被拒绝的写入不能改动已存的值"
+        );
+
+        // 库里被外部工具写坏：合法数字但不在白名单 / 根本不是数字
+        vault
+            .set_setting(setting_keys::AUTO_LOCK_SECS, "123")
+            .unwrap();
+        assert_eq!(vault.get_settings().unwrap().auto_lock_secs, 600);
+        vault
+            .set_setting(setting_keys::AUTO_LOCK_SECS, "abc")
+            .unwrap();
+        assert_eq!(vault.get_settings().unwrap().auto_lock_secs, 600);
+        // 空串也一样 —— 有些工具会把"空值"存成空字符串而不是删掉这一行
+        vault.set_setting(setting_keys::AUTO_LOCK_SECS, "").unwrap();
+        assert_eq!(vault.get_settings().unwrap().auto_lock_secs, 600);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

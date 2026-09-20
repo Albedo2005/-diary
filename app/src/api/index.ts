@@ -148,6 +148,31 @@ export interface CryptoInfo {
   p_cost: number;
 }
 
+/** 应用设置。与后端 `db::AppSettings` 一一对应。 */
+export interface AppSettings {
+  /** 窗口失去焦点后多久自动锁定（秒）。`0` = 永不。 */
+  auto_lock_secs: number;
+}
+
+/**
+ * 自动锁定时长的档位。**白名单**，与后端 `db::AUTO_LOCK_ALLOWED_SECS` 一一对应。
+ *
+ * 为什么钉死四档而不是让用户填任意秒数：这个值决定"离开多久之后
+ * 密钥从内存里消失"，是安全参数。放开成任意值，一定有人填 3 秒
+ * （自己被烦死）或 8 小时（等于没设），最后等于不用自动锁定。
+ *
+ * ⚠️ `0` = 永不，是**合法档位**，不要当"没设置"处理。
+ */
+export const AUTO_LOCK_OPTIONS = [
+  { value: 60, label: "1 分钟" },
+  { value: 300, label: "5 分钟" },
+  { value: 600, label: "10 分钟" },
+  { value: 0, label: "永不" },
+] as const;
+
+/** 默认档位：10 分钟。与后端 `db::DEFAULT_AUTO_LOCK_SECS` 保持一致。 */
+export const DEFAULT_AUTO_LOCK_SECS = 600;
+
 // ---------------------------------------------------------------------------
 // 错误处理
 // ---------------------------------------------------------------------------
@@ -297,3 +322,29 @@ export const integrityCheck = () => invoke<IntegrityReport>("integrity_check");
 export const rebuildIndexes = () => invoke<number>("rebuild_indexes");
 
 export const cryptoInfo = () => invoke<CryptoInfo>("crypto_info");
+
+// ---------------------------------------------------------------------------
+// 应用设置
+// ---------------------------------------------------------------------------
+
+/**
+ * 读取应用设置。
+ *
+ * 后端刻意**不报错**：缺失 / 解析失败 / 值不在白名单，一律回落默认值 ——
+ * 1.6 及之前的库根本没有 `auto_lock_secs` 这个 key，报错会让升级上来的
+ * 库一打开就失败，而用户什么都没做错。
+ *
+ * ⚠️ 这些值**不能**从 `app_status` 拿：`app_setting` 表在加密库里，
+ *    未解锁时读不到；硬塞进 status 只会编出一个默认值来骗界面。
+ *    （只有解锁后才调得动这条命令。）
+ */
+export const getSettings = () => invoke<AppSettings>("get_settings");
+
+/**
+ * 设置自动锁定时长（秒）。只接受 `AUTO_LOCK_OPTIONS` 里的四个档位，
+ * 其他值后端返回 `validation` 错误。
+ *
+ * 写入失败时**必须把界面回滚成原值** —— 别本地改完就当成功。
+ */
+export const setAutoLockSecs = (secs: number) =>
+  invoke<void>("set_auto_lock_secs", { secs });

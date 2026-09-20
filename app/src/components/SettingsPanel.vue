@@ -3,28 +3,37 @@
  * 设置面板 —— 集中放"可以改的东西"。
  *
  * 与「关于」的分界线只有一条：**能改的进设置，只能看的留关于**。
- * 只读信息（版本、数据目录、加密参数、统计）在这里也放了一份，
- * 让设置页本身信息完整；「关于」弹窗作为用惯了的快捷入口继续保留。
+ * 只读信息（版本、数据目录、加密参数、统计）在【关于】分类里，
+ * 这里是全应用**唯一**的只读出口（顶栏那个「关于」入口已经删掉了）。
  *
- * 本次（指令 10）只搭壳：
- *   - 安全 / 外观 两组里的控件是**占位**：能看到形状，点了会明确提示
- *     "尚未接入"，且不保存任何东西。接线分别在指令 3（改主密码）、
- *     指令 4（免密打开）、指令 12（窗口模式）。
- *   - 数据与备份 三项是**照搬**现有逻辑，行为与原来完全一致，
- *     由 App.vue 处理事件（后端命令一个字没改）。
+ * 已接线的项：
+ *   - 数据与备份 三项 —— 逻辑留在 App.vue，这里只发信号
+ *   - **自动锁定时长**（指令 11）—— 见下面 onChangeAutoLock 的说明
+ * 仍是占位的项（点了会明说"尚未接入"并立刻复位，不留"看着开了其实没开"）：
+ *   - 主密码 → 指令 3；免密打开 → 指令 4；窗口模式 → 指令 12
  *
- * 组件不自己拉状态：status / backup / crypto / stats 全部从 App.vue 传入，
- * 免得两份状态各走各的、切个分类就对不上。
+ * 组件不自己拉状态：status / backup / crypto / stats / autoLockSecs
+ * 全部从 App.vue 传入，免得两份状态各走各的、切个分类就对不上。
  */
 import { computed, ref } from "vue";
 import pkg from "../../package.json";
-import type { AppStatus, BackupStatus, CryptoInfo, Stats } from "../api";
+import {
+  AUTO_LOCK_OPTIONS,
+  setAutoLockSecs,
+  toAppError,
+  type AppStatus,
+  type BackupStatus,
+  type CryptoInfo,
+  type Stats,
+} from "../api";
 
 const props = defineProps<{
   status: AppStatus;
   backup: BackupStatus | null;
   crypto: CryptoInfo | null;
   stats: Stats | null;
+  /** 自动锁定时长（秒）。0 = 永不。由 App.vue 持有，是唯一真值源。 */
+  autoLockSecs: number;
 }>();
 
 const emit = defineEmits<{
@@ -35,6 +44,8 @@ const emit = defineEmits<{
   (e: "integrity"): void;
   /** 切换自动备份开关。 */
   (e: "toggle-auto-backup"): void;
+  /** 自动锁定时长已成功写入后端，通知 App.vue 更新本地值。 */
+  (e: "auto-lock-secs", secs: number): void;
   /** 一句提示，由 App.vue 的 toast 显示。 */
   (e: "notice", message: string): void;
 }>();
@@ -80,6 +91,35 @@ const attemptText = computed(
   () =>
     `连续输错 ${props.status.max_attempts} 次锁定 ${humanLockout(props.status.lockout_secs)}`
 );
+
+// ---------------------------------------------------------------------------
+// 自动锁定时长（指令 11，已接线）
+// ---------------------------------------------------------------------------
+
+/**
+ * 切换自动锁定时长。
+ *
+ * 为什么这一项**自己调后端**，而备份三项是 emit 给 App.vue：
+ *   "写入失败要把下拉恢复成原值"需要拿到调用结果，而 emit 是单向的 ——
+ *   父组件没法把失败回传给这里。所以这一项由组件直接调 api/，
+ *   成功后 emit 新值让 App.vue 更新 ref（ref 仍然唯一真值源）。
+ *
+ * ⚠️ 失败时必须**手动**把 <select> 拨回去：
+ *    DOM 里用户已经选中了新项，而 props 没变，Vue 认为"绑定的值没变化"、
+ *    不会重渲染这个属性 —— 下拉会停在一个并未生效的值上。
+ */
+async function onChangeAutoLock(e: Event) {
+  const el = e.target as HTMLSelectElement;
+  const next = Number(el.value);
+  if (next === props.autoLockSecs) return;
+  try {
+    await setAutoLockSecs(next);
+    emit("auto-lock-secs", next);
+  } catch (err) {
+    el.value = String(props.autoLockSecs); // 回滚，不留假状态
+    emit("notice", toAppError(err).message);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // 占位控件（还没接线的那些）
@@ -165,6 +205,23 @@ function onChangeWindowMode(e: Event) {
                     @change="onToggleAutoUnlock"
                   />
                 </label>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="label">
+                <div class="t">自动锁定时长</div>
+                <div class="d">离开多久之后自动锁定</div>
+              </div>
+              <div class="ctl">
+                <select
+                  :value="String(autoLockSecs)"
+                  @change="onChangeAutoLock"
+                >
+                  <option v-for="o in AUTO_LOCK_OPTIONS" :key="o.value" :value="o.value">
+                    {{ o.label }}
+                  </option>
+                </select>
               </div>
             </div>
 

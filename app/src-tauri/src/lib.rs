@@ -106,6 +106,11 @@ pub fn run() {
             commands::integrity_check,
             commands::rebuild_indexes,
             commands::crypto_info,
+            // 应用设置
+            // 读是"通用读"（一个结构体带所有项，以后加字段不用加命令），
+            // 写是"专用写"（每项一条，因为写入要校验、要有明确语义）。
+            commands::get_settings,
+            commands::set_auto_lock_secs,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");

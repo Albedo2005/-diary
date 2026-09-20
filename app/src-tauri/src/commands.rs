@@ -12,7 +12,8 @@
 
 use crate::crypto::{self, CryptoMeta, KdfParams};
 use crate::db::{
-    BackupResult, DayMood, Entry, EntrySummary, IntegrityReport, SearchHit, Stats, Vault,
+    AppSettings, BackupResult, DayMood, Entry, EntrySummary, IntegrityReport, SearchHit, Stats,
+    Vault,
 };
 use crate::error::{AppError, AppResult};
 use serde::Serialize;
@@ -496,6 +497,33 @@ pub fn set_auto_backup(state: State<'_, VaultState>, enabled: bool) -> AppResult
     with_vault(&state, |v| {
         v.set_setting(crate::db::setting_keys::AUTO_BACKUP_ENABLED, if enabled { "true" } else { "false" })
     })
+}
+
+// ---------------------------------------------------------------------------
+// 应用设置
+// ---------------------------------------------------------------------------
+
+/// 读取应用设置（目前只有"自动锁定时长"）。
+///
+/// ⚠️ 刻意**不**把这些值并进 `app_status`：`app_setting` 表在**加密库**里，
+///    未解锁时读不到 —— 硬塞进 status 只会返回默认值，
+///    前端还以为"用户设的就是 10 分钟"，实际根本没读到。
+///    读不到就说不出来，比编一个值好。
+///
+/// 走 `with_vault`：未解锁必须拒绝，不能靠默认值糊弄过去。
+#[tauri::command]
+pub fn get_settings(state: State<'_, VaultState>) -> AppResult<AppSettings> {
+    with_vault(&state, |v| v.get_settings())
+}
+
+/// 设置"窗口失去焦点后多久自动锁定"（秒）。`0` = 永不。
+///
+/// 档位白名单校验在数据层（`db::AUTO_LOCK_ALLOWED_SECS`）——
+/// 这里只负责"必须已解锁"。校验放在数据层而不是命令层，
+/// 是为了让"绕过界面直接调命令"也拿不到非法值。
+#[tauri::command]
+pub fn set_auto_lock_secs(state: State<'_, VaultState>, secs: u32) -> AppResult<()> {
+    with_vault(&state, |v| v.set_auto_lock_secs(secs))
 }
 
 /// 后台自动备份的检查间隔。

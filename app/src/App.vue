@@ -5,7 +5,7 @@
  * 界面顺序遵循一个原则：**打开就能写**。
  * 所以主界面直接是"日历 + 编辑器"，没有首页、没有列表页中转。
  */
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import CalendarPanel from "./components/CalendarPanel.vue";
 import EditorPane from "./components/EditorPane.vue";
 import SearchPanel from "./components/SearchPanel.vue";
@@ -14,7 +14,9 @@ import UnlockScreen from "./components/UnlockScreen.vue";
 import {
   backupNow,
   cryptoInfo,
+  DEFAULT_AUTO_LOCK_SECS,
   getBackupStatus,
+  getSettings,
   getStats,
   getStatus,
   integrityCheck,
@@ -43,6 +45,15 @@ const backup = ref<BackupStatus | null>(null);
 /** 设置弹窗。日历与编辑器不被卸载，所以这里悬着也不影响未保存的草稿。 */
 const showSettings = ref(false);
 
+/**
+ * 自动锁定时长（秒）。`0` = 永不。
+ *
+ * 先用默认值起步，解锁成功后由 loadSettings() 换成库里的真实值 ——
+ * 设置存在**加密库**里，未解锁时根本读不到，所以这里必须可变，
+ * 不能像以前那样写死成一个常量。
+ */
+const autoLockSecs = ref(DEFAULT_AUTO_LOCK_SECS);
+
 const toast = ref("");
 let toastTimer: number | null = null;
 
@@ -59,7 +70,12 @@ async function boot() {
   fatal.value = "";
   try {
     status.value = await getStatus();
-    if (status.value.unlocked) await loadAux();
+    if (status.value.unlocked) {
+      await loadAux();
+      // 设置也得跟着读一次：库里存的可能是 1 分钟或永不，
+      // 先用默认值起步会让自动锁定在启动后的一小段时间里用错时长。
+      await loadSettings();
+    }
   } catch (e) {
     fatal.value = toAppError(e).message;
   } finally {
@@ -82,9 +98,26 @@ async function loadAux() {
   }
 }
 
+/**
+ * 读取应用设置（目前只有自动锁定时长）。
+ *
+ * 只能在**解锁后**调 —— 设置在加密库里，未解锁读不到。
+ * 读失败不阻塞主流程：留用默认值也比卡住强，何况这一项有个安全的落点。
+ */
+async function loadSettings() {
+  try {
+    autoLockSecs.value = (await getSettings()).auto_lock_secs;
+  } catch {
+    // 保持默认值。不值得为这一项弹错误。
+  }
+}
+
 function onUnlocked(s: AppStatus) {
   status.value = s;
   void loadAux();
+  // 解锁成功后必须把设置读回来 —— 包括将来"免密自动解锁"那条路径，
+  // 它同样会走到这里。否则会一直用启动时的默认值。
+  void loadSettings();
 }
 
 function onSaved() {
@@ -93,6 +126,9 @@ function onSaved() {
 }
 
 async function doLock() {
+  // 先撤掉自动锁定的计时器：已经锁上了，它再响一次是空跑；
+  // 更糟的是万一定时器残留到解锁之后，会突袭式地把刚解开的库又锁上。
+  clearLockTimer();
   try {
     status.value = await lockVault();
     stats.value = null;
@@ -152,22 +188,62 @@ async function doIntegrity() {
   }
 }
 
-/** 离开电脑自动锁定的兜底：窗口失去焦点 15 分钟后清除内存中的密钥。 */
+/**
+ * 离开电脑自动锁定的兜底：窗口失去焦点后，按**用户设定的时长**清除内存中的密钥。
+ *
+ * 计时起点是**窗口失焦**，不是 Windows 那种"系统空闲时间"（人在不在电脑前）——
+ * 后者要调系统 API 取空闲时长，本项目不做。区别很实际：
+ * 开着窗口盯着日记发呆不会锁，切到别的程序才走计时。
+ *
+ * 时长可配（设置页【安全】→ 自动锁定时长），所以它不能是常量；
+ * 而且**设置一改就得重挂**：否则刚从"1 分钟"改成"永不"，
+ * 旧 timer 到点照样把库锁上。
+ */
 let blurTimer: number | null = null;
-const AUTO_LOCK_MS = 15 * 60 * 1000;
-function onBlur() {
-  if (!unlocked.value) return;
-  if (blurTimer !== null) window.clearTimeout(blurTimer);
-  blurTimer = window.setTimeout(() => {
-    if (unlocked.value) void doLock();
-  }, AUTO_LOCK_MS);
-}
-function onFocus() {
+
+function clearLockTimer() {
   if (blurTimer !== null) {
     window.clearTimeout(blurTimer);
     blurTimer = null;
   }
 }
+
+function onBlur() {
+  if (!unlocked.value) return;
+  if (autoLockSecs.value <= 0) return; // 永不
+  clearLockTimer();
+  blurTimer = window.setTimeout(() => {
+    if (unlocked.value) void doLock();
+  }, autoLockSecs.value * 1000);
+}
+
+function onFocus() {
+  clearLockTimer();
+}
+
+/**
+ * 按当前设置重挂计时器。
+ *
+ * 窗口此刻有焦点就不该有计时器 —— 交回给 onFocus 的语义；
+ * 只有确实处于失焦状态时才按新时长重新开始计。
+ */
+function rearmLockTimer() {
+  clearLockTimer();
+  if (!unlocked.value) return;
+  if (autoLockSecs.value <= 0) return;
+  if (!document.hasFocus()) onBlur();
+}
+
+/** 设置一改立刻生效（不用重启）：重挂计时器。 */
+watch(autoLockSecs, () => rearmLockTimer());
+
+/**
+ * 任何"进入未解锁态"的路径都清掉计时器 ——
+ * 手动锁定也会经过这里，不必在每个调用点都记得清一遍。
+ */
+watch(unlocked, (ok) => {
+  if (!ok) clearLockTimer();
+});
 
 onMounted(() => {
   void boot();
@@ -252,10 +328,12 @@ onUnmounted(() => {
         :backup="backup"
         :crypto="crypto"
         :stats="stats"
+        :auto-lock-secs="autoLockSecs"
         @close="showSettings = false"
         @backup="doBackup"
         @integrity="doIntegrity"
         @toggle-auto-backup="toggleAutoBackup"
+        @auto-lock-secs="(s) => (autoLockSecs = s)"
         @notice="flash"
       />
     </template>
