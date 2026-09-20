@@ -39,6 +39,13 @@ export interface AppStatus {
   pin_min_len: number;
   max_attempts: number;
   lockout_secs: number;
+  /**
+   * 是否开启了免密打开（`data/auto_login.json` 是否存在）。
+   *
+   * ⚠️ 这个字段读的是**库外文件**，所以未解锁时也是准的 ——
+   *    启动流程正是靠它决定"走不走免密"。它不是加密库里的设置项。
+   */
+  auto_login: boolean;
   data_dir: string;
 }
 
@@ -258,6 +265,52 @@ export const changePassword = (
   newPin: string,
   newHint: string | null
 ) => invoke<ChangePasswordResult>("change_password", { oldPin, newPin, newHint });
+
+// ---------------------------------------------------------------------------
+// 免密打开
+// ---------------------------------------------------------------------------
+
+/**
+ * 用免密钥匙解锁 —— 启动时自动调用，用户看不到这一步。
+ *
+ * 原理：**不是给库加一把新钥匙，而是把库现有密钥复制一份明文存到库外**
+ * （`data/auto_login.json`），所以整个过程不涉及 `PRAGMA rekey`，
+ * 开关的成本只是写 / 删一个文件。密码**没有被取消**，它仍然有效。
+ *
+ * ⚠️ 失败意味着钥匙文件已不可用（改过密码而同步失败 / 文件被改坏），
+ *    后端会把那个文件**删掉**，界面应回退到密码解锁并说明原因 ——
+ *    否则下次启动还会再失败一次。用户原来的密码始终有效。
+ *
+ * 与 `enableAutoLogin` 的区别：这条**不需要密码**（钥匙就是凭证），
+ * 所以它在未解锁状态下也调得动。
+ */
+export const unlockWithAutoKey = () =>
+  invoke<AppStatus>("unlock_with_auto_key");
+
+/**
+ * 开启免密打开。**必须给密码**。
+ *
+ * 为什么开启也要密码：否则任何人趁你屏幕还解锁着点两下，
+ * 就能把它变成永久免密入口。失败计入锁定期（连续 5 次锁定 10 分钟）。
+ *
+ * ⚠️ 界面必须如实写出代价，不许粉饰：
+ *    钥匙明文躺在磁盘上，开启后机密性只挡"误开"和通用工具直读；
+ *    `data/` 整体被拷走 = 库能被直接打开。
+ */
+export const enableAutoLogin = (pin: string) =>
+  invoke<AppStatus>("enable_auto_login", { pin });
+
+/**
+ * 关闭免密打开。**同样要求密码**。
+ *
+ * 理由不是防人，是**帮用户确认"我还记得密码"** ——
+ * 否则关掉之后下次启动就进不去了，而他刚做的事看起来只是"关个开关"。
+ *
+ * ⚠️ 关掉**不等于钥匙作废**：删文件只是让程序不再读它，磁盘上可能仍有残留。
+ *    要真正作废，必须**更换主密码**（那会用新密钥把整库重新加密）。
+ */
+export const disableAutoLogin = (pin: string) =>
+  invoke<AppStatus>("disable_auto_login", { pin });
 
 // ---------------------------------------------------------------------------
 // 日记读写

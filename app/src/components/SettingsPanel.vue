@@ -10,8 +10,8 @@
  *   - 数据与备份 三项 —— 逻辑留在 App.vue，这里只发信号
  *   - **自动锁定时长**（指令 11）—— 见下面 onChangeAutoLock 的说明
  *   - **修改主密码**（指令 3）—— 见下面 submitChangePin 的说明
- * 仍是占位的项（点了会明说"尚未接入"并立刻复位，不留"看着开了其实没开"）：
- *   - 免密打开 → 指令 4
+ *   - **免密打开**（指令 4）—— 见下面 openAutoLogin / submitAutoLogin 的说明
+ * 到此【安全】分类里**没有占位项了**，全部接线完毕。
  *
  * ⚠️ 【外观】分类已撤销（2026-09-20）：它当初只为装"窗口模式"而建，
  * 而窗口模式（指令 12）连同【全屏】档一起被用户否掉了 —— 他不需要沉浸式，
@@ -28,6 +28,8 @@ import pkg from "../../package.json";
 import {
   AUTO_LOCK_OPTIONS,
   changePassword,
+  disableAutoLogin,
+  enableAutoLogin,
   setAutoLockSecs,
   toAppError,
   type AppStatus,
@@ -58,6 +60,12 @@ const emit = defineEmits<{
   (e: "auto-lock-secs", secs: number): void;
   /** 主密码已更换。带上后端返回的最新状态与收尾警告，由 App.vue 落库。 */
   (e: "password-changed", res: ChangePasswordResult): void;
+  /**
+   * 免密开关变了。带上后端返回的最新状态 ——
+   * App.vue 必须**整体替换**（不是只改 auto_login 一个字段）：
+   * 开关失败会改变剩余尝试次数，甚至把库置入锁定期。
+   */
+  (e: "auto-login-changed", status: AppStatus): void;
   /** 请 App.vue 重新拉一次 status（改密码失败会改变剩余尝试次数 / 锁定状态）。 */
   (e: "refresh-status"): void;
   /** 一句提示，由 App.vue 的 toast 显示。 */
@@ -235,24 +243,92 @@ async function submitChangePin() {
 }
 
 // ---------------------------------------------------------------------------
-// 占位控件（还没接线的那些）
+// 免密打开（指令 4，已接线）
 // ---------------------------------------------------------------------------
 
 /**
- * 占位控件统一反馈：明确说"还没接"。
- * 界面上宁可直接承认"没接"，也不要让它看起来已经生效。
+ * 当前是否已开启。真值源是 `status.auto_login` ——
+ * 后端读的是**库外文件** `data/auto_login.json` 是否存在，
+ * 所以未解锁时它也是准的（这正是启动流程能靠它决定走不走免密的原因）。
  */
-function notYet(what: string, cmd: string) {
-  emit("notice", `${what}尚未接入（${cmd}），本次只搭了界面`);
+const autoLoginOn = computed(() => props.status.auto_login);
+
+/** 子表单是否展开。 */
+const autoLoginOpen = ref(false);
+/** 这次点开是要"开启"还是"关闭" —— 同一条子表单服务两个方向。 */
+const autoLoginIntent = ref<"enable" | "disable">("enable");
+const autoLoginBusy = ref(false);
+const autoLoginError = ref("");
+const autoLoginPin = ref("");
+const autoLoginInput = ref<HTMLInputElement | null>(null);
+
+/**
+ * 点开关 → 展开子表单，**不是**立刻切换。
+ *
+ * 为什么不能"点一下就生效"：开启免密**必须验证密码**，否则任何人趁你
+ * 屏幕还解锁着点两下，就把它变成了永久免密入口。关闭同样要密码 ——
+ * 那不是防人，是**帮你确认自己还记得密码**，不然关掉之后下次启动
+ * 就进不去了，而你会以为只是关了个开关。
+ *
+ * ⚠️ 开关用 `@click.prevent`：浏览器默认会在点击瞬间翻转勾选状态，
+ *    而那一步还没经过密码验证。不阻止的话界面会先显示"已开启"、
+ *    再被 props 拉回来 —— 中间那一瞬就是在骗人。
+ */
+function openAutoLogin() {
+  autoLoginIntent.value = autoLoginOn.value ? "disable" : "enable";
+  autoLoginOpen.value = true;
+  autoLoginError.value = "";
+  autoLoginPin.value = "";
+  void nextTick(() => autoLoginInput.value?.focus());
 }
 
-/** 免密打开。未接入前只显示"关"，点了立刻拨回去，绝不留假状态。 */
-const autoUnlock = ref(false);
+function closeAutoLogin() {
+  autoLoginOpen.value = false;
+  autoLoginBusy.value = false;
+  autoLoginError.value = "";
+  // 明文密码不留内存、也不留在界面上
+  autoLoginPin.value = "";
+}
 
-function onToggleAutoUnlock(e: Event) {
-  // TODO(指令 4)：写免密开关，并联动解锁页 / 锁定页（遮蔽页）。
-  (e.target as HTMLInputElement).checked = autoUnlock.value;
-  notYet("免密打开", "指令 4");
+/**
+ * 提交。成功后把后端返回的**整份状态**交给 App.vue 整体替换。
+ *
+ * 与自动锁定时长、改密码同一套路：这一项自己调后端（要拿到结果才知道
+ * 该收起表单还是留着让人改，emit 是单向的），但状态的唯一真值源在 App.vue。
+ */
+async function submitAutoLogin() {
+  if (autoLoginBusy.value) return;
+  if (!autoLoginPin.value) {
+    autoLoginError.value = "请输入当前密码";
+    return;
+  }
+
+  const enabling = autoLoginIntent.value === "enable";
+  autoLoginBusy.value = true;
+  autoLoginError.value = "";
+  try {
+    const s = enabling
+      ? await enableAutoLogin(autoLoginPin.value)
+      : await disableAutoLogin(autoLoginPin.value);
+    closeAutoLogin();
+    emit("auto-login-changed", s);
+    emit("notice", enabling ? "已开启免密打开" : "已关闭免密打开");
+  } catch (err) {
+    const e = toAppError(err);
+    // 后端文案已经是人话（"密码不正确" / "已锁定，请在 N 秒后重试"），
+    // 不在前端重写第二份 —— 两份文案迟早对不上。
+    autoLoginError.value = e.message;
+
+    if (e.kind === "wrong_pin") {
+      autoLoginPin.value = "";
+      void nextTick(() => autoLoginInput.value?.focus());
+      emit("refresh-status");
+    } else if (e.kind === "locked") {
+      emit("refresh-status");
+    }
+  } finally {
+    autoLoginBusy.value = false;
+  }
 }
 </script>
 
@@ -377,18 +453,94 @@ function onToggleAutoUnlock(e: Event) {
             <div class="row">
               <div class="label">
                 <div class="t">免密打开</div>
-                <div class="d">打开软件时跳过密码，直接进入</div>
+                <div class="d">
+                  {{
+                    autoLoginOn
+                      ? "已开启：打开软件时跳过密码，直接进入"
+                      : "打开软件时跳过密码，直接进入"
+                  }}
+                </div>
               </div>
               <div class="ctl">
                 <label class="toggle">
                   <input
                     type="checkbox"
-                    :checked="autoUnlock"
-                    @change="onToggleAutoUnlock"
+                    :checked="autoLoginOn"
+                    @click.prevent="openAutoLogin"
                   />
                 </label>
               </div>
             </div>
+
+            <!--
+              免密开关子表单：开、关都要密码，就地展开（与改密码同一手法）。
+              ⚠️ 用 @click.prevent 而不是 v-model：见 openAutoLogin 的说明 ——
+                 勾选状态必须等密码验证通过后才允许变化。
+            -->
+            <form v-if="autoLoginOpen" class="sub" @submit.prevent="submitAutoLogin">
+              <p class="sub-lead">
+                {{
+                  autoLoginIntent === "enable"
+                    ? "开启免密打开需要确认密码 —— 否则任何人趁你屏幕还解锁着点两下，就能把它变成永久免密入口。"
+                    : "关闭同样要确认密码 —— 这不是防人，是帮你确认自己还记得密码，否则关掉之后下次启动就进不去了。"
+                }}
+              </p>
+
+              <div class="field">
+                <label for="al-pin">当前密码</label>
+                <input
+                  id="al-pin"
+                  ref="autoLoginInput"
+                  v-model="autoLoginPin"
+                  type="password"
+                  inputmode="numeric"
+                  autocomplete="off"
+                  :disabled="autoLoginBusy"
+                />
+              </div>
+
+              <p v-if="autoLoginError" class="err">{{ autoLoginError }}</p>
+
+              <!--
+                开与关的说明分开写：两件事的风险不是一回事 ——
+                开启要交代"钥匙明文躺在磁盘上"，关闭要交代"删文件不等于
+                钥匙作废"。合成一句必然有一半是错的，而这两条都属于
+                用户有权知道、且不说他就会误判自己数据安全程度的事。
+              -->
+              <p v-if="autoLoginIntent === 'enable'" class="warn">
+                ⚠️ 开启后，库的钥匙会以<strong>明文</strong>保存在
+                <code>data/auto_login.json</code> 里 —— 这是免密能生效的前提，
+                不是漏了加密。它挡得住误点，挡不住能打开这台电脑的人；
+                <strong>整个 data 目录被拷走 = 日记能被直接打开</strong>。
+                要真正锁上，请关掉这个开关。
+              </p>
+              <p v-else class="warn">
+                关掉之后，下次启动需要输入密码。
+                ⚠️ 但<strong>钥匙只是不再被读取，不等于作废</strong> ——
+                磁盘上可能仍有残留。要真正作废那把钥匙，必须
+                <strong>更换主密码</strong>（那会用新密钥把整库重新加密）。
+              </p>
+
+              <div class="actions">
+                <button class="btn" type="submit" :disabled="autoLoginBusy">
+                  {{
+                    autoLoginBusy
+                      ? "处理中…"
+                      : autoLoginIntent === "enable"
+                        ? "确认开启"
+                        : "确认关闭"
+                  }}
+                </button>
+                <button
+                  class="btn ghost"
+                  type="button"
+                  :disabled="autoLoginBusy"
+                  @click="closeAutoLogin"
+                >
+                  取消
+                </button>
+              </div>
+            </form>
 
             <div class="row">
               <div class="label">
@@ -676,6 +828,13 @@ select {
   gap: 11px;
   padding: 14px 0 16px;
   border-bottom: 1px solid var(--border);
+}
+/* 子表单的引导句：说清"为什么这里还要再输一次密码" */
+.sub-lead {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-2);
 }
 .field {
   display: flex;

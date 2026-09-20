@@ -52,6 +52,10 @@ target/**/*.d
 *.diarydb
 crypto_meta.bin
 lockout.json
+# 免密打开的钥匙文件（它的内容就是库密钥本身，明文）。
+# 下面的 /data/ 已经覆盖了它 —— 这里再单独列一行，是为了防止将来
+# 数据目录挪位置（比如改成 %APPDATA%）时把钥匙一起提交上去。
+auto_login.json
 
 # 日记数据目录 —— 绝对不要提交。
 # 应用是便携式的，数据存在项目里的 data/ 目录（见 commands::resolve_data_dir）。

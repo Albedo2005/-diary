@@ -12,8 +12,8 @@
 
 use crate::crypto::{self, CryptoMeta, KdfParams};
 use crate::db::{
-    AppSettings, BackupResult, DayMood, Entry, EntrySummary, IntegrityReport, SearchHit, Stats,
-    Vault,
+    derive_and_verify, AppSettings, BackupResult, DayMood, Entry, EntrySummary, IntegrityReport,
+    SearchHit, Stats, Vault,
 };
 use crate::error::{AppError, AppResult};
 use serde::Serialize;
@@ -44,6 +44,12 @@ pub struct AppStatus {
     pub max_attempts: u32,
     /// 锁定时长（秒）。
     pub lockout_secs: u64,
+    /// 是否开启了免密打开（`data/auto_login.json` 是否存在）。
+    ///
+    /// ⚠️ 必须读**库外文件**判断，不能用 `get_setting` —— 那在加密库里，
+    ///    未解锁时读不到，而启动时正要靠这个字段决定"走不走免密"，
+    ///    那一刻库必然是锁着的。硬塞一个默认值只会骗界面。
+    pub auto_login: bool,
     /// 数据目录，便于设置页展示与备份选择默认位置。
     pub data_dir: String,
 }
@@ -197,6 +203,11 @@ pub fn app_status(state: State<'_, VaultState>) -> AppResult<AppStatus> {
         pin_min_len: lockout.pin_min_len,
         max_attempts: crypto::MAX_FAILED_ATTEMPTS,
         lockout_secs: crypto::LOCKOUT_DURATION.as_secs(),
+        // 只看"文件在不在"，与开关语义严格一致（文件存在 = 开启，
+        // 不设 enabled 字段，避免"文件在、字段却说不开"的矛盾状态）。
+        // 刻意**不解析内容**：状态查询不该因为一个坏文件而失败，
+        // "钥匙坏了"由 unlock_with_auto_key 处理（它会顺手删掉坏文件）。
+        auto_login: crypto::auto_login_path(state.data_dir()).exists(),
         data_dir: state.data_dir().to_string_lossy().to_string(),
     })
 }
@@ -295,6 +306,195 @@ pub fn lock_vault(state: State<'_, VaultState>) -> AppResult<AppStatus> {
         *guard = None;
     }
     app_status(state)
+}
+
+// ---------------------------------------------------------------------------
+// 免密打开（指令 4）
+// ---------------------------------------------------------------------------
+//
+// 语义：**不是给库加一把新钥匙，而是把库现有密钥复制一份明文存到库外**
+// （`data/auto_login.json`）。所以整个功能**不涉及 `PRAGMA rekey`** ——
+// 开关的成本只是写 / 删一个文件。
+//
+// 三条必须守住的边界：
+//   · 开启与关闭**都要求输入密码**。开启是为了防"趁你屏幕还解锁着点两下，
+//     就把它变成永久免密入口"；关闭是为了帮用户确认"我还记得密码"——
+//     否则关完下次启动就进不去了，而用户完全不知道为什么。
+//   · 失败一律计入锁定期，与 `unlock_vault` / `change_password` 同一口径。
+//   · 钥匙对不上库时**删掉文件**（留着只会每次启动失败一次），
+//     但 IO 类临时故障**保留文件**（不能因一次故障清掉用户的设置）。
+//
+// ⚠️ 本段三条命令都**不走 `with_vault`**：
+//    解锁那条本来就来解锁（此刻必然是 None）；开关那两条的凭证是
+//    "用户输入的密码"，密码对才生效，与连接在不在无关。
+
+/// 用免密钥匙解锁。
+///
+/// 前端在启动时调：`app_status` 里 `auto_login == true` 且未解锁就走这里。
+/// 失败意味着钥匙文件已不可用（改过密码没同步上 / 文件被改坏），
+/// 那时文件已被清掉，界面应回退到密码解锁并说明原因。
+#[tauri::command]
+pub fn unlock_with_auto_key(state: State<'_, VaultState>) -> AppResult<AppStatus> {
+    let vault = unlock_via_auto_login(state.data_dir())?;
+
+    {
+        let mut guard = state
+            .vault()
+            .lock()
+            .map_err(|_| AppError::State("内部状态锁已损坏".into()))?;
+        *guard = Some(vault);
+    }
+
+    // 免密进得来，就算一次成功解锁：清零失败计数。
+    // ⚠️ 必须**重新读一遍**再 record_success：save 是整份覆盖写，
+    //    拿更早读的副本写回会把中间落盘的东西覆盖掉
+    //    （改密码那边正是踩了这个坑，见 crypto::LockoutState::update_hint 的说明）。
+    let lock_path = crypto::lockout_path(state.data_dir());
+    let mut fresh = crypto::LockoutState::load(&lock_path);
+    fresh.record_success(&lock_path)?;
+
+    app_status(state)
+}
+
+/// 读钥匙文件并开库。失败路径按"该不该留这个文件"分成两类。
+///
+/// 为什么必须分类（不能一刀切删或一刀切留）：
+///   · 钥匙**已经没用了**（对不上库 / 文件内容坏了）→ 删。
+///     留着它只会每次启动都失败一次，而且用户根本不知道该找哪个文件；
+///   · **临时故障**（IO 失败、库被别的进程占着）→ 留。
+///     一次偶发故障就清掉用户的设置，是把小问题变成"我怎么又要输密码了"。
+///
+/// 判据是**错误类型**，不是"失败了"这个笼统结论。
+///
+/// `pub` 是为了让集成测试能直接驱动它 —— 与 `change_password_core` 同一个理由：
+/// 这里恰好是最该被测的一段（删文件的分支写错，用户就会每次启动都失败一次）。
+pub fn unlock_via_auto_login(data_dir: &Path) -> AppResult<Vault> {
+    let path = crypto::auto_login_path(data_dir);
+
+    let al = match crypto::AutoLogin::load(&path) {
+        Ok(Some(al)) => al,
+        // 文件不在：状态查询与解锁之间被人删了。属于正常竞态，不是错误升级。
+        Ok(None) => return Err(AppError::State("免密打开未开启".into())),
+        Err(e) => {
+            // 内容坏（crypto）→ 删；IO 类 → 保留。见函数文档。
+            if matches!(e, AppError::Crypto(_)) {
+                let _ = crypto::AutoLogin::clear(&path);
+            }
+            return Err(e);
+        }
+    };
+
+    // load 已经校验过长度，这里不会失败；真要失败也按"文件没用"处理。
+    let mut key = match al.key() {
+        Ok(k) => k,
+        Err(e) => {
+            let _ = crypto::AutoLogin::clear(&path);
+            return Err(e);
+        }
+    };
+
+    let opened = Vault::unlock_with_key(data_dir, &key);
+    // 无论成败，密钥都从内存里清掉 —— 它是库密钥本身。
+    crypto::zeroize(&mut key);
+
+    match opened {
+        Ok(v) => Ok(v),
+        Err(AppError::WrongPin) => {
+            // 最典型的原因：改过密码，而钥匙文件没能同步上（或用户手工换过库文件）。
+            // 删掉它，让下次启动直接走密码解锁，不必每次都先失败一次。
+            let _ = crypto::AutoLogin::clear(&path);
+            Err(AppError::State(
+                "免密打开已失效，已自动关闭。请用密码解锁 —— 你原来的密码仍然有效。".into(),
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 开启免密打开。
+#[tauri::command]
+pub fn enable_auto_login(state: State<'_, VaultState>, pin: String) -> AppResult<AppStatus> {
+    let data_dir = state.data_dir().clone();
+    enable_auto_login_core(&data_dir, &pin)?;
+    app_status(state)
+}
+
+/// 关闭免密打开（仍然要求密码，理由见本段开头的三条边界）。
+#[tauri::command]
+pub fn disable_auto_login(state: State<'_, VaultState>, pin: String) -> AppResult<AppStatus> {
+    let data_dir = state.data_dir().clone();
+    disable_auto_login_core(&data_dir, &pin)?;
+    app_status(state)
+}
+
+/// 开启免密打开的完整流程 —— 可以被测试直接驱动的那部分。
+///
+/// 顺序不能乱：**先验证密码成功，再写文件**。反过来（先写文件再验证）
+/// 会留下"文件在、库却根本打不开"的死状态，而那正好是最坏的一种：
+/// 用户以为自己开了免密，重启后走免密失败，还看不出原因。
+pub fn enable_auto_login_core(data_dir: &Path, pin: &str) -> AppResult<()> {
+    let lock_path = crypto::lockout_path(data_dir);
+    let mut lockout = crypto::LockoutState::load(&lock_path);
+
+    // 锁定中直接拒绝，且不消耗尝试次数 —— 与 unlock_vault 同一口径。
+    lockout.check_not_locked(&lock_path)?;
+
+    match derive_and_verify(data_dir, pin) {
+        Ok(mut key) => {
+            let saved = crypto::AutoLogin::new(&key).save(&crypto::auto_login_path(data_dir));
+            // 无论写没写成，密钥都不该继续留在内存里。
+            crypto::zeroize(&mut key);
+            saved?;
+
+            let mut fresh = crypto::LockoutState::load(&lock_path);
+            fresh.record_success(&lock_path)?;
+            Ok(())
+        }
+        Err(AppError::WrongPin) => {
+            let locked_now = lockout.record_failure(&lock_path)?;
+            if locked_now {
+                Err(AppError::Locked {
+                    remaining_secs: crypto::LOCKOUT_DURATION.as_secs(),
+                })
+            } else {
+                Err(AppError::WrongPin)
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 关闭免密打开的完整流程。
+///
+/// 校验通过才删文件：密码都对不上的人，没有资格动这个开关
+/// （他可能是坐在电脑前的别人）。
+pub fn disable_auto_login_core(data_dir: &Path, pin: &str) -> AppResult<()> {
+    let lock_path = crypto::lockout_path(data_dir);
+    let mut lockout = crypto::LockoutState::load(&lock_path);
+
+    lockout.check_not_locked(&lock_path)?;
+
+    match derive_and_verify(data_dir, pin) {
+        Ok(mut key) => {
+            crypto::zeroize(&mut key);
+            crypto::AutoLogin::clear(&crypto::auto_login_path(data_dir))?;
+
+            let mut fresh = crypto::LockoutState::load(&lock_path);
+            fresh.record_success(&lock_path)?;
+            Ok(())
+        }
+        Err(AppError::WrongPin) => {
+            let locked_now = lockout.record_failure(&lock_path)?;
+            if locked_now {
+                Err(AppError::Locked {
+                    remaining_secs: crypto::LOCKOUT_DURATION.as_secs(),
+                })
+            } else {
+                Err(AppError::WrongPin)
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 // ---------------------------------------------------------------------------

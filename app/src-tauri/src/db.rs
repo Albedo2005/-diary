@@ -394,6 +394,28 @@ impl Vault {
         Ok(vault)
     }
 
+    /// 用**现成的密钥**打开已有数据库（免密打开用，指令 4）。
+    ///
+    /// 与 `unlock` 的唯一区别：密钥不来自 PIN 派生，而是从
+    /// `data/auto_login.json` 里读出来的那把（它当初也是派生出来的）。
+    ///
+    /// 为什么单独开一个入口而不是复用 `unlock`：`unlock` 必须先读
+    /// crypto_meta.json 才能派生，而免密路径**不需要也不应该**再派生一次
+    /// —— 免密打开的全部意义就是跳过那次约 0.8 秒的 Argon2id。
+    ///
+    /// ⚠️ 本函数只是**借用**密钥，不清零调用方内存；调用方用完自己清。
+    pub fn unlock_with_key(data_dir: &Path, key: &[u8; KEY_LEN]) -> AppResult<Self> {
+        let db_path = data_dir.join("diary.db");
+        if !db_path.exists() {
+            return Err(AppError::State("数据库不存在，需要先初始化".into()));
+        }
+        // 密钥不对时，open_with_key 内部的 apply_key_and_verify 返回 WrongPin ——
+        // 正是调用方用来判断"这把钥匙已过期（比如改过密码）"的信号。
+        let vault = Self::open_with_key(&db_path, key)?;
+        vault.migrate()?;
+        Ok(vault)
+    }
+
     /// 修改主密码。
     ///
     /// 原理：在**已解锁的连接**上执行 `PRAGMA rekey`，SQLCipher 会把整个库

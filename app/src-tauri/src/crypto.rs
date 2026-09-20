@@ -427,6 +427,106 @@ pub fn auto_login_path(data_dir: &Path) -> PathBuf {
     data_dir.join("auto_login.json")
 }
 
+/// 免密钥匙文件的内容。
+///
+/// ⚠️ **明文存储 —— 这是这个功能的全部意义，不是漏了加密。**
+///    免密打开等于"把库现有密钥复制一份明文放到库外"，
+///    而"把库打开"要的就是密钥本身。给这个文件加密 = 这个功能不存在。
+///    所以不要"顺手补个加密"，也别以为这里欠了什么。
+///
+/// ⚠️ 由此产生的三条事实，设置页必须如实写出来（不许粉饰）：
+///    · 文件明文躺在磁盘上，开启后机密性只挡"误开"和通用工具直读；
+///    · `data/` 整体被拷走 = 库能被直接打开
+///      （这是换来"换电脑 / 恢复备份后仍能免密"的取舍）；
+///    · **关掉免密 ≠ 钥匙作废**。删文件只是让程序不再读它，
+///      磁盘上可能仍有残留。要真正作废，必须**更换主密码** ——
+///      那会用新密钥把整个库重新加密，旧钥匙从此解不开。
+///
+/// ⚠️ `key_hex` / `created_at` 是对外契约：`sync_auto_login_key`
+///    只改 `key_hex`、其余字段原样保留，所以将来加字段不会被冲掉。
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AutoLogin {
+    /// 库密钥的十六进制（64 字符 = 32 字节）。**这就是库密钥本身**。
+    pub key_hex: String,
+    /// 创建时间（Unix 秒）。仅用于显示"什么时候开的"。
+    #[serde(default)]
+    pub created_at: u64,
+}
+
+/// 手写 Debug：**绝不能**让 `key_hex` 顺着日志或 panic 信息漏出去。
+///
+/// `#[derive(Debug)]` 会把整个字段原样打出来 —— 一条 `eprintln!("{al:?}")`
+/// 就等于把库密钥写进了日志文件。`Vault` 手写 Debug 是同一个理由。
+impl std::fmt::Debug for AutoLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AutoLogin")
+            .field("key_hex", &"<已隐藏>")
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+impl AutoLogin {
+    /// 用一把**已验证过**的密钥构造。调用方负责保证它确实能打开库。
+    pub fn new(key: &[u8; KEY_LEN]) -> Self {
+        Self {
+            key_hex: hex_encode(key),
+            created_at: now_unix(),
+        }
+    }
+
+    /// 从文件读取。
+    ///
+    /// 三种情况必须分得清 —— 调用方要靠这个区分决定"删不删文件"：
+    ///   · 文件不存在 → `Ok(None)`：免密未开启，**正常状态**
+    ///   · 读失败     → `Err(io)`  ：临时故障（句柄被占、权限），**不要**删
+    ///   · 内容坏     → `Err(crypto)`：文件本质坏了（JSON 残缺、hex 长度不对），
+    ///                                留着只会每次启动都失败一次，该删
+    pub fn load(path: &Path) -> AppResult<Option<Self>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(path)?;
+        let me: Self = serde_json::from_str(&text)
+            .map_err(|e| AppError::Crypto(format!("免密钥匙文件损坏，无法解析: {e}")))?;
+        // 顺手验一遍长度：能解析但值不对，同样属于"这个文件没用"。
+        me.key()?;
+        Ok(Some(me))
+    }
+
+    /// 解析出密钥本身。长度/格式不对时返回 `crypto` 错误（调用方据此删文件）。
+    pub fn key(&self) -> AppResult<[u8; KEY_LEN]> {
+        let bytes = hex_decode(&self.key_hex)?;
+        if bytes.len() != KEY_LEN {
+            return Err(AppError::Crypto(format!(
+                "免密钥匙长度异常：期望 {KEY_LEN} 字节，实际 {}",
+                bytes.len()
+            )));
+        }
+        let mut out = [0u8; KEY_LEN];
+        out.copy_from_slice(&bytes);
+        Ok(out)
+    }
+
+    /// 写入文件。原子写（临时文件 + 改名），与 `LockoutState::save` 同一手法。
+    pub fn save(&self, path: &Path) -> AppResult<()> {
+        let value = serde_json::to_value(self)
+            .map_err(|e| AppError::State(format!("序列化免密钥匙失败: {e}")))?;
+        write_json_atomic(path, &value)
+    }
+
+    /// 删除文件 = 关闭免密打开。文件本来就不存在也算成功（幂等）。
+    ///
+    /// ⚠️ 只"不再读取"，不保证磁盘块被覆写 —— 见本结构体文档里的第三条。
+    pub fn clear(path: &Path) -> AppResult<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
 /// 把免密钥匙文件里的 `key_hex` 换成新密钥。返回 `true` 表示确实改写了文件。
 ///
 /// **什么时候必须调**：改主密码之后。漏了这一步，用户改完密码重启会发现
@@ -717,5 +817,57 @@ mod tests {
             "默认 m_cost 不应超过校准上限"
         );
         assert!(d.m_cost >= KDF_CALIBRATE_MIN_MIB * 1024);
+    }
+
+    #[test]
+    fn auto_login_round_trips_and_a_missing_file_is_not_an_error() {
+        let dir = std::env::temp_dir().join("dsh-diary-test-autologin");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = auto_login_path(&dir);
+
+        // 文件不存在 = 免密未开启，是**正常状态**，不是错误。
+        // 调用方要靠这个区分决定"删不删文件"。
+        assert!(AutoLogin::load(&path).unwrap().is_none());
+
+        let key = [3u8; KEY_LEN];
+        AutoLogin::new(&key).save(&path).unwrap();
+        let back = AutoLogin::load(&path).unwrap().expect("应能读回");
+        assert_eq!(back.key().unwrap(), key, "存取必须无损，否则免密开不了库");
+
+        // 内容坏 → crypto 错误（调用方据此**删掉**文件，而不是当临时故障留着）
+        std::fs::write(&path, "{ 这不是 JSON").unwrap();
+        let e = AutoLogin::load(&path).expect_err("坏文件必须报错");
+        assert!(matches!(e, AppError::Crypto(_)), "实际: {e:?}");
+
+        // 能解析但长度不对，同样算坏 —— 否则会被当成"一把开不了库的钥匙"，
+        // 走的是另一个分支，用户会看到不同的提示。
+        std::fs::write(&path, "{\"key_hex\":\"abcd\"}").unwrap();
+        let e = AutoLogin::load(&path).expect_err("长度不对也必须报错");
+        assert!(matches!(e, AppError::Crypto(_)), "实际: {e:?}");
+
+        // 关掉：文件消失；再关一次也不报错（幂等）
+        AutoLogin::clear(&path).unwrap();
+        assert!(!path.exists());
+        AutoLogin::clear(&path).expect("重复关闭必须无害");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_login_debug_never_leaks_the_key() {
+        // 安全回归测试。`#[derive(Debug)]` 会把 key_hex 原样打出来，
+        // 而一句 `eprintln!("{al:?}")` 就等于把库密钥写进了日志文件 ——
+        // 所以这里的 Debug 是手写的，这条测试守住它别被"顺手改回 derive"。
+        let key = [0xABu8; KEY_LEN];
+        let al = AutoLogin::new(&key);
+        let shown = format!("{al:?}");
+        assert!(
+            !shown.contains(&hex_encode(&key)),
+            "Debug 输出里出现了密钥本体: {shown}"
+        );
+        assert!(shown.contains("已隐藏"), "实际: {shown}");
+        // 顺带确认密钥本身仍能正常取出（别为了让 Debug 干净而把功能藏掉了）
+        assert_eq!(al.key().unwrap(), key);
     }
 }

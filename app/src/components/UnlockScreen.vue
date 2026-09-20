@@ -21,7 +21,17 @@ import {
   type AppStatus,
 } from "../api";
 
-const props = defineProps<{ status: AppStatus }>();
+const props = defineProps<{
+  status: AppStatus;
+  /**
+   * 上一次启动时免密解锁失败过（钥匙文件已失效，后端已把它删掉）。
+   *
+   * 为真时界面要多做两件事：副标题固定说"输入密码"，并在密码框上方
+   * 加一条红条解释原因。理由是用户的心理预期是"应该直接进去"——
+   * 突然要求输密码而不给解释，他第一个念头是"密码被改了 / 软件坏了"。
+   */
+  autoLoginFailed?: boolean;
+}>();
 const emit = defineEmits<{
   (e: "unlocked", status: AppStatus): void;
   (e: "status", status: AppStatus): void;
@@ -41,6 +51,17 @@ let timer: number | null = null;
 const isInit = computed(() => !local.value.initialized);
 const locked = computed(() => remaining.value > 0);
 const minLen = computed(() => local.value.pin_min_len);
+
+/**
+ * 副标题文案。
+ *
+ * 抽成 computed 而不是写在模板里三目：免密失败那条分支要和正常解锁
+ * 用同一句"输入密码，继续写下去"，将来改文案时不会只改动其中一处。
+ */
+const subtitle = computed(() => {
+  if (props.autoLoginFailed) return "输入密码，继续写下去";
+  return isInit.value ? "记录每天的自己" : "输入密码，继续写下去";
+});
 
 const canSubmit = computed(() => {
   if (busy.value || locked.value) return false;
@@ -145,9 +166,7 @@ async function submit() {
       <!-- 标题居中，两行：主标题 + 副标题 -->
       <header class="hero">
         <h1>日记</h1>
-        <p class="subtitle">
-          {{ isInit ? "记录每天的自己" : "输入密码，继续写下去" }}
-        </p>
+        <p class="subtitle">{{ subtitle }}</p>
       </header>
 
       <p v-if="isInit" class="lead">
@@ -167,6 +186,17 @@ async function submit() {
       </div>
 
       <template v-else>
+        <!--
+          免密打开失效的说明条。
+          ⚠️ 必须明说"你原来的密码仍然有效"：用户此刻的状态是
+          "本来该直接进，却要输密码"，最容易联想到"密码被改了 / 库坏了"，
+          而真相只是那把**额外的**钥匙过期了，主密码从来没被动过。
+          用现成的 .error 样式（同色系的提示条），不另造一套。
+        -->
+        <div v-if="autoLoginFailed && !isInit" class="error">
+          免密打开已失效，已自动关闭。请输入密码 —— 你原来的密码仍然有效。
+        </div>
+
         <label class="field">
           <span class="label">{{ isInit ? "设置密码" : "密码" }}</span>
           <input

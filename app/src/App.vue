@@ -8,6 +8,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import CalendarPanel from "./components/CalendarPanel.vue";
 import EditorPane from "./components/EditorPane.vue";
+import HiddenScreen from "./components/HiddenScreen.vue";
 import SearchPanel from "./components/SearchPanel.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
 import UnlockScreen from "./components/UnlockScreen.vue";
@@ -23,6 +24,7 @@ import {
   lockVault,
   setAutoBackup,
   toAppError,
+  unlockWithAutoKey,
   type AppStatus,
   type BackupStatus,
   type ChangePasswordResult,
@@ -47,6 +49,23 @@ const backup = ref<BackupStatus | null>(null);
 const showSettings = ref(false);
 
 /**
+ * 遮蔽页是否挂着。
+ *
+ * ⚠️ 它**不是锁**：免密打开时库自始至终是解锁的，这里只是拉一层帘子
+ *    （见 doLock 与 HiddenScreen.vue 的说明）。帘子挂着时主界面组件
+ *    并不卸载，所以编辑器里的草稿原样保留。
+ */
+const hidden = ref(false);
+
+/**
+ * 上次启动时免密解锁失败过。
+ *
+ * 真时把解锁页的副标题改掉并加一条提示条 —— 用户本来期待"直接进去"，
+ * 结果看到要输密码，不说清楚他会以为软件坏了。
+ */
+const autoLoginFailed = ref(false);
+
+/**
  * 自动锁定时长（秒）。`0` = 永不。
  *
  * 先用默认值起步，解锁成功后由 loadSettings() 换成库里的真实值 ——
@@ -69,12 +88,33 @@ function flash(msg: string) {
 async function boot() {
   booting.value = true;
   fatal.value = "";
+  autoLoginFailed.value = false;
   try {
-    status.value = await getStatus();
-    if (status.value.unlocked) {
+    let s = await getStatus();
+
+    /*
+      免密打开：库还没解锁、而钥匙文件在，就直接开库，用户看不到解锁页。
+      booting 期间显示的是"正在启动…"，所以这里不会有"闪一下解锁页"。
+
+      失败不做特殊处理 —— 后端已经处理完了：它把那个没用的钥匙文件删掉，
+      并把原因写在错误里。前端只负责回退到解锁页并告诉用户为什么。
+      （失败时刻意**不**再重试一次密码路径：没有密码可试。）
+    */
+    if (!s.unlocked && s.auto_login) {
+      try {
+        s = await unlockWithAutoKey();
+      } catch {
+        autoLoginFailed.value = true;
+        s = await getStatus();
+      }
+    }
+
+    status.value = s;
+    if (s.unlocked) {
       await loadAux();
       // 设置也得跟着读一次：库里存的可能是 1 分钟或永不，
       // 先用默认值起步会让自动锁定在启动后的一小段时间里用错时长。
+      // 免密自动解锁同样会走到这里，所以它读到的也是真实设置。
       await loadSettings();
     }
   } catch (e) {
@@ -115,10 +155,35 @@ async function loadSettings() {
 
 function onUnlocked(s: AppStatus) {
   status.value = s;
+  // 已经进来了，那条"免密失效"的提示就没有意义了。
+  autoLoginFailed.value = false;
   void loadAux();
-  // 解锁成功后必须把设置读回来 —— 包括将来"免密自动解锁"那条路径，
+  // 解锁成功后必须把设置读回来 —— 包括"免密自动解锁"那条路径，
   // 它同样会走到这里。否则会一直用启动时的默认值。
   void loadSettings();
+}
+
+/**
+ * 免密开关变了（设置页里开的或关的）。
+ *
+ * 用后端返回的那一份**整体替换**，而不是只改 auto_login 这一个字段：
+ * 开关失败会改变剩余尝试次数、甚至进入锁定期，前端自己拼必然漏项。
+ */
+function onAutoLoginChanged(s: AppStatus) {
+  status.value = s;
+}
+
+/**
+ * 从遮蔽页回来。
+ *
+ * 库自始至终是解锁的，所以这里只撤帘子 —— 不碰状态、不重拉数据，
+ * 编辑器里的草稿原样还在（组件全程没被卸载）。
+ * 但要**重挂自动锁定计时器**：帘子挂着这段时间里它已被清掉，
+ * 不重挂的话"再次失焦"就不会再触发了。
+ */
+function resume() {
+  hidden.value = false;
+  rearmLockTimer();
 }
 
 function onSaved() {
@@ -130,6 +195,22 @@ async function doLock() {
   // 先撤掉自动锁定的计时器：已经锁上了，它再响一次是空跑；
   // 更糟的是万一定时器残留到解锁之后，会突袭式地把刚解开的库又锁上。
   clearLockTimer();
+
+  /*
+    免密打开时**不能真锁库**：库里没有密码可输，锁上就是死锁 ——
+    用户下一次打开会撞上一个"要求密码、却又不接受任何密码"的界面。
+    所以这里只拉一层帘子（纯前端），回来看一眼就恢复，草稿也不丢。
+
+    ⚠️ 判断只写在**这一处**。手动点「锁定」和自动锁定到点都走本函数，
+       两处各写一份 if 的话，漏掉任何一处就会出现上面那个死锁。
+    ⚠️ 免密模式下"自动锁定"仍然照常生效（到点就走这里拉帘子），
+       不要加 `if (auto_login) return` 去停用它 —— 那样屏幕会一直亮着。
+  */
+  if (status.value?.auto_login) {
+    hidden.value = true;
+    return;
+  }
+
   try {
     status.value = await lockVault();
     stats.value = null;
@@ -289,6 +370,14 @@ onUnmounted(() => {
 
 <template>
   <div class="app">
+    <!--
+      遮蔽页（免密打开下的"假锁定"）。
+      ⚠️ 必须放在最前、且**独立成一条判断** —— 不能插进下面那条
+         v-if / v-else-if 链中间，那会打断链，导致 v-else-if 报错。
+      它自己带 z-index，能盖住主界面与设置弹窗（见组件内说明）。
+    -->
+    <HiddenScreen v-if="hidden" @resume="resume" />
+
     <div v-if="booting" class="boot">正在启动…</div>
 
     <div v-else-if="fatal" class="boot error">
@@ -299,6 +388,7 @@ onUnmounted(() => {
     <UnlockScreen
       v-else-if="status && !unlocked"
       :status="status"
+      :auto-login-failed="autoLoginFailed"
       @unlocked="onUnlocked"
       @status="(s) => (status = s)"
     />
@@ -366,6 +456,7 @@ onUnmounted(() => {
         @toggle-auto-backup="toggleAutoBackup"
         @auto-lock-secs="(s) => (autoLockSecs = s)"
         @password-changed="onPasswordChanged"
+        @auto-login-changed="onAutoLoginChanged"
         @refresh-status="refreshStatus"
         @notice="flash"
       />

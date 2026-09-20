@@ -1394,3 +1394,225 @@ fn rekey_leaves_no_old_key_pages_behind() {
     let _ = std::fs::remove_dir_all(&copy);
 }
 
+// ---------------------------------------------------------------------------
+// 免密打开（指令 4）
+// ---------------------------------------------------------------------------
+//
+// 这一组测的是"把库密钥明文复制一份到库外"这条路径。
+// 最容易写错、也最该被测的三处：
+//   ① 钥匙到底能不能真的开库（不能的话这个功能毫无意义）；
+//   ② 失败时该不该删那个文件（删错 → 用户设置凭空消失；
+//      不删 → 每次启动都白失败一次，而用户不知道问题出在哪）；
+//   ③ 改密码之后钥匙有没有跟上（没跟上 → 用户改完密码重启，
+//      免密突然失效，而"改密码"和"免密"在他眼里毫无关系）。
+
+/// 建一个已初始化的库，返回数据目录。
+fn vault_dir(tag: &str) -> std::path::PathBuf {
+    let dir = temp_dir(tag);
+    {
+        let v = Vault::create(&dir, PIN, None).expect("创建应成功");
+        drop(v);
+    }
+    dir
+}
+
+#[test]
+fn enable_auto_login_writes_a_key_that_really_opens_the_vault() {
+    let dir = vault_dir("al-enable");
+    let path = app_lib::crypto::auto_login_path(&dir);
+    assert!(!path.exists(), "初始状态不该有钥匙文件");
+
+    app_lib::commands::enable_auto_login_core(&dir, PIN).expect("开启免密应成功");
+    assert!(path.exists(), "开启后钥匙文件必须存在");
+
+    // 核心断言：文件里那把钥匙必须**真的能开库** ——
+    // 这个功能的全部意义就在于此，能读到文件但开不了库等于没做。
+    let al = app_lib::crypto::AutoLogin::load(&path)
+        .unwrap()
+        .expect("文件应可解析");
+    let mut key = al.key().unwrap();
+    {
+        let vault = Vault::unlock_with_key(&dir, &key).expect("钥匙必须能开库");
+        assert_eq!(vault.stats().unwrap().total_entries, 0);
+    }
+    app_lib::crypto::zeroize(&mut key);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn enable_auto_login_with_a_wrong_pin_creates_nothing() {
+    let dir = vault_dir("al-wrongpin");
+    let path = app_lib::crypto::auto_login_path(&dir);
+
+    let err = app_lib::commands::enable_auto_login_core(&dir, "999999")
+        .expect_err("错误密码必须被拒绝");
+    assert!(matches!(err, AppError::WrongPin), "实际: {err:?}");
+    assert!(
+        !path.exists(),
+        "验证失败时绝不能留下钥匙文件 —— 那等于开了一个不需要密码的入口"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn enable_auto_login_counts_attempts_and_locks_out() {
+    let dir = vault_dir("al-lockout");
+    let path = app_lib::crypto::auto_login_path(&dir);
+
+    // 前 4 次：只是密码错。⚠️ 用 `..=4`，`1..4` 只有 3 次（这里栽过）。
+    for i in 1..=4 {
+        let e = app_lib::commands::enable_auto_login_core(&dir, "999999")
+            .expect_err("错误密码必须失败");
+        assert!(matches!(e, AppError::WrongPin), "第 {i} 次实际: {e:?}");
+    }
+
+    // 第 5 次：触发锁定。
+    let e = app_lib::commands::enable_auto_login_core(&dir, "999999")
+        .expect_err("第 5 次必须触发锁定");
+    assert!(matches!(e, AppError::Locked { .. }), "实际: {e:?}");
+
+    // 锁定期间即使密码**正确**也拒绝 —— 否则锁定期形同虚设，
+    // 而"开启免密"这条路正好提供了另一个无限试密码的入口。
+    let e = app_lib::commands::enable_auto_login_core(&dir, PIN)
+        .expect_err("锁定期间必须拒绝");
+    assert!(matches!(e, AppError::Locked { .. }), "实际: {e:?}");
+    assert!(!path.exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn disable_auto_login_requires_the_pin_and_removes_the_file() {
+    let dir = vault_dir("al-disable");
+    let path = app_lib::crypto::auto_login_path(&dir);
+    app_lib::commands::enable_auto_login_core(&dir, PIN).unwrap();
+    assert!(path.exists());
+
+    // 密码错 → 文件必须留着。开关不能被"不知道密码的人"动。
+    let e = app_lib::commands::disable_auto_login_core(&dir, "999999")
+        .expect_err("错误密码必须拒绝");
+    assert!(matches!(e, AppError::WrongPin), "实际: {e:?}");
+    assert!(path.exists(), "验证失败时不能把免密关掉");
+
+    // 密码对 → 删掉。
+    app_lib::commands::disable_auto_login_core(&dir, PIN).unwrap();
+    assert!(!path.exists(), "关闭免密必须删掉钥匙文件");
+
+    // 幂等：再关一次不该报错（用户可能连点两下，或文件已被手工删掉）。
+    app_lib::commands::disable_auto_login_core(&dir, PIN).expect("重复关闭必须无害");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_vault_without_a_key_file_behaves_exactly_as_before() {
+    let dir = vault_dir("al-absent");
+    let path = app_lib::crypto::auto_login_path(&dir);
+
+    // 文件不存在是**正常状态**，不是错误 —— 老库就是这样。
+    assert!(
+        app_lib::crypto::AutoLogin::load(&path).unwrap().is_none(),
+        "文件不存在应返回 None，而不是报错"
+    );
+
+    // 试图走免密：明确失败，且**绝不会**顺手创建一个文件
+    //（创建一个就等于替用户把免密打开了，是越过用户意愿的动作）。
+    let e = app_lib::commands::unlock_via_auto_login(&dir).expect_err("没开免密就该失败");
+    assert!(!path.exists(), "缺文件时绝不能凭空创建钥匙文件");
+    assert!(format!("{e}").contains("未开启"), "错误信息应说清原因，实际: {e}");
+
+    // 常规解锁一行都没变。
+    let vault = Vault::unlock(&dir, PIN).expect("密码解锁必须照旧可用");
+    assert_eq!(vault.stats().unwrap().total_entries, 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_broken_key_file_is_deleted_and_the_pin_still_works() {
+    let dir = vault_dir("al-broken");
+    let path = app_lib::crypto::auto_login_path(&dir);
+    app_lib::commands::enable_auto_login_core(&dir, PIN).unwrap();
+
+    // 模拟手工改坏 / 磁盘损坏。
+    std::fs::write(&path, "{\"key_hex\": \"not-hex-at-all\"}").unwrap();
+
+    let e = app_lib::commands::unlock_via_auto_login(&dir).expect_err("坏钥匙不能开库");
+    assert!(!path.exists(), "坏文件必须被删掉，否则每次启动都要再白失败一次");
+    assert!(format!("{e}").len() > 0);
+
+    // 主路径不受影响：密码仍然能开。
+    let vault = Vault::unlock(&dir, PIN).expect("密码必须仍然有效");
+    assert_eq!(vault.stats().unwrap().total_entries, 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_key_that_no_longer_matches_the_vault_is_deleted() {
+    let dir = vault_dir("al-stale");
+    let path = app_lib::crypto::auto_login_path(&dir);
+
+    // 一把"格式完全合法、但开不了这个库"的钥匙。
+    // 现实中对应的正是"改过密码，而钥匙文件没同步上"。
+    let stale = app_lib::crypto::AutoLogin::new(&[7u8; app_lib::crypto::KEY_LEN]);
+    stale.save(&path).unwrap();
+
+    let e = app_lib::commands::unlock_via_auto_login(&dir).expect_err("过期钥匙必须失败");
+    assert!(!path.exists(), "对不上库的钥匙必须删掉");
+    // 文案要引导用户改用密码 —— 他会怀疑"是不是密码也坏了"。
+    assert!(
+        format!("{e}").contains("密码"),
+        "错误信息应指向密码解锁，实际: {e}"
+    );
+
+    let vault = Vault::unlock(&dir, PIN).expect("密码必须仍然有效");
+    assert!(vault.stats().is_ok());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn after_changing_the_pin_the_key_file_holds_the_new_key() {
+    let dir = vault_dir("al-after-chpw");
+    let path = app_lib::crypto::auto_login_path(&dir);
+
+    app_lib::commands::enable_auto_login_core(&dir, PIN).unwrap();
+    let mut old_key = app_lib::crypto::AutoLogin::load(&path)
+        .unwrap()
+        .unwrap()
+        .key()
+        .unwrap();
+
+    // 免密开着的情况下改密码 —— 收尾必须把钥匙文件同步成新密钥。
+    {
+        let vault = Vault::unlock(&dir, PIN).unwrap();
+        app_lib::commands::change_password_core(&dir, &vault, PIN, NEW_PIN, None)
+            .expect("改密码应成功");
+    }
+
+    let new_key = app_lib::crypto::AutoLogin::load(&path)
+        .unwrap()
+        .unwrap()
+        .key()
+        .unwrap();
+    assert_ne!(new_key, old_key, "钥匙文件必须被换成新密钥");
+
+    // "同步成功"的标准是**新钥匙真能开库**，不是"文件内容变了"。
+    {
+        let vault = Vault::unlock_with_key(&dir, &new_key).expect("新钥匙必须能开库");
+        assert!(vault.stats().is_ok());
+    }
+
+    // 旧钥匙必须开不了 —— 否则等于密码根本没改。
+    assert!(
+        Vault::unlock_with_key(&dir, &old_key).is_err(),
+        "旧钥匙必须失效，否则改密码没起到作用"
+    );
+
+    app_lib::crypto::zeroize(&mut old_key);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

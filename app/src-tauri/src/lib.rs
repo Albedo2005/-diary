@@ -82,6 +82,10 @@ pub fn run() {
             commands::unlock_vault,
             commands::lock_vault,
             commands::change_password,
+            // 免密打开（钥匙明文存在库外的 data/auto_login.json）
+            commands::unlock_with_auto_key,
+            commands::enable_auto_login,
+            commands::disable_auto_login,
             // 日记读写
             // 注意：这里注册的是 open_entry（纯读取、不写库），
             // 而不是早期版本的 get_or_create_entry。后者会让"点开日历"
