@@ -9,6 +9,7 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import CalendarPanel from "./components/CalendarPanel.vue";
 import EditorPane from "./components/EditorPane.vue";
 import SearchPanel from "./components/SearchPanel.vue";
+import SettingsPanel from "./components/SettingsPanel.vue";
 import UnlockScreen from "./components/UnlockScreen.vue";
 import {
   backupNow,
@@ -40,6 +41,8 @@ const stats = ref<Stats | null>(null);
 const crypto = ref<CryptoInfo | null>(null);
 const backup = ref<BackupStatus | null>(null);
 const showAbout = ref(false);
+/** 设置弹窗。日历与编辑器不被卸载，所以这里悬着也不影响未保存的草稿。 */
+const showSettings = ref(false);
 
 const toast = ref("");
 let toastTimer: number | null = null;
@@ -131,16 +134,7 @@ async function toggleAutoBackup() {
   }
 }
 
-/** 把"距下次备份"的秒数变成人话。 */
-function humanInterval(secs: number): string {
-  if (secs <= 0) return "即将执行";
-  const h = Math.floor(secs / 3600);
-  const m = Math.floor((secs % 3600) / 60);
-  if (h >= 24) return `${Math.floor(h / 24)} 天后`;
-  if (h > 0) return `${h} 小时后`;
-  return `${Math.max(m, 1)} 分钟后`;
-}
-
+/** 检查搜索索引与正文是否对得上。结果用 toast 汇报，不弹新窗口。 */
 async function doIntegrity() {
   try {
     const r = await integrityCheck();
@@ -218,7 +212,10 @@ onUnmounted(() => {
           <span v-if="stats" class="stat">
             共 {{ stats.total_entries }} 篇 · 连续 {{ stats.streak_days }} 天
           </span>
-          <button class="btn ghost" title="关于与数据" @click="showAbout = true">
+          <button class="btn ghost" title="设置" @click="showSettings = true">
+            设置
+          </button>
+          <button class="btn ghost" title="关于" @click="showAbout = true">
             关于
           </button>
           <button class="btn ghost" @click="doLock">锁定</button>
@@ -248,9 +245,14 @@ onUnmounted(() => {
 
       <div v-if="toast" class="toast">{{ toast }}</div>
 
+      <!--
+        只读出口。可操作项（备份三项）已搬进设置页。
+        划分标准只有一条：**能改的进设置，只能看的留关于**。
+        这个弹窗保留不删，因为它是个用惯了的快捷入口。
+      -->
       <div v-if="showAbout" class="modal-mask" @click.self="showAbout = false">
         <div class="modal">
-          <h2>关于与数据</h2>
+          <h2>关于</h2>
           <dl>
             <dt>数据目录</dt>
             <dd class="mono">{{ status.data_dir }}</dd>
@@ -272,41 +274,31 @@ onUnmounted(() => {
                 <br />从 {{ stats.first_date }} 到 {{ stats.last_date }}
               </template>
             </dd>
-
-            <!-- 备份：这是日记软件最重要的一项，所以放在靠近底部但仍显眼的位置 -->
-            <dt>备份</dt>
-            <dd v-if="backup">
-              <label class="toggle-row">
-                <input
-                  type="checkbox"
-                  :checked="backup.auto_enabled"
-                  @change="toggleAutoBackup"
-                />
-                <span>每天自动备份</span>
-              </label>
-              <div class="backup-meta">
-                已有 {{ backup.backup_count }} 份
-                <template v-if="backup.auto_enabled">
-                  · 下次{{ humanInterval(backup.secs_until_next) }}
-                </template>
-                <br />保留最近 {{ backup.keep_recent }} 份，并按月各留一份
-              </div>
-              <div class="mono backup-path">{{ backup.dest_dir }}</div>
-            </dd>
           </dl>
 
           <div class="actions">
-            <button class="btn" @click="doBackup">立即备份</button>
-            <button class="btn" @click="doIntegrity">检查索引一致性</button>
             <button class="btn ghost" @click="showAbout = false">关闭</button>
           </div>
-
-          <p class="warn">
-            备份是<strong>密文</strong>，与数据库使用同一个密码，恢复时用那个密码即可打开。
-            可以直接把 <code>backups</code> 目录整体复制到网盘或其他硬盘。
-          </p>
         </div>
       </div>
+
+      <!--
+        设置：可以改的东西都在这儿。
+        状态一律从 App.vue 传进去 —— 它自己不再拉一次 status，
+        免得出现"弹窗里的备份状态和顶栏统计各说各话"。
+      -->
+      <SettingsPanel
+        v-if="showSettings"
+        :status="status"
+        :backup="backup"
+        :crypto="crypto"
+        :stats="stats"
+        @close="showSettings = false"
+        @backup="doBackup"
+        @integrity="doIntegrity"
+        @toggle-auto-backup="toggleAutoBackup"
+        @notice="flash"
+      />
     </template>
   </div>
 </template>
@@ -455,45 +447,9 @@ dd {
   font-size: 12px;
   word-break: break-all;
 }
-/* 自动备份开关：用一个朴素的原生 checkbox，不引入组件库 */
-.toggle-row {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  cursor: pointer;
-  user-select: none;
-}
-.toggle-row input {
-  cursor: pointer;
-  accent-color: var(--accent);
-}
-.backup-meta {
-  margin-top: 5px;
-  font-size: 12px;
-  line-height: 1.7;
-  color: var(--text-3);
-}
-.backup-path {
-  margin-top: 5px;
-  font-size: 11px;
-  color: var(--text-3);
-}
-.warn code {
-  font-family: var(--mono);
-  font-size: 11px;
-  padding: 1px 4px;
-  background: var(--hover);
-  border-radius: 3px;
-}
 .actions {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
-}
-.warn {
-  margin: 16px 0 0;
-  font-size: 12px;
-  line-height: 1.7;
-  color: var(--text-3);
 }
 </style>
