@@ -15,12 +15,17 @@
 # ASCII-only on purpose（PowerShell 5.1 对无 BOM 文件的处理不可靠）。
 
 param(
-    [int]$TimeoutSec = 45
+    [int]$TimeoutSec = 45,
+    # Defaults to the raw build artifact. scripts\publish-exe.ps1 passes the
+    # copy inside the delivery folder instead, so the smoke test covers exactly
+    # the file users double-click.
+    [string]$Exe = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $proj = 'D:\Users\Lenovo\Desktop\Diary'
-$exe = Join-Path $proj 'target\release\app.exe'
+if (-not $Exe) { $Exe = Join-Path $proj 'target\release\app.exe' }
+$exe = $Exe
 
 if (-not (Test-Path $exe)) {
     Write-Host "FAIL: exe not found: $exe" -ForegroundColor Red
@@ -75,7 +80,14 @@ if ($errText) {
     Write-Host '  (empty - good)'
 }
 
-Remove-Item "$proj\_smoke-err.log", "$proj\_smoke-out.log" -ErrorAction SilentlyContinue
+# Cleanup is best-effort: a failed delete must never turn a passing smoke test
+# into a failure. (A sandboxed agent runs a safe-delete shim that fails closed
+# when the recycle bin is unavailable.)
+foreach ($f in @("$proj\_smoke-err.log", "$proj\_smoke-out.log")) {
+    if (Test-Path $f) {
+        try { Remove-Item $f -Force -ErrorAction Stop } catch { }
+    }
+}
 
 Write-Host ''
 if ($windowSeen) {
