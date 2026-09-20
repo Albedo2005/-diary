@@ -103,6 +103,14 @@ pub fn run() {
             commands::stats,
             // 搜索
             commands::search_entries,
+            // 标签
+            // 读是"列全部 + 查某天"，写是"整组覆盖"（不是逐条增删）——
+            // 逐条增删会多出"插一个已存在的"这种中间态，语义反而更绕。
+            commands::list_tags,
+            commands::tags_of_entry,
+            commands::set_entry_tags,
+            commands::rename_tag,
+            commands::delete_tag,
             // 维护与备份
             commands::backup_now,
             commands::backup_status,

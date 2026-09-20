@@ -13,7 +13,7 @@
 use crate::crypto::{self, CryptoMeta, KdfParams};
 use crate::db::{
     derive_and_verify, AppSettings, BackupResult, DayMood, Entry, EntrySummary, IntegrityReport,
-    SearchHit, Stats, Vault,
+    SearchHit, Stats, TagStat, Vault,
 };
 use crate::error::{AppError, AppResult};
 use serde::Serialize;
@@ -745,6 +745,60 @@ pub fn search_entries(
     limit: Option<i64>,
 ) -> AppResult<Vec<SearchHit>> {
     with_vault(&state, |v| v.search(&query, limit.unwrap_or(50)))
+}
+
+// ---------------------------------------------------------------------------
+// 标签
+//
+// ⚠️ 这里**只有 5 条命令**，而且都不是"给个 SQL 让前端跑"的形式 ——
+//    和其它命令一样，每一条都是一个语义明确的业务动作。
+//    标签名能改、能删，但**永远不能**让前端传 SQL 或表名。
+// ---------------------------------------------------------------------------
+
+/// 所有标签 + 每个标签的日记篇数（只数"写过"的）。
+///
+/// 排序在后端定死（按名字、忽略大小写），前端不要再排一次 ——
+/// 两处各排一次，迟早出现"下拉框里的顺序和侧栏不一样"。
+#[tauri::command]
+pub fn list_tags(state: State<'_, VaultState>) -> AppResult<Vec<TagStat>> {
+    with_vault(&state, |v| v.list_tags())
+}
+
+/// 某天日记的标签名（按名字排序）。那天没有日记 → 空数组。
+#[tauri::command]
+pub fn tags_of_entry(state: State<'_, VaultState>, date: String) -> AppResult<Vec<String>> {
+    with_vault(&state, |v| v.tags_of_entry(&date))
+}
+
+/// 整组覆盖某天日记的标签，返回**实际存下来的**标签名。
+///
+/// ⚠️ 日记必须**已有正文**：标签挂的是 entry_id，而 entry 行是保存正文时
+///    产生的（`open_entry` 是纯读取，返回 id = 0）。还没写内容就贴标签，
+///    要么得凭空插一条空行（破坏"打开 ≠ 写过"这条铁律），要么写不进去 ——
+///    所以后端直接报 validation 错。前端也把标签区置灰，两边都拦。
+///
+/// 已锁定的日记拒绝改标签（锁定 = 只读，标签也是这篇日记的一部分）。
+#[tauri::command]
+pub fn set_entry_tags(
+    state: State<'_, VaultState>,
+    date: String,
+    tags: Vec<String>,
+) -> AppResult<Vec<String>> {
+    with_vault(&state, |v| v.set_entry_tags(&date, &tags))
+}
+
+/// 标签改名。新名字已被**别的**标签占用时返回 validation 错误，**不合并**。
+/// 返回清洗后的最终名字（前端拿它回显）。
+#[tauri::command]
+pub fn rename_tag(state: State<'_, VaultState>, id: i64, new_name: String) -> AppResult<String> {
+    with_vault(&state, |v| v.rename_tag(id, &new_name))
+}
+
+/// 删标签。**只删标签与关联行，日记内容一个字都不动。**
+/// 返回受影响的关联数（≈ 多少篇日记用过它），供界面给用户一句实话。
+#[tauri::command]
+pub fn delete_tag(state: State<'_, VaultState>, id: i64) -> AppResult<usize> {
+    with_vault(&state, |v| v.delete_tag(id))
 }
 
 // ---------------------------------------------------------------------------

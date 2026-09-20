@@ -42,6 +42,19 @@ const mode = ref<"write" | "search">("write");
 /** 递增以要求日历刷新标记。 */
 const refreshToken = ref(0);
 
+/**
+ * 递增以要求两处标签界面刷新。
+ *
+ * 标签同时出现在**侧栏列表**（CalendarPanel）与**编辑器 chip 行 + 下拉候选**
+ * （EditorPane）里，而改标签的入口也在两处（编辑器的 ＋/×、侧栏的 ✎/✕）。
+ * 用一个共享的令牌让两边互相同步，比"谁改了谁挨个去通知对方"少一半接线，
+ * 也避免出现"侧栏删了标签、编辑器还挂着它"这种半新半旧的状态。
+ *
+ * 与自己无关的改动也会触发一次重读 —— 多查一次换来的是
+ * "界面上的标签永远来自数据库"，这个买卖划算。
+ */
+const tagToken = ref(0);
+
 const stats = ref<Stats | null>(null);
 const crypto = ref<CryptoInfo | null>(null);
 const backup = ref<BackupStatus | null>(null);
@@ -189,6 +202,18 @@ function resume() {
 function onSaved() {
   refreshToken.value++;
   void loadAux();
+}
+
+/**
+ * 任何一处改了标签（编辑器加/撤、侧栏改名/删除）→ 让两处界面都重读。
+ *
+ * ⚠️ 只递增令牌，**不判断是谁改的**：判断"这次改动影响哪些视图"需要
+ *    在前端复制一份标签与日记的关联关系，而那份镜像迟早会与数据库不一致
+ *    （标签会被级联删除、会被改名）。让两边都去问后端，最简单也最准。
+ */
+function onTagsChanged() {
+  tagToken.value++;
+  // 标签改了不影响统计（统计只看正文），所以这里不重拉 loadAux。
 }
 
 async function doLock() {
@@ -420,9 +445,17 @@ onUnmounted(() => {
           <CalendarPanel
             :selected="selected"
             :refresh-token="refreshToken"
+            :tag-token="tagToken"
             @select="(d) => (selected = d)"
+            @tags-changed="onTagsChanged"
+            @notice="flash"
           />
-          <EditorPane :date="selected" @saved="onSaved" />
+          <EditorPane
+            :date="selected"
+            :tag-token="tagToken"
+            @saved="onSaved"
+            @tags-changed="onTagsChanged"
+          />
         </template>
         <div v-else class="search-wrap">
           <SearchPanel

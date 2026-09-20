@@ -23,13 +23,19 @@
 import { computed, nextTick, onUnmounted, ref, watch } from "vue";
 import {
   deleteEntry,
+  listTags,
   lockAllEntries,
   MOODS,
   openEntry,
   saveEntry,
   setEntryLocked,
+  setEntryTags,
+  TAG_MAX_CHARS,
+  TAG_SUGGEST_LIMIT,
+  tagsOfEntry,
   toAppError,
   type Entry,
+  type TagStat,
 } from "../api";
 import { humanDate } from "../utils/date";
 
@@ -37,9 +43,18 @@ const props = defineProps<{
   date: string;
   /** 保存成功后通知父组件（用于刷新日历标记） */
   onSaved?: () => void;
+  /**
+   * 标签变更信号。侧栏删掉 / 改名了某个标签时由父组件递增，
+   * 用来让这里的 chip 行与下拉候选跟着刷新。
+   */
+  tagToken?: number;
 }>();
 
-const emit = defineEmits<{ (e: "saved"): void }>();
+const emit = defineEmits<{
+  (e: "saved"): void;
+  /** 本组件的标签改动也要让侧栏的标签列表知道（篇数变了）。 */
+  (e: "tags-changed"): void;
+}>();
 
 const loading = ref(false);
 const errorText = ref("");
@@ -58,6 +73,59 @@ const entry = ref<Entry | null>(null);
  * 避免“编辑器标的是开心、日历显示受伤”这类漂移。
  */
 const mood = ref<number | null>(null);
+
+/**
+ * 这一篇的标签（后端返回的权威名字，不是本地猜的）。
+ *
+ * ⚠️ 每次改动都**用后端的返回值整体替换**（`set_entry_tags` 返回实际存下来的
+ *    列表）。本地自己 push/splice 看着更省一次往返，但清洗规则在后端
+ *    （去空白、限长、忽略大小写去重），本地那份迟早与库里差一点 ——
+ *    那就成了两套真相。
+ */
+const tags = ref<string[]>([]);
+
+/** 标签输入框里的内容（还没提交）。 */
+const tagInput = ref("");
+/** 全库的标签（含篇数）。下拉候选与"已存在过"的提示都来自它。 */
+const allTags = ref<TagStat[]>([]);
+/** 下拉候选是否展开。 */
+const tagOpen = ref(false);
+/** 标签请求进行中。避免连点两下产生两次"整组覆盖"（会互相覆盖）。 */
+const tagBusy = ref(false);
+const tagError = ref("");
+
+/**
+ * 标签区是否可编辑。
+ *
+ * 两道闸，与心情条同款：
+ *   1. **正文为空时不能打标签**。标签挂在 entry_id 上，而 entry 行是保存
+ *      正文时产生的 —— 空日记的 id 是 0，此时打标签要么插一条空行
+ *      （直接破坏"打开 ≠ 写过"这条铁律），要么失败。后端也会拒，
+ *      这里置灰只是为了不让用户白填一次。
+ *   2. 锁定时不能改：锁定 = 只读，标签也是这篇日记的一部分。
+ */
+const canTag = computed(() => hasContent() && !locked.value);
+
+/** 标签区的悬停提示 / 置灰时旁边那行说明。 */
+const tagHint = computed(() => {
+  if (locked.value) return "解锁后可改标签";
+  if (!hasContent()) return "先写点内容，再贴标签";
+  return "回车添加；点 × 移除";
+});
+
+/**
+ * 下拉候选：已有的、这篇还没有的、且与输入内容沾边的。
+ *
+ * 空输入时给出**全部**已有标签 —— 标签的价值在于复用，
+ * 让用户在打第一个字之前就看见"上次那个叫什么"，比让他凭记忆打更实用。
+ */
+const tagSuggestions = computed(() => {
+  const q = tagInput.value.trim().toLowerCase();
+  return allTags.value
+    .filter((t) => !tags.value.includes(t.name))
+    .filter((t) => q === "" || t.name.toLowerCase().includes(q))
+    .slice(0, TAG_SUGGEST_LIMIT);
+});
 
 /**
  * 心情条是否可点。
@@ -140,6 +208,12 @@ async function load() {
     content.value = e.content_md;
     locked.value = e.locked;
     mood.value = e.mood;
+    // 先清空再读：读失败时宁可"看不到标签"，也不能把上一天的标签
+    // 留在屏幕上冒充这一天的（那会让用户以为标签串了）。
+    tags.value = [];
+    tagInput.value = "";
+    tagOpen.value = false;
+    await loadTags();
     dirty = false;
     saveState.value = "";
   } catch (e) {
@@ -201,9 +275,15 @@ async function flush(forDate: string = props.date) {
         // 行都没了，心情自然也不存在。前端跟着清掉 ——
         // 否则界面上还留着一个高亮的表情，看着"有心情"，重开这天却是空的。
         mood.value = null;
+        // 标签同理，而且是**两层**都不存在了：
+        // entry 行没了 → entry_tag 的 ON DELETE CASCADE 把关联行清掉
+        //（标签本身还在，可能别的日记在用）。所以这里清空的是"这一篇的标签"。
+        tags.value = [];
         dirty = false;
         saveState.value = "";
         emit("saved");
+        // 篇数少了，侧栏那份标签列表要跟着变。
+        emit("tags-changed");
       } catch (e) {
         saveState.value = "error";
         errorText.value = toAppError(e).message;
@@ -245,6 +325,100 @@ function pickMood(value: number) {
   dirty = true;
   saveState.value = "pending";
   void flush();
+}
+
+/**
+ * 读这一篇的标签 + 全库标签（下拉候选用）。
+ *
+ * 两个查询互不依赖，并发发出去。失败只记错误、不阻塞编辑 ——
+ * 标签是附加信息，读不到不该让整个编辑器用不了。
+ */
+async function loadTags() {
+  tagError.value = "";
+  try {
+    const [mine, all] = await Promise.all([
+      tagsOfEntry(props.date),
+      listTags(),
+    ]);
+    tags.value = mine;
+    allTags.value = all;
+  } catch (e) {
+    tagError.value = toAppError(e).message;
+  }
+}
+
+/**
+ * 把这一篇的标签整组提交给后端，并用后端返回的那份刷新界面。
+ *
+ * ⚠️ 提交前必须先把正文落库。标签挂的是 `entry_id`，而 entry 行是
+ *    `save_entry` 的 upsert 产生的：用户打下第一个字、还没到 1 秒防抖就
+ *    去贴标签的话，库里根本没有那一行 —— 后端会回"先写点内容再打标签"，
+ *    而他明明已经写了。那种错最让人摸不着头脑，所以在这一层先 flush。
+ */
+async function commitTags(next: string[]) {
+  // 整组覆盖是"读-改-写"，两次并发会互相覆盖（后到的把先到的结果冲掉），
+  // 所以同一时刻只允许一次在飞。
+  if (tagBusy.value) return;
+  tagBusy.value = true;
+  tagError.value = "";
+  try {
+    if (dirty) await flush();
+    // flush 失败（例如已锁定）时就别往下走了：库里的行没变，
+    // 这时候提交标签只会再报一个看不懂的错。
+    if (saveState.value === "error") return;
+
+    tags.value = await setEntryTags(props.date, next);
+    // 篇数变了，侧栏那份列表也得跟着变。
+    allTags.value = await listTags();
+    tagInput.value = "";
+    emit("tags-changed");
+  } catch (e) {
+    tagError.value = toAppError(e).message;
+  } finally {
+    tagBusy.value = false;
+  }
+}
+
+/**
+ * 添加一个标签。
+ *
+ * 重复的直接吞掉（不报错、也不发请求）：用户常常记不清有没有加过，
+ * 连点两下就弹个"已存在"很烦人。判定**忽略大小写** ——
+ * 后端 `tag.name` 是 `UNIQUE COLLATE NOCASE`，`Travel` 与 `travel`
+ * 本来就是同一个标签。
+ */
+function addTag(raw: string) {
+  const name = raw.trim();
+  if (!name) return;
+  const lower = name.toLowerCase();
+  if (tags.value.some((t) => t.toLowerCase() === lower)) {
+    tagInput.value = "";
+    return;
+  }
+  void commitTags([...tags.value, name]);
+}
+
+function removeTag(name: string) {
+  void commitTags(tags.value.filter((t) => t !== name));
+}
+
+/** 点下拉里的候选。加完保持展开，方便连着加几个。 */
+function pickSuggestion(name: string) {
+  tagOpen.value = true;
+  addTag(name);
+}
+
+function onTagKeydown(ev: KeyboardEvent) {
+  // ⚠️ 输入法组字期间的回车是在**选词**，不是在提交标签。
+  //    不挡这一下，中文用户每打完一个词都会顺手 . 提交一次。
+  if (ev.isComposing) return;
+  if (ev.key === "Enter") {
+    ev.preventDefault();
+    addTag(tagInput.value);
+  } else if (ev.key === "Escape") {
+    tagOpen.value = false;
+    tagInput.value = "";
+  }
 }
 
 /** 组字开始/结束。结束时补一次保存，把最终文本落库。 */
@@ -313,6 +487,22 @@ watch(
   }
 );
 watch([title, content], scheduleSave);
+
+/**
+ * 侧栏删掉了某个标签 / 把它改了名 → 这里的 chip 行与下拉候选都得刷新
+ *（被删的那个可能正挂在这一篇上）。
+ *
+ * 自己发出的改动也会绕回来触发一次（父组件把 tagToken 递增后传回来），
+ * 多查一次不算浪费：它保证界面上的最终状态**来自数据库**，
+ * 而不是来自前端自己那条推理链。
+ *
+ * ⚠️ 只监听 tagToken，**不监听 date** —— 换日期由 load() 负责，
+ *    它已经读过一次标签了，这里再读一次就是纯重复。
+ */
+watch(
+  () => props.tagToken,
+  () => void loadTags()
+);
 
 // 首屏：load() 里的 lockAllEntries() 顺带实现了
 // "关掉软件再打开，所有日记都是锁的"。
@@ -391,6 +581,61 @@ onUnmounted(() => {
           </button>
         </div>
       </div>
+
+      <!--
+        标签区：已有标签是 chip（点 × 移除），末尾一个 ＋ 输入框（回车添加，
+        输入时下拉提示已用过的标签）。
+
+        ⚠️ 正文为空 / 已锁定时整个区置灰，并把原因写在旁边（tagHint）——
+           "为什么点不动"必须当场说清楚，否则用户只会觉得按钮坏了。
+           后端也会拒（标签挂 entry_id，空日记没有 id），这里只是省得他白填。
+      -->
+      <div class="tag-row" :class="{ disabled: !canTag }">
+        <span v-for="t in tags" :key="t" class="chip">
+          <span class="chip-name">{{ t }}</span>
+          <button
+            class="chip-x"
+            :disabled="!canTag || tagBusy"
+            :title="canTag ? `移除标签「${t}」` : tagHint"
+            @click="removeTag(t)"
+          >
+            ×
+          </button>
+        </span>
+
+        <div class="tag-add">
+          <input
+            v-model="tagInput"
+            class="tag-input"
+            type="text"
+            placeholder="＋ 标签"
+            :maxlength="TAG_MAX_CHARS"
+            :disabled="!canTag || tagBusy"
+            :title="tagHint"
+            @focus="tagOpen = true"
+            @blur="tagOpen = false"
+            @input="tagOpen = true"
+            @keydown="onTagKeydown"
+          />
+          <!--
+            下拉候选。
+            ⚠️ 候选用 @mousedown.prevent：不挡这一下，输入框会在 click
+               触发之前先 blur，下拉被关掉，用户永远点不中候选。
+          -->
+          <ul v-if="tagOpen && canTag && tagSuggestions.length" class="suggest">
+            <li v-for="s in tagSuggestions" :key="s.id">
+              <button type="button" @mousedown.prevent @click="pickSuggestion(s.name)">
+                <span class="suggest-name">{{ s.name }}</span>
+                <span class="suggest-count">{{ s.entry_count }} 篇</span>
+              </button>
+            </li>
+          </ul>
+        </div>
+
+        <span v-if="!canTag" class="tag-note">{{ tagHint }}</span>
+      </div>
+
+      <p v-if="tagError" class="error">{{ tagError }}</p>
 
       <!--
         锁定与编辑共用同一个 textarea，**刻意不切换成渲染视图**。
@@ -524,6 +769,128 @@ onUnmounted(() => {
 .mood-bar.disabled .mood-btn {
   opacity: 0.15;
   cursor: default;
+}
+
+/* 标签区：一行 chip + 一个 ＋ 输入框，可折行。 */
+.tag-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 2px 0 10px;
+}
+/* 不可编辑（空日记 / 已锁定）：整体压暗，但仍看得见已挂的标签。
+   旁边那行 tag-note 说明原因 —— 光置灰不解释，用户只会以为坏了。 */
+.tag-row.disabled .chip,
+.tag-row.disabled .tag-add {
+  opacity: 0.45;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 4px 2px 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-2);
+  background: var(--accent-soft);
+  border-radius: 999px;
+}
+.chip-x {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--text-3);
+  background: transparent;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+}
+.chip-x:hover:not(:disabled) {
+  color: var(--danger);
+  background: var(--hover);
+}
+.chip-x:disabled {
+  cursor: default;
+}
+/* 输入框本身要窄：标签一般两个字，占一行宽输入框会把整行撑开。 */
+.tag-add {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.tag-input {
+  width: 84px;
+  padding: 3px 8px;
+  font-size: 12px;
+  color: var(--text-1);
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-radius: 999px;
+  outline: none;
+}
+.tag-input:focus {
+  width: 120px;
+  border-style: solid;
+  border-color: var(--accent);
+}
+.tag-input:disabled {
+  cursor: default;
+}
+.tag-input::placeholder {
+  color: var(--text-3);
+}
+.tag-note {
+  font-size: 12px;
+  color: var(--text-3);
+}
+/* 下拉候选：绝对定位，不占版面高度（否则正文会被推下去一下）。 */
+.suggest {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 10;
+  min-width: 140px;
+  max-height: 190px;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.12);
+}
+.suggest button {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 8px;
+  font-size: 12px;
+  text-align: left;
+  color: var(--text-1);
+  background: transparent;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.suggest button:hover {
+  background: var(--hover);
+}
+.suggest-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.suggest-count {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
 }
 .content-input {
   flex: 1;

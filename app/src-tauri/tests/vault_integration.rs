@@ -1616,3 +1616,470 @@ fn after_changing_the_pin_the_key_file_holds_the_new_key() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ---------------------------------------------------------------------------
+// 标签（指令 5 = P1 #8）
+// ---------------------------------------------------------------------------
+//
+// 建表语句早就在 schema.rs 里了（tag / entry_tag + 两个 ON DELETE CASCADE），
+// 这一组验证的是**把它们真正用起来**之后的端到端行为。
+//
+// 五条验收逐个对应：
+//   ① 给某天加标签 → 重开这天，标签还在          → tags_round_trip_across_reopen
+//   ② 重复输入「旅行」两次 → 只存一个            → duplicate_tag_names_are_stored_only_once
+//   ③ 删标签 → 标签消失，但日记内容完好          → deleting_a_tag_never_touches_entry_content
+//   ④ 重命名为已存在的名字 → 报错，两个都原样    → renaming_onto_an_existing_name_is_rejected_and_changes_nothing
+//   ⑤ 给空日记打标签 → 不允许                    → tagging_an_entry_without_content_is_rejected
+//
+// 另外补了四条验收清单没提、但最容易被写错的：
+//   · 整组覆盖的"差集"语义：撤 A 篇的标签不能动到 B 篇的同名标签
+//   · 反方向级联：删日记只清关联行，**标签本身留着**（别把别篇的在用标签一起带走）
+//   · 锁定是硬约束：改标签同样被拒（与 save_entry / delete_entry 同口径）
+//   · 篇数只数"写过"的：清空正文后标签篇数要跟着掉，不能与统计打架
+
+#[test]
+fn tags_round_trip_across_reopen() {
+    let dir = temp_dir("tag-roundtrip");
+    {
+        let v = Vault::create(&dir, PIN, None).unwrap();
+        v.save_entry("2026-09-20", "出去走走", "今天去了青海湖。")
+            .unwrap();
+        let stored = v
+            .set_entry_tags("2026-09-20", &["旅行".into(), "青海".into()])
+            .unwrap();
+        // 返回的就是库里的那份（清洗 + 排序后），不是把请求原样回给我。
+        assert_eq!(stored, vec!["旅行", "青海"]);
+        drop(v);
+    }
+
+    // 重新打开（新连接、重新派生密钥、跑一遍 migrate）：标签必须还在。
+    // 验收 ① 说的是"重新打开这天"，而真正会出问题的是**重开整个库** ——
+    // 标签如果只活在前端或只活在内存里，这里就会露馅。
+    let v = Vault::unlock(&dir, PIN).unwrap();
+    assert_eq!(v.tags_of_entry("2026-09-20").unwrap(), vec!["旅行", "青海"]);
+    let all = v.list_tags().unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(
+        all.iter().all(|t| t.entry_count == 1),
+        "两个标签各挂在 1 篇上"
+    );
+    // 那天没有日记时是空表，不是报错。
+    assert!(v.tags_of_entry("2026-09-21").unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn duplicate_tag_names_are_stored_only_once() {
+    let dir = temp_dir("tag-dedupe");
+    let v = Vault::create(&dir, PIN, None).unwrap();
+    v.save_entry("2026-09-20", "", "内容").unwrap();
+
+    // 一次传入一堆"其实是同一个"的名字：完全重复、只差空白、只差大小写。
+    // 大小写那条最关键 —— `tag.name` 是 UNIQUE COLLATE NOCASE，
+    // Travel / travel 会落到同一行上；不去重就会往 entry_tag 插两条
+    // (entry_id, tag_id) 相同的记录，直接撞主键。
+    let stored = v
+        .set_entry_tags(
+            "2026-09-20",
+            &[
+                "旅行".into(),
+                "旅行".into(),
+                "  旅行 ".into(),
+                "Travel".into(),
+                "travel".into(),
+                "TRAVEL".into(),
+            ],
+        )
+        .unwrap();
+    // 排序按 `COLLATE NOCASE`（即先折 ASCII 大小写、再按字节比）——
+    // 所以纯 ASCII 的名字排在汉字前面。返回顺序有意义，别写反。
+    assert_eq!(stored, vec!["Travel", "旅行"]);
+    // 保留用户敲的原始大小写，不偷偷改成小写。
+    assert_eq!(stored[0], "Travel");
+
+    // 再调一次（模拟"用户又打了一遍旅行"）也不该多出一行。
+    let again = v.set_entry_tags("2026-09-20", &["旅行".into()]).unwrap();
+    assert_eq!(again, vec!["旅行"]);
+
+    // 直接数库里的行数，不只看接口返回 —— 验收 ② 说的是"只存一个"。
+    let tag_rows: i64 = v
+        .conn()
+        .query_row("SELECT count(*) FROM tag", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(tag_rows, 2, "重复的名字不能在 tag 表里留下多行");
+    let links: i64 = v
+        .conn()
+        .query_row("SELECT count(*) FROM entry_tag", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(links, 1, "同一篇上同名标签只能有一条关联");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn deleting_a_tag_never_touches_entry_content() {
+    let dir = temp_dir("tag-delete");
+    let v = Vault::create(&dir, PIN, None).unwrap();
+    v.save_entry("2026-09-18", "第一篇", "在青海湖边上坐了一下午。")
+        .unwrap();
+    v.save_entry("2026-09-19", "第二篇", "今天去了塔尔寺，人很多。")
+        .unwrap();
+    v.set_entry_tags("2026-09-18", &["旅行".into()]).unwrap();
+    v.set_entry_tags("2026-09-19", &["旅行".into(), "寺庙".into()])
+        .unwrap();
+
+    let travel = v
+        .list_tags()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == "旅行")
+        .expect("标签应在列表里");
+    assert_eq!(travel.entry_count, 2);
+
+    let affected = v.delete_tag(travel.id).unwrap();
+    assert_eq!(affected, 2, "返回的应是受影响的日记篇数");
+
+    // 标签从两个地方都消失了：全库列表、以及那两篇的标签里。
+    assert!(v.list_tags().unwrap().iter().all(|t| t.name != "旅行"));
+    assert!(v.tags_of_entry("2026-09-18").unwrap().is_empty());
+    // 但 19 号上**别的**标签不受牵连。
+    assert_eq!(v.tags_of_entry("2026-09-19").unwrap(), vec!["寺庙"]);
+
+    // 验收 ③ 的重点在这儿：日记内容一字未动，而且还能打开、还能搜到。
+    let e1 = v.open_entry("2026-09-18").unwrap();
+    assert_eq!(e1.title, "第一篇");
+    assert_eq!(e1.content_md, "在青海湖边上坐了一下午。");
+    let e2 = v.open_entry("2026-09-19").unwrap();
+    assert_eq!(e2.content_md, "今天去了塔尔寺，人很多。");
+    assert_eq!(v.stats().unwrap().total_entries, 2);
+    // 搜索索引也没被碰坏 —— "删标签把索引一起删了"是这类级联最容易踩的坑。
+    assert_eq!(v.search("青海湖", 10).unwrap().len(), 1);
+
+    // 幂等：再删一次不报错（界面上连点两下不该炸）。
+    assert_eq!(v.delete_tag(travel.id).unwrap(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn renaming_onto_an_existing_name_is_rejected_and_changes_nothing() {
+    let dir = temp_dir("tag-rename-conflict");
+    let v = Vault::create(&dir, PIN, None).unwrap();
+    v.save_entry("2026-09-20", "", "内容").unwrap();
+    v.set_entry_tags("2026-09-20", &["旅行".into(), "工作".into()])
+        .unwrap();
+
+    let before = v.list_tags().unwrap();
+    let travel = before.iter().find(|t| t.name == "旅行").unwrap().id;
+    let work = before.iter().find(|t| t.name == "工作").unwrap().id;
+
+    // 验收 ④：撞名必须报错，**不合并**。
+    let err = v
+        .rename_tag(travel, "工作")
+        .expect_err("改成已存在的名字必须被拒绝");
+    assert!(
+        matches!(err, AppError::Validation(_)),
+        "应返回 Validation（前端按 kind 展示），实际: {err:?}"
+    );
+    assert!(
+        format!("{err}").contains("工作"),
+        "错误信息要点出撞上的那个名字，实际: {err}"
+    );
+
+    // 两个标签都保持原样：名字没变、数量没变、关联没变。
+    let after = v.list_tags().unwrap();
+    assert_eq!(after.len(), 2, "被拒的改名不得悄悄把两个标签并成一个");
+    assert_eq!(after.iter().find(|t| t.id == travel).unwrap().name, "旅行");
+    assert_eq!(after.iter().find(|t| t.id == work).unwrap().name, "工作");
+    assert_eq!(v.tags_of_entry("2026-09-20").unwrap(), vec!["工作", "旅行"]);
+
+    // 大小写不同也算撞名（NOCASE）：旅行 → TRAVEL 与已存在的 travel 冲突。
+    // ⚠️ 这一步之前库里已经有 3 个标签了（旅行 / 工作 / travel）——
+    //    要断言的是"**集合没有变化**"，而不是某个固定的数字：
+    //    写死 2 的话，这条测试会因为"忘了前面还留着一个工作"而挂掉（已栽过一次）。
+    v.set_entry_tags("2026-09-20", &["旅行".into(), "travel".into()])
+        .unwrap();
+    let mut names_before: Vec<String> = v.list_tags().unwrap().into_iter().map(|t| t.name).collect();
+    names_before.sort();
+    assert_eq!(names_before, vec!["travel", "工作", "旅行"]);
+
+    let travel_cn = v
+        .list_tags()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == "旅行")
+        .unwrap()
+        .id;
+    assert!(
+        matches!(
+            v.rename_tag(travel_cn, "TRAVEL").unwrap_err(),
+            AppError::Validation(_)
+        ),
+        "NOCASE 下 TRAVEL 与 travel 是同一个名字"
+    );
+
+    let mut names_after: Vec<String> = v.list_tags().unwrap().into_iter().map(|t| t.name).collect();
+    names_after.sort();
+    assert_eq!(names_after, names_before, "被拒的改名必须一个字都不改");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn renaming_a_tag_updates_it_everywhere() {
+    let dir = temp_dir("tag-rename-ok");
+    let v = Vault::create(&dir, PIN, None).unwrap();
+    v.save_entry("2026-09-20", "", "内容").unwrap();
+    v.set_entry_tags("2026-09-20", &["旅行".into()]).unwrap();
+    let id = v.list_tags().unwrap()[0].id;
+
+    // 首尾空白由后端清掉，返回的就是最终名字（前端拿它回显）。
+    assert_eq!(v.rename_tag(id, "  远行  ").unwrap(), "远行");
+    assert_eq!(v.tags_of_entry("2026-09-20").unwrap(), vec!["远行"]);
+    assert_eq!(v.list_tags().unwrap()[0].name, "远行");
+
+    // 只改大小写也要能存下来：对 NOCASE 而言"名字没变"，但显示的样子变了。
+    // 少了这条分支的话，用户敲 Travel 会被静默留成 travel —— 而他自己
+    // 明明看到界面上有变化，于是以为改成功了。
+    v.set_entry_tags("2026-09-20", &["远行".into(), "travel".into()])
+        .unwrap();
+    let travel = v
+        .list_tags()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == "travel")
+        .expect("travel 应在列表里");
+    assert_eq!(v.rename_tag(travel.id, "Travel").unwrap(), "Travel");
+    assert_eq!(v.list_tags().unwrap()[0].name, "Travel");
+
+    // 不存在的 id → 报错，不能静默当成功（否则前端会以为改好了）。
+    assert!(matches!(
+        v.rename_tag(999_999, "随便").unwrap_err(),
+        AppError::Validation(_)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tagging_an_entry_without_content_is_rejected() {
+    let dir = temp_dir("tag-empty");
+    let v = Vault::create(&dir, PIN, None).unwrap();
+
+    // ① 那天还没有任何记录：open_entry 是纯读取，id = 0。
+    //    此时打标签要么凭空插一条空行（破坏"打开 ≠ 写过"），要么失败 ——
+    //    所以必须失败，而且要说清原因。
+    let err = v
+        .set_entry_tags("2026-09-20", &["旅行".into()])
+        .expect_err("空日记不允许打标签");
+    assert!(matches!(err, AppError::Validation(_)), "实际: {err:?}");
+    assert!(
+        format!("{err}").contains("内容"),
+        "错误信息要告诉用户该先做什么，实际: {err}"
+    );
+
+    // ② 有行、但正文是空的（历史脏行 / 别的写入路径留下的）。
+    v.save_entry("2026-09-20", "只有标题", "").unwrap();
+    assert!(v
+        .set_entry_tags("2026-09-20", &["旅行".into()])
+        .is_err());
+
+    // 关键的"什么都没留下"：被拒之后 tag 表必须还是空的。
+    // 如果实现是"先插标签、发现没 entry 再报错"，这里就会留下一个孤儿标签。
+    let tag_rows: i64 = v
+        .conn()
+        .query_row("SELECT count(*) FROM tag", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(tag_rows, 0, "被拒的请求不得创建标签");
+    // entry 表里只有那一条标题行，没有为存标签而多插的行。
+    let entries: i64 = v
+        .conn()
+        .query_row("SELECT count(*) FROM entry", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(entries, 1);
+    assert!(
+        !v.is_written("2026-09-20").unwrap(),
+        "空日记仍然不算'写过' —— 打标签失败不能把这条铁律带偏"
+    );
+
+    // ③ 写上内容之后，同一篇立刻就能打了。
+    v.save_entry("2026-09-20", "只有标题", "写上了。").unwrap();
+    assert_eq!(
+        v.set_entry_tags("2026-09-20", &["旅行".into()]).unwrap(),
+        vec!["旅行"]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn setting_tags_is_a_whole_group_replacement() {
+    let dir = temp_dir("tag-group");
+    let v = Vault::create(&dir, PIN, None).unwrap();
+    v.save_entry("2026-09-18", "", "甲").unwrap();
+    v.save_entry("2026-09-19", "", "乙").unwrap();
+    v.set_entry_tags("2026-09-18", &["旅行".into(), "山".into()])
+        .unwrap();
+    v.set_entry_tags("2026-09-19", &["旅行".into()]).unwrap();
+
+    // 撤掉 18 号的"山"：18 号只剩旅行，19 号一个字不动。
+    assert_eq!(
+        v.set_entry_tags("2026-09-18", &["旅行".into()]).unwrap(),
+        vec!["旅行"]
+    );
+    assert_eq!(v.tags_of_entry("2026-09-19").unwrap(), vec!["旅行"]);
+
+    // 全撤 → 空表。这一条走的是 `tags` 为空的分支：差集实现里
+    // "要删的集合"是全集，最容易在这里写出 `NOT IN ()` 之类的语法错。
+    assert!(v.set_entry_tags("2026-09-18", &[]).unwrap().is_empty());
+    assert!(v.tags_of_entry("2026-09-18").unwrap().is_empty());
+    assert_eq!(
+        v.tags_of_entry("2026-09-19").unwrap(),
+        vec!["旅行"],
+        "撤 18 号的标签不能动到 19 号 —— 差集必须按 entry_id 限定"
+    );
+
+    // 没人用的标签行仍然留着（它可能只是"这一篇撤了"），
+    // 而且必须出现在列表里、显示 0 篇 —— 藏起来用户就没机会删它了。
+    let all = v.list_tags().unwrap();
+    assert_eq!(all.len(), 2, "撤掉关联不等于删标签，标签行由 delete_tag 显式清理");
+    assert_eq!(all.iter().find(|t| t.name == "山").unwrap().entry_count, 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn deleting_an_entry_drops_its_links_but_keeps_the_tag() {
+    let dir = temp_dir("tag-cascade");
+    let v = Vault::create(&dir, PIN, None).unwrap();
+    v.save_entry("2026-09-18", "", "甲").unwrap();
+    v.save_entry("2026-09-19", "", "乙").unwrap();
+    v.set_entry_tags("2026-09-18", &["旅行".into()]).unwrap();
+    v.set_entry_tags("2026-09-19", &["旅行".into()]).unwrap();
+    assert_eq!(v.list_tags().unwrap()[0].entry_count, 2);
+
+    // 删掉一篇日记：外键 entry_id → entry(id) ON DELETE CASCADE 清关联行，
+    // 但 tag 行必须留着 —— 19 号还在用它。
+    v.delete_entry("2026-09-18").unwrap();
+    let all = v.list_tags().unwrap();
+    assert_eq!(all.len(), 1, "标签本身不能被日记带走");
+    assert_eq!(all[0].entry_count, 1);
+    assert_eq!(v.tags_of_entry("2026-09-19").unwrap(), vec!["旅行"]);
+
+    // 孤儿关联行必须为 0。外键没打开时最容易留下的就是这种脏数据：
+    // 界面上看着正常，某天翻统计/自检才炸。
+    let links: i64 = v
+        .conn()
+        .query_row("SELECT count(*) FROM entry_tag", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(links, 1, "删日记必须级联清掉它的关联行");
+    assert_eq!(v.integrity_check().unwrap().entry_count, 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_locked_entry_rejects_tag_changes() {
+    let dir = temp_dir("tag-locked");
+    let v = Vault::create(&dir, PIN, None).unwrap();
+    v.save_entry("2026-09-20", "", "内容").unwrap();
+    v.set_entry_tags("2026-09-20", &["旅行".into()]).unwrap();
+    v.set_entry_locked("2026-09-20", true).unwrap();
+
+    // 锁定是**硬约束**，不是界面上的置灰：加、撤都必须被拒。
+    let err = v
+        .set_entry_tags("2026-09-20", &["旅行".into(), "山".into()])
+        .expect_err("锁定后不许加标签");
+    assert!(matches!(err, AppError::Validation(_)), "实际: {err:?}");
+    assert!(
+        v.set_entry_tags("2026-09-20", &[]).is_err(),
+        "锁定后也不许撤标签"
+    );
+
+    // 原样保留。锁的是"改"，**读**不受影响。
+    assert_eq!(v.tags_of_entry("2026-09-20").unwrap(), vec!["旅行"]);
+    assert_eq!(v.list_tags().unwrap()[0].name, "旅行");
+
+    // 解锁后又能改了。
+    v.set_entry_locked("2026-09-20", false).unwrap();
+    assert_eq!(
+        v.set_entry_tags("2026-09-20", &["旅行".into(), "山".into()])
+            .unwrap(),
+        vec!["山", "旅行"]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tag_counts_only_count_written_entries() {
+    let dir = temp_dir("tag-count");
+    let v = Vault::create(&dir, PIN, None).unwrap();
+    v.save_entry("2026-09-18", "", "甲").unwrap();
+    v.save_entry("2026-09-19", "", "乙").unwrap();
+    v.set_entry_tags("2026-09-18", &["旅行".into()]).unwrap();
+    v.set_entry_tags("2026-09-19", &["旅行".into()]).unwrap();
+    assert_eq!(v.list_tags().unwrap()[0].entry_count, 2);
+
+    // 把 19 号的正文清空（这条路径会产生"有行但没正文"的历史脏行）。
+    // 篇数口径必须与 `stats()` 一致 —— 否则会出现
+    // "标签说 2 篇、顶栏统计说 1 篇"这种自相矛盾的界面。
+    v.save_entry("2026-09-19", "", "").unwrap();
+    assert_eq!(v.stats().unwrap().total_entries, 1);
+    assert_eq!(
+        v.list_tags().unwrap()[0].entry_count,
+        1,
+        "标签篇数只数'写过'的"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tag_input_validation_rejects_garbage() {
+    let dir = temp_dir("tag-validation");
+    let v = Vault::create(&dir, PIN, None).unwrap();
+    v.save_entry("2026-09-20", "", "内容").unwrap();
+
+    // 超长：按**字符**算，21 个汉字就要拒（按字节算的话中文只能打 6 个字）。
+    let too_long = "字".repeat(app_lib::db::TAG_MAX_CHARS + 1);
+    assert!(matches!(
+        v.set_entry_tags("2026-09-20", &[too_long]).unwrap_err(),
+        AppError::Validation(_)
+    ));
+    // 正好 20 个汉字要通过。
+    let just_right = "字".repeat(app_lib::db::TAG_MAX_CHARS);
+    assert_eq!(
+        v.set_entry_tags("2026-09-20", &[just_right]).unwrap().len(),
+        1
+    );
+
+    // 日期格式错：读和写都要挡住（写挡住是防脏数据，读挡住是防 SQL 拼接）。
+    assert!(v.set_entry_tags("2026-9-20", &["旅行".into()]).is_err());
+    assert!(v.tags_of_entry("2026/09/20").is_err());
+
+    // 全空白 → 归零，**不是报错**：用户清空输入框不该炸出一个红条。
+    assert!(v.set_entry_tags("2026-09-20", &["  ".into()]).unwrap().is_empty());
+
+    // 但"改名成空"要报错 —— "没有名字的标签"不是一个合法状态。
+    v.set_entry_tags("2026-09-20", &["旅行".into()]).unwrap();
+    // ⚠️ 按**名字**找，不要用 `[0]`：前面那个 20 字的标签还留在库里
+    //    （撤了关联不等于删标签），而"字"的码点比"旅"小，排在列表第一。
+    let id = v
+        .list_tags()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == "旅行")
+        .expect("旅行 应在列表里")
+        .id;
+    assert!(matches!(
+        v.rename_tag(id, "   ").unwrap_err(),
+        AppError::Validation(_)
+    ));
+    assert!(
+        v.list_tags()
+            .unwrap()
+            .iter()
+            .any(|t| t.id == id && t.name == "旅行"),
+        "被拒的改名不能改动原值（按 id 找，别按列表位置找）"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

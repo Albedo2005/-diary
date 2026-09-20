@@ -102,6 +102,21 @@ export const MOOD_EMOJI: Record<number, string> = Object.fromEntries(
   MOODS.map((m) => [m.value, m.emoji])
 );
 
+/**
+ * 一个标签 + 它的使用情况。
+ *
+ * `entry_count` 只数**写过**的日记（后端用与日历标记、统计同一条
+ * `has_content_sql()` 判定），所以它可能与"某天挂过这个标签"的次数不一致。
+ *
+ * **可能是 0**：把最后一篇带它的日记的标签撤掉之后，标签本身不会自动消失。
+ * 界面上要如实显示"0 篇"，不要隐藏 —— 藏起来用户就没机会删它了。
+ */
+export interface TagStat {
+  id: number;
+  name: string;
+  entry_count: number;
+}
+
 export interface SearchHit {
   entry_date: string;
   title: string;
@@ -391,6 +406,79 @@ export const getStats = () => invoke<Stats>("stats");
  */
 export const searchEntries = (query: string, limit = 50) =>
   invoke<SearchHit[]>("search_entries", { query, limit });
+
+// ---------------------------------------------------------------------------
+// 标签
+// ---------------------------------------------------------------------------
+
+/**
+ * 标签名的长度上限（**字符数**，不是字节数）。与后端 `db::TAG_MAX_CHARS` 一致。
+ *
+ * 前端拿它做 `maxlength` 只是省得用户白打一遍；真正管用的是后端那道校验 ——
+ * 这里改成 50 也不会让超长标签落库。
+ */
+export const TAG_MAX_CHARS = 20;
+
+/** 输入提示里最多显示几条候选。纯界面参数，后端不认识它。 */
+export const TAG_SUGGEST_LIMIT = 8;
+
+/**
+ * 所有标签 + 每个标签的日记篇数（只数"写过"的）。
+ *
+ * 排序由**后端**定死（按名字、忽略大小写）。前端不要再排一次 ——
+ * 两处各排一次，迟早出现"下拉提示里的顺序和侧栏不一样"。
+ */
+export const listTags = () => invoke<TagStat[]>("list_tags");
+
+/**
+ * 某天日记上的标签名（按名字排序）。那天没有日记 → 空数组。
+ *
+ * 与 `openEntry` 分开取，不塞进 `Entry`：
+ * `Entry` 会在每次保存（1 秒防抖一次）时返回，往里加标签就意味着
+ * 每次自动保存都多查一次标签表 —— 为了一个不常变的东西付高频代价。
+ */
+export const tagsOfEntry = (date: string) =>
+  invoke<string[]>("tags_of_entry", { date });
+
+/**
+ * 整组覆盖某天日记的标签。返回**实际存下来的**标签名。
+ *
+ * 语义是"传什么就是什么"，不是增量：
+ *   加一个 → 传 `[...旧, 新]`；撤一个 → 传 `旧.filter(x => x !== 要撤的)`。
+ * 所以两次调用之间**不要**并发（后端按整组算差集，并发会彼此覆盖）。
+ *
+ * ⚠️ 日记必须**已经有正文**，否则后端返回 `validation` 错误（"先写点内容"）。
+ *    原因是标签挂在 `entry_id` 上，而 entry 行是保存正文时产生的 ——
+ *    空日记的 id 是 0。界面上要先把标签区置灰；调用前若正文还没落库，
+ *    要**先 await saveEntry**（本项目的编辑器就是这么做：flush 之后再调）。
+ *
+ * ⚠️ 返回值以后端的为准去刷界面：清洗规则（去空白 / 限长 / 忽略大小写去重）
+ *    住在后端，前端自己算的那份必然与它差一点，那就成了两套真相。
+ */
+export const setEntryTags = (date: string, tags: string[]) =>
+  invoke<string[]>("set_entry_tags", { date, tags });
+
+/**
+ * 标签改名。新名字已被**别的**标签占用时返回 `validation` 错误，**不合并**。
+ *
+ * 为什么不自动合并：改名与合并不是一回事，合并要动两批日记的全部关联行。
+ * 真要合并应当明说 —— 所以这里宁可报错，也不悄悄把两个标签并成一个。
+ *
+ * 返回清洗后的最终名字：后端会 trim、会检查长度，界面拿它回显。
+ */
+export const renameTag = (id: number, newName: string) =>
+  invoke<string>("rename_tag", { id, newName });
+
+/**
+ * 删标签。**只删标签与关联行，日记内容一个字都不动**（外键方向保证了这点）。
+ *
+ * 返回受影响的关联数（≈ 多少篇日记用过它），用来给用户一句实话：
+ * "已删除「旅行」，3 篇日记的标签被移除 —— 日记内容未受影响"。
+ * 不这么说，用户会以为自己刚把三篇日记删了。
+ *
+ * 删不存在的标签不报错（幂等），界面上连点两下不该出错。
+ */
+export const deleteTag = (id: number) => invoke<number>("delete_tag", { id });
 
 // ---------------------------------------------------------------------------
 // 维护

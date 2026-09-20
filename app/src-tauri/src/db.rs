@@ -124,6 +124,22 @@ pub struct SearchHit {
     pub matched_by: String,
 }
 
+/// 一个标签 + 它的使用情况。
+#[derive(Debug, Clone, Serialize)]
+pub struct TagStat {
+    pub id: i64,
+    pub name: String,
+    /// 打了这个标签、且**算写过**的日记篇数（判定同 `has_content_sql()`）。
+    ///
+    /// 只数"写过"的，与日历标记、月度统计、搜索索引用同一条规则 ——
+    /// 否则同一个标签会出现"这里显示 3 篇、点进去只有 2 篇有内容"。
+    ///
+    /// **可能是 0**：把最后一篇带它的日记的标签撤掉之后，标签本身不会自动
+    /// 消失（见 `set_entry_tags` 的说明），界面上显示"0 篇"；
+    /// 想清理就用 `delete_tag`。刻意保留这种"空标签"，理由见 `list_tags`。
+    pub entry_count: i64,
+}
+
 /// 备份结果。
 #[derive(Debug, Clone, Serialize)]
 pub struct BackupResult {
@@ -165,6 +181,60 @@ pub fn has_content(content_md: &str) -> bool {
     // char::is_whitespace 覆盖空格、制表、换行、回车、垂直制表、换页，
     // 与上面的 SQL 字符集一一对应。
     content_md.chars().any(|c| !c.is_whitespace())
+}
+
+/// 标签名的长度上限（**字符数**，不是字节数）。
+///
+/// 20 是"够用且不至于把界面撑坏"的经验值：标签是给人扫的，
+/// 超过二十字它已经是一句话，该写进标题或正文。
+///
+/// ⚠️ 按 `chars().count()` 而不是 `len()` 计数：中文一个字 3 字节，
+///    拿字节数当上限会让中文标签只能打 6 个字。
+pub const TAG_MAX_CHARS: usize = 20;
+
+/// 清洗一批用户输入的标签名。
+///
+/// 规则（顺序不能反）：
+///   1. **去首尾空白**（`str::trim` 覆盖空格 / 制表 / 换行，与
+///      `has_content()` 用的 `is_whitespace` 是同一套口径）
+///   2. **空的丢掉** —— 用户多敲一个分隔符不该产生一个无名标签
+///   3. **超长报错**，不静默截断：悄悄砍掉尾巴的话，用户下次会看到一个
+///      自己没打过、也搜不到的标签，而"我明明打过"这件事无法自证
+///   4. **去重，且忽略大小写** —— 这条是硬要求，不是洁癖：
+///      `tag.name` 是 `UNIQUE COLLATE NOCASE`，`[Travel, travel]` 会落到
+///      **同一行**上；不去重就会往 `entry_tag` 插两条
+///      (entry_id, tag_id) 完全相同的记录，撞主键直接报错
+///
+/// 刻意**保留用户敲的原始大小写**（`Travel` 不会被改写成 `travel`）：
+/// 名字长什么样是用户的自由，库只保证"大小写不同算同一个标签"。
+///
+/// ⚠️ 去重用的是**只折 ASCII 大小写**的 `to_ascii_lowercase()`，
+///    而不是 `to_lowercase()` —— 后者按 Unicode 规则折，
+///    范围比 SQLite 的 `NOCASE`（只折 A~Z）更大，会出现
+///    "应用认为重名、数据库认为不重名"的错位。两边必须同口径。
+fn normalize_tag_names(raw: &[String]) -> AppResult<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    // 折叠后的名字，只用来判重；存回库的仍是用户敲的那个样子。
+    let mut seen: Vec<String> = Vec::new();
+    for name in raw {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let chars = trimmed.chars().count();
+        if chars > TAG_MAX_CHARS {
+            return Err(AppError::Validation(format!(
+                "标签名过长（上限 {TAG_MAX_CHARS} 字，收到 {chars} 字）"
+            )));
+        }
+        let key = trimmed.to_ascii_lowercase();
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        out.push(trimmed.to_string());
+    }
+    Ok(out)
 }
 
 /// 加密数据库连接。
@@ -1014,6 +1084,249 @@ impl Vault {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    // -----------------------------------------------------------------------
+    // 标签
+    //
+    // 两张表（tag / entry_tag）在建库时就有了，本组方法只是把它们用起来。
+    // 外键方向是关键，别改：
+    //     entry_tag.entry_id → entry(id) ON DELETE CASCADE
+    //     entry_tag.tag_id   → tag(id)   ON DELETE CASCADE
+    // 也就是**删标签只删关联行，永远不会碰 entry**；删日记也只删关联行，
+    // 标签本身留着（可能还有别的日记在用）。
+    // 连接里 `foreign_keys = ON` 已经在 `open_with_key` 打开了 ——
+    // SQLite 默认是关的，关着的话 CASCADE 一声不响地不生效，
+    // 库里会留下指向已删记录的孤儿关联行。
+    // -----------------------------------------------------------------------
+
+    /// 所有标签 + 每个标签的日记篇数（只数"写过"的）。
+    ///
+    /// 排序按**名字**（忽略大小写），不按篇数：篇数会随用户改日记而变，
+    /// 列表跟着重排会让"想点第 3 个"变成灾难；按名字排是稳定的。
+    ///
+    /// 为什么用两层 LEFT JOIN：**没有关联的标签也要出现**（显示 0 篇）。
+    /// 如果内连接过滤掉它们，用户撤掉最后一篇的标签后，这个标签就从界面上
+    /// 凭空消失了 —— 而它还在库里，将来重新用上时又冒出来，像灵异事件。
+    /// 更要紧的是：界面上看不见它，用户就没有机会去删它。
+    ///
+    /// ⚠️ 数的是 `count(e.id)` 而不是 `count(*)`：第二个 LEFT JOIN 没配上时
+    ///    `e.id` 是 NULL，`count(*)` 会把它数成 1（"0 篇的标签显示 1 篇"）。
+    pub fn list_tags(&self) -> AppResult<Vec<TagStat>> {
+        let sql = format!(
+            "SELECT t.id, t.name, count(e.id)
+             FROM tag t
+             LEFT JOIN entry_tag et ON et.tag_id = t.id
+             LEFT JOIN entry e ON e.id = et.entry_id AND {}
+             GROUP BY t.id, t.name
+             ORDER BY t.name COLLATE NOCASE ASC",
+            has_content_sql()
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok(TagStat {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                entry_count: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 某天日记上的标签名（按名字排序）。那天没有日记 → 空列表。
+    ///
+    /// 刻意**不按"写过"过滤**：这里回答的是"挂在这条记录上的标签是什么"。
+    /// 能不能改标签是另一回事，由 `set_entry_tags` 把闸（那时才需要正文）。
+    /// 多一层过滤只会让"读到的比刚写进去的少"这种怪事出现。
+    pub fn tags_of_entry(&self, date: &str) -> AppResult<Vec<String>> {
+        validate_date(date)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT t.name
+             FROM tag t
+             JOIN entry_tag et ON et.tag_id = t.id
+             JOIN entry e ON e.id = et.entry_id
+             WHERE e.entry_date = ?1
+             ORDER BY t.name COLLATE NOCASE ASC",
+        )?;
+        let rows = stmt.query_map(params![date], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 整组覆盖某天日记的标签。返回**实际存下来的**标签名（清洗 + 去重 + 排序后）。
+    ///
+    /// 为什么返回列表而不是 `()`：清洗规则住在后端（去空白、限长、忽略大小写
+    /// 去重），前端不可能自己算出完全一致的一份。让它拿后端的结果去刷界面，
+    /// 就不会出现"界面上显示「旅行 」而库里是「旅行」"这种两套真相
+    /// —— 与免密开关"整体替换 status"是同一条思路。
+    ///
+    /// 三道硬闸，全在后端，**不靠界面置灰**（置灰只是提示，
+    /// 拦不住排队中的自动保存、也拦不住绕过前端的调用）：
+    ///
+    ///   1. 日记**必须已经存在且有正文**。标签挂的是 `entry_id`，而 entry 行
+    ///      是保存正文时产生的（`open_entry` 是纯读取，id = 0）。没有 id 时
+    ///      要打标签只有两条路：凭空插一条空行，或写库失败。前者会直接破坏
+    ///      **"打开 ≠ 写过"** 这条铁律（日历标记、统计、搜索全按正文判定），
+    ///      所以这里明确报错，把"给空日记打标签"挡在数据层。
+    ///   2. 日记**已锁定**时拒绝：锁定 = 只读，标签也是这篇日记的一部分。
+    ///      与 `save_entry` / `delete_entry` 同一口径（那里也是硬约束）。
+    ///   3. **整组覆盖**：传什么就是什么，不做"增量猜测"。前端加一个标签就传
+    ///      全集，撤一个也传全集，语义永远只有一个。
+    ///
+    /// ⚠️ 撤掉某个日记的标签**不会**顺手删掉"没人用的标签行"。
+    ///    清理是显式动作（`delete_tag`）：自动删会产生"我撤了 A 篇的标签，
+    ///    另外 B 篇上的同名标签也没了"这种看不懂的行为 ——
+    ///    除非那真的是用户想要的（那是"合并/清理"，另一个功能）。
+    pub fn set_entry_tags(&self, date: &str, tags: &[String]) -> AppResult<Vec<String>> {
+        validate_date(date)?;
+        if self.is_locked(date)? {
+            return Err(AppError::Validation(
+                "这篇日记已锁定，先解锁再改标签".into(),
+            ));
+        }
+        let names = normalize_tag_names(tags)?;
+
+        // "删"与"插"必须同一个事务：分开写的话，中途失败会留下半套标签
+        //（旧的删了、新的还没插 —— 用户看到的是"标签全没了"）。
+        let tx = self.conn.unchecked_transaction()?;
+
+        // 闸 1：必须存在"写过的"那一行。判定走同一条 has_content_sql()，
+        // 与日历标记、月度统计、搜索索引用的是同一个口径。
+        let entry_id: Option<i64> = tx
+            .query_row(
+                &format!(
+                    "SELECT id FROM entry WHERE entry_date = ?1 AND {}",
+                    has_content_sql()
+                ),
+                params![date],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(entry_id) = entry_id else {
+            return Err(AppError::Validation(
+                "这篇还没有内容，先写点内容再打标签".into(),
+            ));
+        };
+
+        // ① 让每个标签存在，并取回它的 id。
+        //
+        // ⚠️ 必须"先 INSERT OR IGNORE，再 SELECT"两步，**不能用
+        //    `last_insert_rowid()`**：名字已存在时那一条被 OR IGNORE 跳过，
+        //    而 `last_insert_rowid()` 返回的是**上一次成功插入的 id** ——
+        //    拿它当这个标签的 id，会把标签静默挂到别的标签身上。
+        let mut tag_ids: Vec<i64> = Vec::with_capacity(names.len());
+        for name in &names {
+            tx.execute(
+                "INSERT OR IGNORE INTO tag (name) VALUES (?1)",
+                params![name],
+            )?;
+            let id: i64 = tx.query_row(
+                "SELECT id FROM tag WHERE name = ?1",
+                params![name],
+                |r| r.get(0),
+            )?;
+            tag_ids.push(id);
+        }
+
+        // ② 算差集：删掉这次没给的，补上新增的。
+        //    刻意**不是**"全删再全插" —— 差集不动没变的那部分，
+        //    写入量最小，也让"哪条关联真的动过"一眼看得出来。
+        let existing: Vec<i64> = {
+            let mut stmt = tx.prepare("SELECT tag_id FROM entry_tag WHERE entry_id = ?1")?;
+            let rows = stmt.query_map(params![entry_id], |r| r.get(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for old_id in existing {
+            if !tag_ids.contains(&old_id) {
+                tx.execute(
+                    "DELETE FROM entry_tag WHERE entry_id = ?1 AND tag_id = ?2",
+                    params![entry_id, old_id],
+                )?;
+            }
+        }
+        for tag_id in &tag_ids {
+            // OR IGNORE：已经在表里的关联不重复插（差集已经排除了，
+            // 但这条路必须自己也是安全的 —— 将来若有人改成增量调用，
+            // 这里不该炸）。
+            tx.execute(
+                "INSERT OR IGNORE INTO entry_tag (entry_id, tag_id) VALUES (?1, ?2)",
+                params![entry_id, tag_id],
+            )?;
+        }
+
+        tx.commit()?;
+
+        // 回读一次再返回 —— 让"返回的就是库里的"这件事真的成立，
+        // 而不是把请求原样回给前端（那等于让前端自己给自己当裁判）。
+        self.tags_of_entry(date)
+    }
+
+    /// 标签改名。新名字已被**别的**标签占用时返回 validation 错误，**不合并**。
+    ///
+    /// 为什么不合并：改名和合并是两件事。"把「旅行」改成「远行」"用户要的是
+    /// 换个词；而"这两批日记从此归到同一个标签下"是一次**数据合并**，
+    /// 影响面大得多（可能几百条关联行要重挂），不该由一次手滑的改名触发。
+    /// 真要合并，就该明说"合并"—— 那是另一个功能，不是这个函数的隐式行为。
+    ///
+    /// 返回清洗后的最终名字（前端拿它回显，别自己再 trim 一份）。
+    pub fn rename_tag(&self, id: i64, new_name: &str) -> AppResult<String> {
+        let mut names = normalize_tag_names(&[new_name.to_string()])?;
+        let Some(name) = names.pop() else {
+            return Err(AppError::Validation("标签名不能为空".into()));
+        };
+
+        // 这个名字现在归谁？`tag.name` 是 COLLATE NOCASE，所以这里比的是
+        // 折了大小写之后的结果（travel 与 Travel 会撞上）。
+        let owner: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM tag WHERE name = ?1",
+                params![name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(other) = owner {
+            if other != id {
+                return Err(AppError::Validation(format!(
+                    "已有同名标签「{name}」，没有改名"
+                )));
+            }
+            // 名字是它自己 → 放行。这条分支不是多余的：用户可能只想改个
+            // 大小写（travel → Travel），对 NOCASE 而言"名字没变"，
+            // 但显示的样子变了，仍然要落库。
+        }
+
+        let changed =
+            self.conn
+                .execute("UPDATE tag SET name = ?1 WHERE id = ?2", params![name, id])?;
+        if changed == 0 {
+            return Err(AppError::Validation("标签不存在（可能已被删除）".into()));
+        }
+        Ok(name)
+    }
+
+    /// 删标签。**只删标签本身与它的关联行，日记内容一个字都不动。**
+    ///
+    /// 方向上有个值得记一笔的点：`entry_tag.tag_id` 上的 ON DELETE CASCADE
+    /// 是 **tag → entry_tag**，所以删标签只会清掉"哪几篇日记用过它"，
+    /// 结构上根本碰不到 entry 表。这就是当初建表时把外键方向选对的回报
+    /// —— 用户最怕的"删个标签把日记删了"在数据库层面就不可能发生。
+    ///
+    /// 返回**受影响的关联数**（≈ 多少篇日记用了它），用来给用户一句实话：
+    /// "已删除「旅行」，3 篇日记的标签被移除 —— 日记内容未受影响"。
+    /// 不说的话，用户会担心自己刚把三篇日记删掉了。
+    ///
+    /// 标签不存在时视为成功（幂等）：界面上连点两下不该报错。
+    pub fn delete_tag(&self, id: i64) -> AppResult<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let affected: i64 = tx.query_row(
+            "SELECT count(*) FROM entry_tag WHERE tag_id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        // 关联行的清理交给 ON DELETE CASCADE（连接已开 foreign_keys）。
+        tx.execute("DELETE FROM tag WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(affected as usize)
+    }
+
     /// 统计：总篇数、总字数、连续写作天数。
     ///
     /// 全部只统计**写过的**日记（`has_content_sql()`）。
@@ -1729,6 +2042,53 @@ mod tests {
         assert!(has_content("一"));
         assert!(has_content("  有内容  "));
         assert!(has_content("\n有内容\n"));
+    }
+
+    #[test]
+    fn tag_names_are_trimmed_deduped_and_length_checked() {
+        // 清洗是纯函数，先在这里把规则钉死；数据库那一层的行为在
+        // tests/vault_integration.rs 的「标签」组里端到端验证。
+        let cleaned = normalize_tag_names(&[
+            "  旅行  ".into(),
+            "旅行".into(),      // 与第一条重复（去空白后同名）
+            "旅行 ".into(),
+            "Travel".into(),
+            "travel".into(),    // 只差大小写 → 同一个标签（NOCASE 语义）
+            "TRAVEL".into(),
+            "   ".into(),       // 全空白 → 丢掉
+            "".into(),
+        ])
+        .unwrap();
+        assert_eq!(cleaned, vec!["旅行", "Travel"]);
+        // 保留第一个出现的大小写，不把 Travel 改写成 travel。
+        assert_eq!(cleaned[1], "Travel");
+
+        // 全空白 / 空输入 → 空列表（前端"撤掉全部标签"走的就是这条）。
+        assert!(normalize_tag_names(&[]).unwrap().is_empty());
+        assert!(normalize_tag_names(&[" ".into(), "\t\n".into()])
+            .unwrap()
+            .is_empty());
+
+        // 长度按**字符**算而不是字节：20 个汉字必须通过。
+        // 按字节算的话 20 个汉字是 60 字节，中文用户只能打 6 个字。
+        let twenty_chars = "字".repeat(TAG_MAX_CHARS);
+        assert_eq!(twenty_chars.len(), TAG_MAX_CHARS * 3);
+        assert_eq!(
+            normalize_tag_names(&[twenty_chars]).unwrap(),
+            vec!["字".repeat(TAG_MAX_CHARS)]
+        );
+
+        // 超一个字就报错，且必须是 validation 类（前端按 kind 分支展示）。
+        let too_long = "字".repeat(TAG_MAX_CHARS + 1);
+        let err = normalize_tag_names(&[too_long]).expect_err("超长必须被拒绝");
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "超长应返回 Validation，实际: {err:?}"
+        );
+        // 边界是"清洗之后"的长度：前后空白不计入，
+        // 否则用户粘一段带空格的文字会被莫名其妙拒掉。
+        let padded = format!("  {}  ", "字".repeat(TAG_MAX_CHARS));
+        assert_eq!(normalize_tag_names(&[padded]).unwrap().len(), 1);
     }
 
     #[test]
