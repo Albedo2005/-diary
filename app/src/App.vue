@@ -40,7 +40,6 @@ const refreshToken = ref(0);
 const stats = ref<Stats | null>(null);
 const crypto = ref<CryptoInfo | null>(null);
 const backup = ref<BackupStatus | null>(null);
-const showAbout = ref(false);
 /** 设置弹窗。日历与编辑器不被卸载，所以这里悬着也不影响未保存的草稿。 */
 const showSettings = ref(false);
 
@@ -215,9 +214,6 @@ onUnmounted(() => {
           <button class="btn ghost" title="设置" @click="showSettings = true">
             设置
           </button>
-          <button class="btn ghost" title="关于" @click="showAbout = true">
-            关于
-          </button>
           <button class="btn ghost" @click="doLock">锁定</button>
         </div>
       </header>
@@ -244,43 +240,6 @@ onUnmounted(() => {
       </main>
 
       <div v-if="toast" class="toast">{{ toast }}</div>
-
-      <!--
-        只读出口。可操作项（备份三项）已搬进设置页。
-        划分标准只有一条：**能改的进设置，只能看的留关于**。
-        这个弹窗保留不删，因为它是个用惯了的快捷入口。
-      -->
-      <div v-if="showAbout" class="modal-mask" @click.self="showAbout = false">
-        <div class="modal">
-          <h2>关于</h2>
-          <dl>
-            <dt>数据目录</dt>
-            <dd class="mono">{{ status.data_dir }}</dd>
-            <dt>加密算法</dt>
-            <dd>
-              SQLCipher（整库加密）+ Argon2id 密钥派生
-              <span v-if="crypto">
-                （{{ crypto.m_cost_mib }} MiB / {{ crypto.t_cost }} 轮 /
-                {{ crypto.p_cost }} 并行）
-              </span>
-            </dd>
-            <dt>搜索索引</dt>
-            <dd>中文分词双索引（jieba 词索引 + 单字兜底索引）</dd>
-            <dt v-if="stats">统计</dt>
-            <dd v-if="stats">
-              {{ stats.total_entries }} 篇 · 累计 {{ stats.total_words }} 字 ·
-              连续 {{ stats.streak_days }} 天
-              <template v-if="stats.first_date">
-                <br />从 {{ stats.first_date }} 到 {{ stats.last_date }}
-              </template>
-            </dd>
-          </dl>
-
-          <div class="actions">
-            <button class="btn ghost" @click="showAbout = false">关闭</button>
-          </div>
-        </div>
-      </div>
 
       <!--
         设置：可以改的东西都在这儿。
@@ -405,51 +364,5 @@ onUnmounted(() => {
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.1);
   max-width: 80vw;
   word-break: break-all;
-}
-.modal-mask {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.28);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-}
-.modal {
-  width: 100%;
-  max-width: 520px;
-  background: var(--surface);
-  border-radius: 12px;
-  padding: 26px;
-  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.18);
-}
-.modal h2 {
-  margin: 0 0 18px;
-  font-size: 17px;
-  font-weight: 600;
-}
-dl {
-  margin: 0 0 18px;
-}
-dt {
-  font-size: 12px;
-  color: var(--text-3);
-  margin-bottom: 3px;
-}
-dd {
-  margin: 0 0 14px;
-  font-size: 13px;
-  line-height: 1.7;
-  color: var(--text-1);
-}
-.mono {
-  font-family: var(--mono);
-  font-size: 12px;
-  word-break: break-all;
-}
-.actions {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
 }
 </style>
