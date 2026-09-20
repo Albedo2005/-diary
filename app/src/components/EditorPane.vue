@@ -24,6 +24,7 @@ import { computed, nextTick, onUnmounted, ref, watch } from "vue";
 import {
   deleteEntry,
   lockAllEntries,
+  MOODS,
   openEntry,
   saveEntry,
   setEntryLocked,
@@ -49,6 +50,32 @@ const saveState = ref<"" | "pending" | "saving" | "saved" | "error">("");
 /** 锁定：正文只读。注意锁的是**能否修改**，不是显示方式。 */
 const locked = ref(false);
 const entry = ref<Entry | null>(null);
+
+/**
+ * 当前这篇的心情。null = 未标记。
+ *
+ * 档位表（数值 ↔ emoji）在 `api/index.ts` 的 `MOODS` —— 与日历共用同一份，
+ * 避免“编辑器标的是开心、日历显示受伤”这类漂移。
+ */
+const mood = ref<number | null>(null);
+
+/**
+ * 心情条是否可点。
+ *
+ * 两道闸：
+ *   1. **正文为空时不能标**。后端在正文为空时会丢掉心情，前端置灰是为了
+ *      不让用户白点一次；更根本的是不让"有心情但没内容"的记录出现 ——
+ *      那会与"打开 ≠ 写过"这条铁律冲突。
+ *   2. 锁定时不能改，与锁定状态下其它编辑行为保持一致。
+ */
+const canMarkMood = computed(() => hasContent() && !locked.value);
+
+/** 心情条的悬停提示，把"为什么点不动"讲清楚。 */
+const moodHint = computed(() => {
+  if (locked.value) return "解锁后可修改心情";
+  if (!hasContent()) return "先写点内容，再标心情";
+  return "今天心情如何？再点一次可取消";
+});
 
 /** 输入法组字中。中文打字时输入法会先给出拼音候选，这段时间不能保存。 */
 let composing = false;
@@ -112,6 +139,7 @@ async function load() {
     title.value = e.title;
     content.value = e.content_md;
     locked.value = e.locked;
+    mood.value = e.mood;
     dirty = false;
     saveState.value = "";
   } catch (e) {
@@ -170,6 +198,9 @@ async function flush(forDate: string = props.date) {
       try {
         await deleteEntry(forDate);
         entry.value = null;
+        // 行都没了，心情自然也不存在。前端跟着清掉 ——
+        // 否则界面上还留着一个高亮的表情，看着"有心情"，重开这天却是空的。
+        mood.value = null;
         dirty = false;
         saveState.value = "";
         emit("saved");
@@ -187,7 +218,7 @@ async function flush(forDate: string = props.date) {
 
   saveState.value = "saving";
   try {
-    const e = await saveEntry(forDate, title.value, content.value);
+    const e = await saveEntry(forDate, title.value, content.value, mood.value);
     entry.value = e;
     dirty = false;
     saveState.value = "saved";
@@ -196,6 +227,24 @@ async function flush(forDate: string = props.date) {
     saveState.value = "error";
     errorText.value = toAppError(e).message;
   }
+}
+
+/**
+ * 点选心情。
+ *
+ * **立即保存**，不进防抖队列：心情是个离散选择，点完就该落库。
+ * 若跟着正文的 1 秒防抖走，用户点完马上切日期，这次心情会连着"未保存"
+ * 一起被丢掉。
+ *
+ * 再点同一个档位 = 取消标记（传 null）。
+ * 正文为空时直接返回 —— 按钮本来就是禁用的，这里是第二道闸。
+ */
+function pickMood(value: number) {
+  if (!canMarkMood.value) return;
+  mood.value = mood.value === value ? null : value;
+  dirty = true;
+  saveState.value = "pending";
+  void flush();
 }
 
 /** 组字开始/结束。结束时补一次保存，把最终文本落库。 */
@@ -309,15 +358,39 @@ onUnmounted(() => {
     <div v-if="loading" class="placeholder">读取中…</div>
 
     <template v-else>
-      <input
-        v-model="title"
-        class="title-input"
-        type="text"
-        placeholder="标题（可留空）"
-        maxlength="200"
-        :readonly="locked"
-        :class="{ locked }"
-      />
+      <div class="title-row">
+        <input
+          v-model="title"
+          class="title-input"
+          type="text"
+          placeholder="标题（可留空）"
+          maxlength="200"
+          :readonly="locked"
+          :class="{ locked }"
+        />
+
+        <!--
+          心情条：五档，当前档高亮。
+          正文为空 / 锁定状态下整体置灰 —— 后端在空内容时会丢掉心情，
+          置灰是为了不让用户白点，也避免产生"有心情但没内容"的记录。
+        -->
+        <div
+          class="mood-bar"
+          :class="{ disabled: !canMarkMood }"
+          :title="moodHint"
+        >
+          <button
+            v-for="m in MOODS"
+            :key="m.value"
+            class="mood-btn"
+            :class="{ on: mood === m.value }"
+            :disabled="!canMarkMood"
+            @click="pickMood(m.value)"
+          >
+            {{ m.emoji }}
+          </button>
+        </div>
+      </div>
 
       <!--
         锁定与编辑共用同一个 textarea，**刻意不切换成渲染视图**。
@@ -398,8 +471,15 @@ onUnmounted(() => {
   background: var(--accent);
   border-color: var(--accent);
 }
+/* 标题与心情条同一行：标题吃掉剩余宽度，心情条固定宽度贴右。 */
+.title-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
 .title-input {
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   padding: 4px 0 12px;
   font-size: 21px;
   font-weight: 600;
@@ -411,6 +491,39 @@ onUnmounted(() => {
 .title-input::placeholder {
   color: var(--text-3);
   font-weight: 400;
+}
+
+/* 心情条：未选中的档位淡一些，选中的高亮。 */
+.mood-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.mood-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  font-size: 16px;
+  line-height: 1;
+  opacity: 0.4;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.mood-btn:hover:not(:disabled) {
+  opacity: 1;
+  background: var(--hover);
+}
+.mood-btn.on {
+  opacity: 1;
+  background: var(--accent-soft);
+}
+/* 不可点（正文为空 / 已锁定）：整体压暗，但仍看得见当前心情。 */
+.mood-bar.disabled .mood-btn {
+  opacity: 0.15;
+  cursor: default;
 }
 .content-input {
   flex: 1;

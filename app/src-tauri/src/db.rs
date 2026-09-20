@@ -60,6 +60,16 @@ pub struct EntrySummary {
     pub updated_at: String,
 }
 
+/// 某一天的心情标记，供日历在日期格上显示表情。
+///
+/// 没有标记的日子**不会出现在结果里**，所以 `mood` 不必是 `Option`。
+#[derive(Debug, Clone, Serialize)]
+pub struct DayMood {
+    pub entry_date: String,
+    /// 1=很差 2=较差 3=一般 4=较好 5=很好（取值约束见 `save_entry_with_mood`）。
+    pub mood: i64,
+}
+
 /// 搜索结果。
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchHit {
@@ -455,13 +465,47 @@ impl Vault {
         Ok(entry)
     }
 
-    /// 保存日记内容。
+    /// 保存日记内容（**不带心情**）。
+    ///
+    /// 为什么保留这个三参数入口：Rust 没有默认参数，改签名会把测试与探针里
+    /// 几十处调用一次性全部打断，而那些文件不属于本次改动的范围。
+    /// 运行时保存走 `save_entry_with_mood`，心情由前端显式传入。
+    ///
+    /// 语义提醒：这个入口**会把心情置空**（等价于"未标记"）。
+    pub fn save_entry(&self, date: &str, title: &str, content_md: &str) -> AppResult<Entry> {
+        self.save_entry_with_mood(date, title, content_md, None)
+    }
+
+    /// 保存日记内容 + 心情标记。
+    ///
+    /// `mood`：1=很差 2=较差 3=一般 4=较好 5=很好，`None` = 未标记。
     ///
     /// ⚠️ **正文与两份索引必须在同一个事务里更新**。分开写会产生两类脏状态：
     ///   - 正文存了但索引没更新 -> 日记搜不到
     ///   - 索引更新了但正文没存 -> 搜到一条打不开的日记
-    pub fn save_entry(&self, date: &str, title: &str, content_md: &str) -> AppResult<Entry> {
+    ///
+    /// ⚠️ 心情**不能**变成"写过"判定的一部分。
+    ///    若允许在一篇空日记上标心情，库里就会出现"有心情但没正文"的行，
+    ///    与"打开 ≠ 写过"这条铁律正面冲突 —— 日历标记、月度统计、搜索索引
+    ///    全都按正文判定，多出这种行会让各处显示自相矛盾。
+    ///    所以这里设一道硬闸：**正文为空时心情一律不写库**。
+    ///    前端也配合把心情条置灰，两边都不产生这种行。
+    pub fn save_entry_with_mood(
+        &self,
+        date: &str,
+        title: &str,
+        content_md: &str,
+        mood: Option<i64>,
+    ) -> AppResult<Entry> {
         validate_date(date)?;
+
+        // 取值必须是 1~5 或未标记。宁可报错也不写进一个语义不明的数字 ——
+        // 将来的心情分布统计全靠这几个值分组。
+        if let Some(m) = mood {
+            if !(1..=5).contains(&m) {
+                return Err(AppError::Validation(format!("心情取值应为 1~5，收到 {m}")));
+            }
+        }
 
         // 锁定是**硬约束**，不是界面上的置灰。
         // 光靠前端把输入框设成 readonly 拦不住自动保存定时器：
@@ -491,17 +535,23 @@ impl Vault {
         // 那种不一致比"搜不到"更让人困惑。
         let indexed = has_content(content_md);
 
+        // 硬闸：正文为空时心情不落库（理由见方法头注释）。
+        // 就算前端异常多传了一个 mood，也只会在这一行被丢掉，
+        // 不会产生污染"写过"判定的行。
+        let mood = if indexed { mood } else { None };
+
         let tx = self.conn.unchecked_transaction()?;
 
         tx.execute(
-            "INSERT INTO entry (notebook_id, entry_date, title, content_md, word_count, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            "INSERT INTO entry (notebook_id, entry_date, title, content_md, word_count, mood, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
              ON CONFLICT(entry_date) DO UPDATE SET
                  title = excluded.title,
                  content_md = excluded.content_md,
                  word_count = excluded.word_count,
+                 mood = excluded.mood,
                  updated_at = excluded.updated_at",
-            params![DEFAULT_NOTEBOOK_ID, date, title, content_md, words, now],
+            params![DEFAULT_NOTEBOOK_ID, date, title, content_md, words, mood, now],
         )?;
 
         let id: i64 = tx.query_row(
@@ -696,6 +746,34 @@ impl Vault {
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![from, to], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 区间内**有心情标记**的日期 → 心情值。日历用它给日期格加表情。
+    ///
+    /// 为什么单独开一个接口、而不是让 `written_dates` 顺带返回心情：
+    /// `written_dates` 的返回类型是 `Vec<String>`，前端与多处都已依赖；
+    /// 而"这天写过没"和"这天标没标心情"本来就是两个问题，分开取更清楚。
+    ///
+    /// 仍然带上 `has_content_sql()`：心情只应存在于有正文的行上。
+    /// 万一历史数据里混进了"有心情没正文"的脏行，这里会把它挡在日历之外，
+    /// 与全项目的判定规则保持一致。
+    pub fn written_moods(&self, from: &str, to: &str) -> AppResult<Vec<DayMood>> {
+        let sql = format!(
+            "SELECT entry_date, mood FROM entry
+             WHERE entry_date BETWEEN ?1 AND ?2
+               AND mood IS NOT NULL
+               AND {}
+             ORDER BY entry_date ASC",
+            has_content_sql()
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![from, to], |r| {
+            Ok(DayMood {
+                entry_date: r.get(0)?,
+                mood: r.get(1)?,
+            })
+        })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -1520,6 +1598,112 @@ mod tests {
             .unwrap();
         assert_eq!(stale, 0, "无正文的锁标必须被清掉，否则以后会突然发作");
         assert!(vault.is_locked("2026-09-11").unwrap(), "写过之后应正常锁上");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 心情能存能读，且**只在有正文时才落库**。
+    ///
+    /// 这是"心情不能变成非空判定的一部分"的守门测试。
+    /// 允许空日记标心情的话，库里就会出现"有心情但没正文"的行，
+    /// 而日历、统计、搜索全按正文判定 —— 那种行会让界面自相矛盾。
+    #[test]
+    fn mood_is_saved_and_dropped_when_content_is_empty() {
+        let dir = std::env::temp_dir().join("dsh-diary-mood");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let vault = Vault::create(&dir, "135790", None).unwrap();
+
+        // 有正文 + 心情 → 正常存下，重开还在
+        let e = vault
+            .save_entry_with_mood("2026-09-11", "标题", "今天过得不错。", Some(5))
+            .unwrap();
+        assert_eq!(e.mood, Some(5));
+        assert_eq!(
+            vault.open_entry("2026-09-11").unwrap().mood,
+            Some(5),
+            "重开这篇日记，心情必须还在"
+        );
+
+        // 无正文 + 心情 → 心情被丢弃
+        vault
+            .save_entry_with_mood("2026-09-12", "", "   \n\t  ", Some(5))
+            .unwrap();
+        let raw: Option<i64> = vault
+            .conn
+            .query_row(
+                "SELECT mood FROM entry WHERE entry_date = '2026-09-12'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw, None, "正文为空时心情绝不能落库");
+
+        // 关键回归点：标过心情但没有正文的这一天，依然不算"写过"
+        let dates = vault.written_dates("2026-09-01", "2026-09-30").unwrap();
+        assert_eq!(dates.len(), 1, "只有 09-11 算写过，实际: {dates:?}");
+        assert_eq!(dates[0], "2026-09-11");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 心情取值只接受 1~5。别的值直接拒绝，不做"猜用户想表达什么"。
+    #[test]
+    fn mood_out_of_range_is_rejected() {
+        let dir = std::env::temp_dir().join("dsh-diary-mood-range");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let vault = Vault::create(&dir, "135790", None).unwrap();
+        for bad in [0_i64, 6, -1, 999] {
+            let r = vault.save_entry_with_mood("2026-09-11", "", "有内容。", Some(bad));
+            assert!(r.is_err(), "心情取值 {bad} 必须被拒绝");
+        }
+        // 校验发生在写库之前，所以被拒之后不该留下半截数据
+        assert!(
+            vault
+                .written_dates("2026-09-01", "2026-09-30")
+                .unwrap()
+                .is_empty(),
+            "取值非法时不能留下任何写入"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 日历取心情：只返回**有正文**且标过心情的日子。
+    #[test]
+    fn written_moods_only_lists_days_with_content_and_mood() {
+        let dir = std::env::temp_dir().join("dsh-diary-mood-list");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let vault = Vault::create(&dir, "135790", None).unwrap();
+        vault
+            .save_entry_with_mood("2026-09-11", "", "写过，也标了心情。", Some(4))
+            .unwrap();
+        // 写过但没标心情 —— 不该出现在结果里
+        vault
+            .save_entry("2026-09-12", "", "写过，但没标心情。")
+            .unwrap();
+        // 历史脏数据：有心情、没正文。正常路径产生不了（后端会丢掉），
+        // 这里先正常写进去、再直接改库模拟"外部工具写坏"的情况。
+        vault
+            .save_entry_with_mood("2026-09-13", "", "待会儿清空", Some(3))
+            .unwrap();
+        vault
+            .conn
+            .execute(
+                "UPDATE entry SET content_md = '   ' WHERE entry_date = '2026-09-13'",
+                [],
+            )
+            .unwrap();
+
+        let got = vault.written_moods("2026-09-01", "2026-09-30").unwrap();
+        assert_eq!(got.len(), 1, "只应有 09-11：既有正文又有心情，实际: {got:?}");
+        assert_eq!(got[0].entry_date, "2026-09-11");
+        assert_eq!(got[0].mood, 4);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

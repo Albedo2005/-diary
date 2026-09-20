@@ -63,6 +63,38 @@ export interface EntrySummary {
   updated_at: string;
 }
 
+/** 某天的心情标记。日历用它显示表情；没标心情的日子不会出现在结果里。 */
+export interface DayMood {
+  entry_date: string;
+  /** 1=很差 2=较差 3=一般 4=较好 5=很好 */
+  mood: number;
+}
+
+/**
+ * 心情档位：数值 → 显示。
+ *
+ * 数值含义是**前后端契约的一部分**（后端就存 1~5），emoji 只是它的展示形式。
+ * 放在这里而不是各组件里各写一份：编辑器的按钮和日历格子上的小表情
+ * 必须共用同一张表，否则迟早出现"编辑器标的是开心、日历显示受伤"。
+ *
+ * ⚠️ 按**由差到好**排列，与数值同序。改动时必须与后端取值约定同步。
+ *
+ * 关于第 4 档是 😊 而不是 😡：😡（愤怒）是负面情绪，放在"较好"这一档
+ * 语义上讲不通；其余四个都沿用原定表情。
+ */
+export const MOODS = [
+  { value: 1, emoji: "😭", label: "很差" },
+  { value: 2, emoji: "🤕", label: "较差" },
+  { value: 3, emoji: "😶‍🌫️", label: "一般" },
+  { value: 4, emoji: "😊", label: "较好" },
+  { value: 5, emoji: "🥰", label: "很好" },
+] as const;
+
+/** 数值 → emoji 查表。日历按数值取表情时用它。 */
+export const MOOD_EMOJI: Record<number, string> = Object.fromEntries(
+  MOODS.map((m) => [m.value, m.emoji])
+);
+
 export interface SearchHit {
   entry_date: string;
   title: string;
@@ -187,8 +219,19 @@ export const openEntry = (date: string) =>
 export const isDateWritten = (date: string) =>
   invoke<boolean>("is_date_written", { date });
 
-export const saveEntry = (date: string, title: string, contentMd: string) =>
-  invoke<Entry>("save_entry", { date, title, contentMd });
+/**
+ * 保存日记。
+ *
+ * `mood`：1=很差 2=较差 3=一般 4=较好 5=很好，`null` = 未标记。
+ * 心情与正文**同一次写入**：正文为空时后端会丢掉心情，
+ * 所以不存在"有心情但没内容"的记录（见 db.rs 的 save_entry_with_mood）。
+ */
+export const saveEntry = (
+  date: string,
+  title: string,
+  contentMd: string,
+  mood: number | null
+) => invoke<Entry>("save_entry", { date, title, contentMd, mood });
 
 /** 锁定 / 解锁某天。只改"能否修改"，不动正文。 */
 export const setEntryLocked = (date: string, locked: boolean) =>
@@ -205,6 +248,15 @@ export const listMonth = (month: string) =>
 
 export const writtenDates = (from: string, to: string) =>
   invoke<string[]>("written_dates", { from, to });
+
+/**
+ * 区间内**有心情标记**的日期与心情值。
+ *
+ * 与 writtenDates 分开取：那个回答"这天写过没"，这个回答"这天标了什么心情"。
+ * 日历用它在日期格上显示表情（第三种标记）。
+ */
+export const writtenMoods = (from: string, to: string) =>
+  invoke<DayMood[]>("written_moods", { from, to });
 
 export const getStats = () => invoke<Stats>("stats");
 

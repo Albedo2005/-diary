@@ -11,7 +11,9 @@
 //! 这样即使前端被绕过，也拿不到数据，因为密钥只在解锁后的连接里。
 
 use crate::crypto::{self, CryptoMeta, KdfParams};
-use crate::db::{BackupResult, Entry, EntrySummary, IntegrityReport, SearchHit, Stats, Vault};
+use crate::db::{
+    BackupResult, DayMood, Entry, EntrySummary, IntegrityReport, SearchHit, Stats, Vault,
+};
 use crate::error::{AppError, AppResult};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -324,14 +326,25 @@ pub fn is_date_written(state: State<'_, VaultState>, date: String) -> AppResult<
     with_vault(&state, |v| v.is_written(&date))
 }
 
+/// 保存日记。
+///
+/// `mood`：1=很差 2=较差 3=一般 4=较好 5=很好，`null` = 未标记。
+///
+/// 心情并进 save_entry 而**不是**单独开一个命令，是有意的设计：
+/// 单开命令就会出现"先标心情、后写正文"的中间状态，库里留下
+/// "有心情但没内容"的行，与"打开 ≠ 写过"的判定冲突。
+/// 并进来之后，两者永远同一次写入、同生同灭（空内容时后端会丢掉心情）。
 #[tauri::command]
 pub fn save_entry(
     state: State<'_, VaultState>,
     date: String,
     title: String,
     content_md: String,
+    mood: Option<i64>,
 ) -> AppResult<Entry> {
-    with_vault(&state, |v| v.save_entry(&date, &title, &content_md))
+    with_vault(&state, |v| {
+        v.save_entry_with_mood(&date, &title, &content_md, mood)
+    })
 }
 
 /// 一次性锁上所有日记，返回被锁的篇数。
@@ -372,6 +385,19 @@ pub fn written_dates(
     to: String,
 ) -> AppResult<Vec<String>> {
     with_vault(&state, |v| v.written_dates(&from, &to))
+}
+
+/// 区间内**有心情标记**的日期 → 心情值。日历用它给日期格加表情。
+///
+/// 和 `written_dates` 分开：那个回答"这天写过没"，这个回答"这天标了什么心情"。
+/// 返回结果里只有真正带心情的日子，没标的不占位置。
+#[tauri::command]
+pub fn written_moods(
+    state: State<'_, VaultState>,
+    from: String,
+    to: String,
+) -> AppResult<Vec<DayMood>> {
+    with_vault(&state, |v| v.written_moods(&from, &to))
 }
 
 #[tauri::command]

@@ -93,6 +93,8 @@ pub fn run() {
             commands::delete_entry,
             commands::list_month,
             commands::written_dates,
+            // 日历上的心情标记（第三种标记：只在有心情的日子显示）
+            commands::written_moods,
             commands::stats,
             // 搜索
             commands::search_entries,
