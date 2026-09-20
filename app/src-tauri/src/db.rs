@@ -66,7 +66,8 @@ pub struct EntrySummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct DayMood {
     pub entry_date: String,
-    /// 1=很差 2=较差 3=一般 4=较好 5=很好（取值约束见 `save_entry_with_mood`）。
+    /// 1=悲伤 2=受伤 3=茫然 4=愤怒 5=开心（1~5 只是编号，无好坏顺序；
+    /// 取值约束见 `save_entry_with_mood`）。
     pub mood: i64,
 }
 
@@ -478,7 +479,8 @@ impl Vault {
 
     /// 保存日记内容 + 心情标记。
     ///
-    /// `mood`：1=很差 2=较差 3=一般 4=较好 5=很好，`None` = 未标记。
+    /// `mood`：1=悲伤 2=受伤 3=茫然 4=愤怒 5=开心（1~5 只是编号，
+    /// 无好坏顺序），`None` = 未标记。
     ///
     /// ⚠️ **正文与两份索引必须在同一个事务里更新**。分开写会产生两类脏状态：
     ///   - 正文存了但索引没更新 -> 日记搜不到

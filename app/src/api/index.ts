@@ -66,7 +66,7 @@ export interface EntrySummary {
 /** 某天的心情标记。日历用它显示表情；没标心情的日子不会出现在结果里。 */
 export interface DayMood {
   entry_date: string;
-  /** 1=很差 2=较差 3=一般 4=较好 5=很好 */
+  /** 1=悲伤 2=受伤 3=茫然 4=愤怒 5=开心（1~5 只是编号，无好坏顺序） */
   mood: number;
 }
 
@@ -77,17 +77,17 @@ export interface DayMood {
  * 放在这里而不是各组件里各写一份：编辑器的按钮和日历格子上的小表情
  * 必须共用同一张表，否则迟早出现"编辑器标的是开心、日历显示受伤"。
  *
- * ⚠️ 按**由差到好**排列，与数值同序。改动时必须与后端取值约定同步。
- *
- * 关于第 4 档是 😊 而不是 😡：😡（愤怒）是负面情绪，放在"较好"这一档
- * 语义上讲不通；其余四个都沿用原定表情。
+ * ⚠️ 1~5 **只是编号**，不是"由差到好"的程度刻度 ——
+ *    五种心情是并列的类型，谁也不比谁"更高级"，别按顺序去理解或排序。
+ *    将来要加档就**往后编号**，不要插在中间：插入会让已存进库的
+ *    历史数据整体错位（昨天标的 😡 会突然变成别的情绪）。
  */
 export const MOODS = [
-  { value: 1, emoji: "😭", label: "很差" },
-  { value: 2, emoji: "🤕", label: "较差" },
-  { value: 3, emoji: "😶‍🌫️", label: "一般" },
-  { value: 4, emoji: "😊", label: "较好" },
-  { value: 5, emoji: "🥰", label: "很好" },
+  { value: 1, emoji: "😭", label: "悲伤" },
+  { value: 2, emoji: "🤕", label: "受伤" },
+  { value: 3, emoji: "😶‍🌫️", label: "茫然" },
+  { value: 4, emoji: "😡", label: "愤怒" },
+  { value: 5, emoji: "🥰", label: "开心" },
 ] as const;
 
 /** 数值 → emoji 查表。日历按数值取表情时用它。 */
@@ -222,7 +222,8 @@ export const isDateWritten = (date: string) =>
 /**
  * 保存日记。
  *
- * `mood`：1=很差 2=较差 3=一般 4=较好 5=很好，`null` = 未标记。
+ * `mood`：1=悲伤 2=受伤 3=茫然 4=愤怒 5=开心（1~5 只是编号，无好坏顺序），
+ * `null` = 未标记。档位与 emoji 的对照见下方 `MOODS`。
  * 心情与正文**同一次写入**：正文为空时后端会丢掉心情，
  * 所以不存在"有心情但没内容"的记录（见 db.rs 的 save_entry_with_mood）。
  */
