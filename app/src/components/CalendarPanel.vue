@@ -9,7 +9,7 @@
  */
 import { computed, ref, watch } from "vue";
 import {
-  deleteTag,
+  retireTag,
   listTags,
   MOOD_EMOJI,
   renameTag,
@@ -162,25 +162,24 @@ async function commitRename() {
 }
 
 /**
- * 删除标签。
+ * 让标签"退休"（界面上的「删除」）。
  *
- * 不做二次确认：这个动作**碰不到任何日记内容**（外键方向是
- * tag → entry_tag，删除只清关联行），而且误删了重新打一次就回来了。
+ * 不做二次确认：它连日记的边都碰不到，而且重新打一次同名标签就复活了。
  * 为它弹一个"确定吗"反而把真实风险（改密码、删日记那种）的警示给稀释了。
  *
- * 但要在提示里说清"日记没事" —— 用户看到"已删除"三个字，
- * 第一反应就是"我的日记呢"。
+ * 但提示里必须说清两件事：① 从此不再出现在这个列表里（这是用户要的）；
+ * ② **已经贴过它的日记仍然保留这个标签**（这是用户最担心的"我的日记呢"）。
  */
 async function removeTag(t: TagStat) {
   if (tagBusy.value) return;
   tagBusy.value = true;
   try {
-    const affected = await deleteTag(t.id);
+    const affected = await retireTag(t.id);
     emit(
       "notice",
       affected > 0
-        ? `已删除标签「${t.name}」——${affected} 篇日记的标签被移除，内容未受影响`
-        : `已删除标签「${t.name}」（本来就没有日记在用它）`
+        ? `已移除标签「${t.name}」——以后不再出现在这里；另有 ${affected} 篇日记仍保留它`
+        : `已移除标签「${t.name}」（本来就没有日记在用它）`
     );
     if (editingId.value === t.id) cancelRename();
     await loadTags();
@@ -317,7 +316,7 @@ watch(
             </button>
             <button
               class="tag-op danger"
-              title="删除标签（只清标签，日记内容不受影响）"
+              title="移除标签（以后不再出现在列表里；已写过的日记仍保留它）"
               @click="removeTag(t)"
             >
               ✕

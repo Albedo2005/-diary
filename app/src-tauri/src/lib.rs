@@ -110,7 +110,7 @@ pub fn run() {
             commands::tags_of_entry,
             commands::set_entry_tags,
             commands::rename_tag,
-            commands::delete_tag,
+            commands::retire_tag,
             // 维护与备份
             commands::backup_now,
             commands::backup_status,

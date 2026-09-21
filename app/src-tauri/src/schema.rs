@@ -7,7 +7,7 @@
 ///
 /// 用一个独立的 `schema_version` 表记录，而不是 SQLite 的 `PRAGMA user_version`：
 /// 后者在加密库里行为正常，但用独立表更直观、也便于把版本信息一并导出。
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// 建表语句。
 ///
@@ -114,10 +114,26 @@ CREATE VIRTUAL TABLE IF NOT EXISTS entry_fts_char USING fts5(
 
 -- ---------------------------------------------------------------------------
 -- 标签（数据结构先建好，界面属于 P1）
+--
+-- ⚠️ 这张表是**标签字典**，不是"标签本身"。日记页上从不写标签名，
+--    写的是"这一页贴了哪几条便签"（entry_tag）。改一次字典里的名字，
+--    所有日记跟着变；同名自动合并 —— 这就是当初绕这一道的原因。
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS tag (
     id   INTEGER PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE COLLATE NOCASE
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    -- 退休标记：1 = 用户在界面上把它"删除"了。
+    --
+    -- 删除是**软**的：只把这一位置 1，于是它从"可选标签列表"
+    -- （list_tags）里消失；而**已经贴过它的日记照旧显示这个标签**
+    -- （tags_of_entry 不过滤 retired）—— 历史原样保留。
+    --
+    -- ⚠️ 为什么不直接 DELETE：外键方向是 tag → entry_tag 的
+    --    ON DELETE CASCADE，真删会**连坐清掉关联行**，那几篇日记上的
+    --    标签凭空消失。用户的意思是"让它以后别再出现在我眼前"，
+    --    不是"把我以前写过的东西改掉"。这两件事差得很远。
+    --    想重新用起来：再敲一次同名标签会自动复活（见 set_entry_tags）。
+    retired INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS entry_tag (

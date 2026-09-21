@@ -794,11 +794,19 @@ pub fn rename_tag(state: State<'_, VaultState>, id: i64, new_name: String) -> Ap
     with_vault(&state, |v| v.rename_tag(id, &new_name))
 }
 
-/// 删标签。**只删标签与关联行，日记内容一个字都不动。**
-/// 返回受影响的关联数（≈ 多少篇日记用过它），供界面给用户一句实话。
+/// 让一个标签"退休"（用户界面上的「删除」）。**已经贴过它的日记，标签会保留。**
+///
+/// ⚠️ 名字用 retire 而不是 delete 是**故意**的：它并不真删 `tag` 行，
+///    只把 `retired` 置 1 —— 于是该标签从"可选列表"（`list_tags`）里消失，
+///    而已经贴过它的日记照旧显示它（`tags_of_entry` 不过滤 retired）。
+///    叫 delete 会误导后人：`DELETE FROM tag` 会因为 `ON DELETE CASCADE`
+///    连坐清掉关联行，把用户的历史改掉 —— 那恰好是用户不要的。
+///
+/// 返回"有几篇日记挂着它"，供界面说一句实话：
+/// "已移除「旅行」——另有 2 篇日记仍保留这个标签"。
 #[tauri::command]
-pub fn delete_tag(state: State<'_, VaultState>, id: i64) -> AppResult<usize> {
-    with_vault(&state, |v| v.delete_tag(id))
+pub fn retire_tag(state: State<'_, VaultState>, id: i64) -> AppResult<usize> {
+    with_vault(&state, |v| v.retire_tag(id))
 }
 
 // ---------------------------------------------------------------------------

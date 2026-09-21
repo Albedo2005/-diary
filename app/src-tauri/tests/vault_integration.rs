@@ -1626,7 +1626,8 @@ fn after_changing_the_pin_the_key_file_holds_the_new_key() {
 // 五条验收逐个对应：
 //   ① 给某天加标签 → 重开这天，标签还在          → tags_round_trip_across_reopen
 //   ② 重复输入「旅行」两次 → 只存一个            → duplicate_tag_names_are_stored_only_once
-//   ③ 删标签 → 标签消失，但日记内容完好          → deleting_a_tag_never_touches_entry_content
+//   ③ 删标签 → 从列表里消失，但日记上仍保留、内容完好
+//                                          → retiring_a_tag_hides_it_from_the_list_but_keeps_it_on_entries
 //   ④ 重命名为已存在的名字 → 报错，两个都原样    → renaming_onto_an_existing_name_is_rejected_and_changes_nothing
 //   ⑤ 给空日记打标签 → 不允许                    → tagging_an_entry_without_content_is_rejected
 //
@@ -1714,9 +1715,16 @@ fn duplicate_tag_names_are_stored_only_once() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 用户 2026-09-21 的要求：**"删除"标签只让它从可选列表里消失，
+/// 已经贴过它的日记仍然保留这个标签。**
+///
+/// 旧版是硬删（`DELETE FROM tag`，靠 `ON DELETE CASCADE` 清关联行），
+/// 那几篇日记上的标签会凭空消失。用户的原话是"这个标签对应的日记还是这个
+/// 标签……而不是将以前的对应标签都删去"—— 所以这一版改成软删除
+/// （`retire_tag`：只把 `tag.retired` 置 1）。
 #[test]
-fn deleting_a_tag_never_touches_entry_content() {
-    let dir = temp_dir("tag-delete");
+fn retiring_a_tag_hides_it_from_the_list_but_keeps_it_on_entries() {
+    let dir = temp_dir("tag-retire");
     let v = Vault::create(&dir, PIN, None).unwrap();
     v.save_entry("2026-09-18", "第一篇", "在青海湖边上坐了一下午。")
         .unwrap();
@@ -1734,27 +1742,96 @@ fn deleting_a_tag_never_touches_entry_content() {
         .expect("标签应在列表里");
     assert_eq!(travel.entry_count, 2);
 
-    let affected = v.delete_tag(travel.id).unwrap();
-    assert_eq!(affected, 2, "返回的应是受影响的日记篇数");
+    let affected = v.retire_tag(travel.id).unwrap();
+    assert_eq!(affected, 2, "返回的应是\"有几篇日记挂着它\"");
 
-    // 标签从两个地方都消失了：全库列表、以及那两篇的标签里。
+    // ① 从"可选列表"里消失了 —— 这是用户要的"节约地方"。
     assert!(v.list_tags().unwrap().iter().all(|t| t.name != "旅行"));
-    assert!(v.tags_of_entry("2026-09-18").unwrap().is_empty());
-    // 但 19 号上**别的**标签不受牵连。
-    assert_eq!(v.tags_of_entry("2026-09-19").unwrap(), vec!["寺庙"]);
 
-    // 验收 ③ 的重点在这儿：日记内容一字未动，而且还能打开、还能搜到。
+    // ② 但**那两篇日记上的标签原样保留** —— 本次改动的核心。
+    //    （刻意不比对整体顺序，只断言集合内容，免得被 COLLATE NOCASE 影响。）
+    for date in ["2026-09-18", "2026-09-19"] {
+        let names = v.tags_of_entry(date).unwrap();
+        assert!(
+            names.contains(&"旅行".to_string()),
+            "{date} 上的退休标签必须还在，实际: {names:?}"
+        );
+    }
+    assert_eq!(v.tags_of_entry("2026-09-19").unwrap().len(), 2);
+
+    // ③ 关联行一条没少 —— 软删除根本不碰 entry_tag。
+    let links: i64 = v
+        .conn()
+        .query_row("SELECT count(*) FROM entry_tag", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(links, 3, "软删除不该动任何关联行");
+
+    // ④ 正文一字未动，还能打开、还能搜到。
     let e1 = v.open_entry("2026-09-18").unwrap();
     assert_eq!(e1.title, "第一篇");
     assert_eq!(e1.content_md, "在青海湖边上坐了一下午。");
-    let e2 = v.open_entry("2026-09-19").unwrap();
-    assert_eq!(e2.content_md, "今天去了塔尔寺，人很多。");
     assert_eq!(v.stats().unwrap().total_entries, 2);
-    // 搜索索引也没被碰坏 —— "删标签把索引一起删了"是这类级联最容易踩的坑。
     assert_eq!(v.search("青海湖", 10).unwrap().len(), 1);
 
-    // 幂等：再删一次不报错（界面上连点两下不该炸）。
-    assert_eq!(v.delete_tag(travel.id).unwrap(), 0);
+    // ⑤ 幂等：再调一次不报错（界面上连点两下不该炸）。
+    assert_eq!(v.retire_tag(travel.id).unwrap(), 2);
+
+    // ⑥ 重开整个库之后仍然是"列表里没有、日记上有"。
+    drop(v);
+    let v = Vault::unlock(&dir, PIN).unwrap();
+    assert!(v.list_tags().unwrap().iter().all(|t| t.name != "旅行"));
+    assert!(v
+        .tags_of_entry("2026-09-18")
+        .unwrap()
+        .contains(&"旅行".to_string()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 退休标签的**复活**判据：只有"新挂上"那一次才算用户重新启用它。
+///
+/// 这条最容易写错的地方在于：前端提交的是**整组**标签，一篇老日记只要被
+/// 编辑一次，它身上那个退休标签就会出现在提交名单里。若据此复活，用户会
+/// 看到"我删掉的标签自己冒回来了"。
+#[test]
+fn a_retired_tag_is_revived_only_when_newly_linked() {
+    let dir = temp_dir("tag-revive");
+    let v = Vault::create(&dir, PIN, None).unwrap();
+    v.save_entry("2026-09-18", "", "老日记").unwrap();
+    v.save_entry("2026-09-20", "", "新日记").unwrap();
+    v.set_entry_tags("2026-09-18", &["旅行".into()]).unwrap();
+
+    let travel = v
+        .list_tags()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == "旅行")
+        .unwrap();
+    v.retire_tag(travel.id).unwrap();
+
+    // ① 老日记重新提交**整组**（带上原有的退休标签）→ 不该复活。
+    v.set_entry_tags("2026-09-18", &["旅行".into(), "工作".into()])
+        .unwrap();
+    assert!(
+        v.list_tags().unwrap().iter().all(|t| t.name != "旅行"),
+        "老日记只是被重新保存了一次，退休标签不该自己冒回来"
+    );
+    assert!(
+        v.tags_of_entry("2026-09-18")
+            .unwrap()
+            .contains(&"旅行".to_string()),
+        "但它在那一篇上必须照旧保留"
+    );
+
+    // ② 在**别的一篇**上亲手敲一次同名标签 → 这才是"还要用它"，复活。
+    v.set_entry_tags("2026-09-20", &["旅行".into()]).unwrap();
+    let revived = v
+        .list_tags()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == "旅行")
+        .expect("新挂上同名标签应让它回到列表里");
+    assert_eq!(revived.entry_count, 2, "两篇都挂着它");
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1938,7 +2015,11 @@ fn setting_tags_is_a_whole_group_replacement() {
     // 没人用的标签行仍然留着（它可能只是"这一篇撤了"），
     // 而且必须出现在列表里、显示 0 篇 —— 藏起来用户就没机会删它了。
     let all = v.list_tags().unwrap();
-    assert_eq!(all.len(), 2, "撤掉关联不等于删标签，标签行由 delete_tag 显式清理");
+    assert_eq!(
+        all.len(),
+        2,
+        "撤掉关联不等于删标签，标签行要显式 retire_tag 才会从列表里消失"
+    );
     assert_eq!(all.iter().find(|t| t.name == "山").unwrap().entry_count, 0);
 
     let _ = std::fs::remove_dir_all(&dir);

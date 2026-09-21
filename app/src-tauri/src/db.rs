@@ -136,7 +136,8 @@ pub struct TagStat {
     ///
     /// **可能是 0**：把最后一篇带它的日记的标签撤掉之后，标签本身不会自动
     /// 消失（见 `set_entry_tags` 的说明），界面上显示"0 篇"；
-    /// 想清理就用 `delete_tag`。刻意保留这种"空标签"，理由见 `list_tags`。
+    /// 想让它从列表里消失就用 `retire_tag`（软删除，不会影响已经贴过它的
+    /// 日记）。刻意保留这种"空标签"，理由见 `list_tags`。
     pub entry_count: i64,
 }
 
@@ -684,6 +685,10 @@ impl Vault {
     ///
     /// 版本历史：
     ///   - v1 -> v2：加 `entry.locked`（每篇日记各自记忆锁定状态）
+    ///   - v2 -> v3：加 `tag.retired`（标签的"删除"改成软删除，见 `schema.rs`
+    ///     与 `retire_tag`）。只加列、不动任何已有数据，老库里所有标签的
+    ///     retired 默认 0 = "在列表里"，与升级前的可见性完全一致 ——
+    ///     用户不该在升级后发现"我的标签少了一个"。
     fn upgrade_from(&self, from: i64) -> AppResult<()> {
         // 先备份再动结构。备份失败就别升了 —— 宁可这次打不开，
         // 也不能在没有退路的情况下去改用户唯一的一份数据。
@@ -692,6 +697,9 @@ impl Vault {
         let tx = self.conn.unchecked_transaction()?;
         if from < 2 {
             tx.execute_batch("ALTER TABLE entry ADD COLUMN locked INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if from < 3 {
+            tx.execute_batch("ALTER TABLE tag ADD COLUMN retired INTEGER NOT NULL DEFAULT 0")?;
         }
         tx.execute(
             "UPDATE schema_version SET version = ?1",
@@ -1110,12 +1118,21 @@ impl Vault {
     ///
     /// ⚠️ 数的是 `count(e.id)` 而不是 `count(*)`：第二个 LEFT JOIN 没配上时
     ///    `e.id` 是 NULL，`count(*)` 会把它数成 1（"0 篇的标签显示 1 篇"）。
+    ///
+    /// ⚠️ **只列没退休的标签**（`retired = 0`）—— 这就是界面上"删除"这个动作
+    ///    的全部效果：让它从此不出现在可选列表里。已经贴过它的日记不受影响
+    ///    （`tags_of_entry` 不过滤 retired），历史原样保留。
+    ///
+    ///    代价是会出现"某篇日记挂着一个列表里找不到的标签"这种状态 ——
+    ///    这是**故意**的，不是 bug：用户要的正是"我以后不用它了，
+    ///    但别动我写过的东西"。要把它从那一篇上摘掉，走编辑器里的 chip ×。
     pub fn list_tags(&self) -> AppResult<Vec<TagStat>> {
         let sql = format!(
             "SELECT t.id, t.name, count(e.id)
              FROM tag t
              LEFT JOIN entry_tag et ON et.tag_id = t.id
              LEFT JOIN entry e ON e.id = et.entry_id AND {}
+             WHERE t.retired = 0
              GROUP BY t.id, t.name
              ORDER BY t.name COLLATE NOCASE ASC",
             has_content_sql()
@@ -1171,9 +1188,13 @@ impl Vault {
     ///      全集，撤一个也传全集，语义永远只有一个。
     ///
     /// ⚠️ 撤掉某个日记的标签**不会**顺手删掉"没人用的标签行"。
-    ///    清理是显式动作（`delete_tag`）：自动删会产生"我撤了 A 篇的标签，
+    ///    清理是显式动作（`retire_tag`）：自动删会产生"我撤了 A 篇的标签，
     ///    另外 B 篇上的同名标签也没了"这种看不懂的行为 ——
     ///    除非那真的是用户想要的（那是"合并/清理"，另一个功能）。
+    ///
+    /// ⚠️ 传进来的名字可能命中一个**退休**标签（用户之前"删"过它）。这时
+    ///    本轮不动它 —— 除非这次是把它**新挂到某一篇**上，那才算"我又要用
+    ///    它了"，顺手复活。判据的细节写在下面插入关联那段。
     pub fn set_entry_tags(&self, date: &str, tags: &[String]) -> AppResult<Vec<String>> {
         validate_date(date)?;
         if self.is_locked(date)? {
@@ -1245,10 +1266,29 @@ impl Vault {
             // OR IGNORE：已经在表里的关联不重复插（差集已经排除了，
             // 但这条路必须自己也是安全的 —— 将来若有人改成增量调用，
             // 这里不该炸）。
-            tx.execute(
+            //
+            // 返回值顺便用来判断"这是不是一次**新挂上**的动作"：
+            // 插进去了 = 1，被 OR IGNORE 跳过 = 0。
+            let freshly_linked = tx.execute(
                 "INSERT OR IGNORE INTO entry_tag (entry_id, tag_id) VALUES (?1, ?2)",
                 params![entry_id, tag_id],
-            )?;
+            )? > 0;
+
+            // 复活退休标签 —— 但**只在"新挂上"的时候**。
+            //
+            // 判据必须是"这一篇原来没有它、这次新挂上"，而不是"名单里有它"：
+            // 前端提交的是**整组**（带上了这篇老日记原有的标签），所以一篇
+            // 老日记只要被编辑一次，它身上那个退休标签就会出现在名单里。
+            // 若据此复活，用户就会看到"我删掉的标签自己冒回来了"。
+            // 反过来，用户在新的一篇上亲手敲这个名字 = 明确要再用它 → 复活。
+            // 不复活的话它会变成"隐形标签"：挂着、读得出、但列表里没有，
+            // 想再删一次都点不到。
+            if freshly_linked {
+                tx.execute(
+                    "UPDATE tag SET retired = 0 WHERE id = ?1 AND retired = 1",
+                    params![tag_id],
+                )?;
+            }
         }
 
         tx.commit()?;
@@ -1302,27 +1342,35 @@ impl Vault {
         Ok(name)
     }
 
-    /// 删标签。**只删标签本身与它的关联行，日记内容一个字都不动。**
+    /// 让一个标签"退休"。**这就是界面上「删除」按钮的全部行为。**
     ///
-    /// 方向上有个值得记一笔的点：`entry_tag.tag_id` 上的 ON DELETE CASCADE
-    /// 是 **tag → entry_tag**，所以删标签只会清掉"哪几篇日记用过它"，
-    /// 结构上根本碰不到 entry 表。这就是当初建表时把外键方向选对的回报
-    /// —— 用户最怕的"删个标签把日记删了"在数据库层面就不可能发生。
+    /// 只把 `retired` 置 1：
+    ///   - 它从此不再出现在 `list_tags`（可选列表 / 侧栏）里；
+    ///   - 而**已经贴过它的日记照旧显示它**（`tags_of_entry` 不过滤 retired）。
     ///
-    /// 返回**受影响的关联数**（≈ 多少篇日记用了它），用来给用户一句实话：
-    /// "已删除「旅行」，3 篇日记的标签被移除 —— 日记内容未受影响"。
-    /// 不说的话，用户会担心自己刚把三篇日记删掉了。
+    /// ⚠️ 为什么不再用 `DELETE FROM tag`（2026-09-21 改）
+    ///    外键是 `entry_tag.tag_id → tag(id) ON DELETE CASCADE`，真删会
+    ///    **连坐清掉关联行** —— 那几篇日记上的标签凭空消失。用户的原话是
+    ///    "这个标签对应的日记还是这个标签……把它删去比较节约地方，而不是将
+    ///    以前的对应标签都删去"：他要的只是"别再出现在我眼前"，不是"把历史
+    ///    改掉"。软删除一次满足这两个诉求，而且改名传播、篇数统计、同名合并
+    ///    这三件好处一条都不用丢（硬删 + 反规范化都会丢）。
     ///
-    /// 标签不存在时视为成功（幂等）：界面上连点两下不该报错。
-    pub fn delete_tag(&self, id: i64) -> AppResult<usize> {
+    /// 返回**有几篇日记挂着它**，用来给用户一句实话：
+    /// "已移除「旅行」——另有 2 篇日记仍保留这个标签"。
+    /// 不说的话，用户看见"删除"两个字就会担心自己的日记被动了。
+    ///
+    /// 幂等：标签不存在 / 已经退休都不报错（界面上连点两下不该炸）。
+    /// ⚠️ 重复调用返回的仍是"挂着它的篇数"（关联行一直都在），不是 0。
+    pub fn retire_tag(&self, id: i64) -> AppResult<usize> {
         let tx = self.conn.unchecked_transaction()?;
         let affected: i64 = tx.query_row(
             "SELECT count(*) FROM entry_tag WHERE tag_id = ?1",
             params![id],
             |r| r.get(0),
         )?;
-        // 关联行的清理交给 ON DELETE CASCADE（连接已开 foreign_keys）。
-        tx.execute("DELETE FROM tag WHERE id = ?1", params![id])?;
+        // ⚠️ 是 UPDATE 而不是 DELETE —— 见上面的说明，关联行一行都不碰。
+        tx.execute("UPDATE tag SET retired = 1 WHERE id = ?1", params![id])?;
         tx.commit()?;
         Ok(affected as usize)
     }
@@ -2149,17 +2197,23 @@ mod tests {
         let original = "第一行\n第二行   行尾空格\n\n  三个空格开头的缩进\n\t制表符开头";
         vault.save_entry("2026-09-11", "标题", original).unwrap();
 
-        // 退回 v1：删掉 locked 列 + 版本号改回 1。
+        // 退回 v1：把 v2 / v3 后加的两列都删掉 + 版本号改回 1。
+        // （模拟的是"老库"，所以后加的列一个都不能在 —— 否则下面那句
+        //  ALTER TABLE ... ADD COLUMN 会因为列已存在而直接失败。）
         vault
             .conn
             .execute_batch("ALTER TABLE entry DROP COLUMN locked")
             .unwrap();
         vault
             .conn
+            .execute_batch("ALTER TABLE tag DROP COLUMN retired")
+            .unwrap();
+        vault
+            .conn
             .execute("UPDATE schema_version SET version = 1", [])
             .unwrap();
 
-        vault.migrate().expect("v1 库必须能升到 v2");
+        vault.migrate().expect("v1 库必须能升到最新版");
 
         // 版本号已推进
         let v: i64 = vault
@@ -2180,6 +2234,56 @@ mod tests {
         assert_eq!(e.title, "标题");
         assert!(!e.locked, "升级上来的旧日记默认应该是未锁定的");
         assert!(vault.is_locked("2026-09-11").is_ok(), "locked 列应已可用");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v2 -> v3：加 `tag.retired`（标签"删除"改成软删除）。
+    ///
+    /// ⚠️ 这条迁移最容易出的事故是**把老标签变成"退休"**：只要默认值不是 0，
+    ///    用户升个版本就会看到"我的标签一个都不见了"。所以这里专门断言
+    ///    老标签升级后**照旧在列表里**、篇数与关联都没变。
+    #[test]
+    fn upgrade_from_v2_adds_retired_column_and_keeps_tags_visible() {
+        let dir = std::env::temp_dir().join("dsh-diary-migrate-v2");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let vault = Vault::create(&dir, "135790", None).unwrap();
+        vault.save_entry("2026-09-12", "", "内容").unwrap();
+        vault
+            .set_entry_tags("2026-09-12", &["旅行".into()])
+            .unwrap();
+
+        // 退回 v2：删掉 retired 列 + 版本号改回 2。
+        vault
+            .conn
+            .execute_batch("ALTER TABLE tag DROP COLUMN retired")
+            .unwrap();
+        vault
+            .conn
+            .execute("UPDATE schema_version SET version = 2", [])
+            .unwrap();
+
+        vault.migrate().expect("v2 库必须能升到 v3");
+
+        let v: i64 = vault
+            .conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, schema::SCHEMA_VERSION);
+        assert!(
+            dir.join("diary.pre-v2.db").exists(),
+            "升级前必须产生 v2 快照"
+        );
+
+        // 升上来的老标签必须原样在列表里（retired 默认 0），内容与关联都不动。
+        let all = vault.list_tags().unwrap();
+        assert_eq!(all.len(), 1, "老标签不能被迁移顺手退休掉");
+        assert_eq!(all[0].name, "旅行");
+        assert_eq!(all[0].entry_count, 1);
+        assert_eq!(vault.tags_of_entry("2026-09-12").unwrap(), vec!["旅行"]);
+        assert_eq!(vault.open_entry("2026-09-12").unwrap().content_md, "内容");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

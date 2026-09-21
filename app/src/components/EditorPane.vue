@@ -23,7 +23,7 @@
 import { computed, nextTick, onUnmounted, ref, watch } from "vue";
 import {
   deleteEntry,
-  deleteTag,
+  retireTag,
   listTags,
   lockAllEntries,
   MOODS,
@@ -186,18 +186,19 @@ const otherTags = computed(() =>
 );
 
 /**
- * 确认条上的那句话：把"会影响几篇日记"如实说清楚。
+ * 确认条上的那句话：把"会发生什么、不会发生什么"一次说清。
  *
- * 删除标签**碰不到正文**（外键方向是 tag → entry_tag，级联只清关联行），
- * 但用户看见"删除"两个字，第一反应就是"我的日记呢" —— 必须当场说明。
+ * 这一版的「删除」是**软删除**：标签从此不再出现在可选标签里，
+ * 但**已经贴过它的日记照旧保留这个标签**。用户看见"删除"两个字，
+ * 第一反应就是"我的日记呢" —— 必须当场把这条说死。
  * 篇数取自 `TagStat.entry_count`（后端按"写过"统计），前端不另算一份。
  */
 const deleteHint = computed(() => {
   const t = pendingDelete.value;
   if (!t) return "";
   return t.entry_count > 0
-    ? `删除标签「${t.name}」？它正被 ${t.entry_count} 篇日记使用，删除后这些日记将失去该标签（日记正文不受影响）。`
-    : `删除标签「${t.name}」？目前没有日记在用它。`;
+    ? `移除标签「${t.name}」？它正被 ${t.entry_count} 篇日记使用 —— 移除后它不再出现在可选标签里，但那 ${t.entry_count} 篇日记仍然保留它。`
+    : `移除标签「${t.name}」？目前没有日记在用它。`;
 });
 
 /**
@@ -538,38 +539,37 @@ function cancelDelete() {
 }
 
 /**
- * 确认删除：把标签从库里删掉。
+ * 确认"删除"：让这个标签退休。
  *
- * 后端 `delete_tag` 只做 `DELETE FROM tag`，挂着的关联行交给
- * `ON DELETE CASCADE`（连接已开 foreign_keys）—— **正文一行都不碰**。
- * 它返回受影响的关联行数，用来在提示里答"几篇日记失去了它"。
+ * ⚠️ 后端 `retire_tag` **不删标签行、更不碰日记**：只把 `retired` 置 1，
+ *    于是它从"可选列表"里消失，而**已经贴过它的日记照旧显示它**。
+ *    返回"有几篇日记挂着它"，用来在提示里说一句实话。
  *
- * 后端是幂等的（删不存在的标签不报错），连点两下不会出错。
+ * 后端是幂等的（标签不存在 / 已经退休都不报错），连点两下不会出错。
  */
 async function confirmDelete() {
   const t = pendingDelete.value;
   if (!t) return;
   try {
-    const affected = await deleteTag(t.id);
+    const affected = await retireTag(t.id);
     /*
-      这个标签可能正挂在本篇上。库里那条 entry_tag 已随级联删掉了，
-      所以本地这两份状态必须**同步摘掉** ——
-      否则下一次 syncTags() 会拿着旧名单去提交，而 set_entry_tags 遇到
-      库里不存在的名字会**新建**一个同名标签，等于刚删掉的又长了回来。
+      ⚠️ 这里**不再**把 t.name 从 tags / syncedTags 里摘掉（上一版会摘）。
+      上一版后端是真删：库里那条 entry_tag 随级联没了，前端不清就会拿旧名单
+      去提交，而 set_entry_tags 遇到库里不存在的名字会新建同名标签 → 白删。
+      现在后端只打了个退休标记，**本篇的关联行还在**，tags_of_entry 照样
+      返回它。前端要是自作主张摘掉，下一次 syncTags() 提交的名单就比库里
+      少一个 —— 那反而真的把用户这篇日记的标签删掉了。
+      所以：本地状态原样不动，只重读候选列表。
     */
-    if (tags.value.includes(t.name)) {
-      tags.value = tags.value.filter((n) => n !== t.name);
-    }
-    syncedTags = syncedTags.filter((n) => n !== t.name);
     pendingDelete.value = null;
-    // 候选变了（被删的那个从「其他」里消失），重读全库标签。
+    // 候选变了（退休的那个从「其他」里消失），重读全库标签。
     allTags.value = await listTags();
-    // 与侧栏删除同一句话：先答"我的日记呢"，再报篇数。
+    // 与侧栏同一句话：先答"我的日记呢"，再报篇数。
     emit(
       "notice",
       affected > 0
-        ? `已删除标签「${t.name}」——${affected} 篇日记的标签被移除，内容未受影响`
-        : `已删除标签「${t.name}」（本来就没有日记在用它）`
+        ? `已移除标签「${t.name}」——以后不再出现在可选标签里；另有 ${affected} 篇日记仍保留它`
+        : `已移除标签「${t.name}」（本来就没有日记在用它）`
     );
     // 侧栏那份标签列表要跟着变。
     emit("tags-changed");
@@ -910,7 +910,7 @@ onUnmounted(() => {
                 <button
                   type="button"
                   class="panel-tag-x"
-                  :title="`删除标签「${t.name}」（只清标签，日记内容不受影响）`"
+                  :title="`移除标签「${t.name}」（以后不再出现在可选标签里；已写过的日记仍保留它）`"
                   @click="askDelete(t)"
                 >
                   ×
@@ -920,11 +920,13 @@ onUnmounted(() => {
           </div>
 
           <!--
-            删除确认条。
-            ⚠️「其他」组的 × **不直接删库** —— 那是个不可逆的管理动作，
-               而它就贴在一排可点的 chip 旁边，误触的代价（几十篇日记失去标签）
-               远大于多点一次的麻烦。侧栏那处不做确认，是因为它是**专门的**
+            移除确认条。
+            ⚠️「其他」组的 × **不立即生效** —— 它虽然碰不到正文，但会改掉
+               "这个标签以后还出不出现在可选列表里"，而且它就贴在一排可点的
+               chip 旁边，误触概率不低。侧栏那处不做确认，是因为它是**专门的**
                管理区、动作单一；这里混在"选择标签"的动作里，必须多一道手。
+            （移除本身是**软**的：标签不在列表里了，但已写过的日记仍保留它。
+              所以这条确认条主要是防误触，而不是防"不可逆"。）
           -->
           <div v-if="pendingDelete" class="panel-confirm">
             <span class="panel-confirm-text">{{ deleteHint }}</span>
@@ -933,7 +935,7 @@ onUnmounted(() => {
               class="panel-confirm-del"
               @click="confirmDelete"
             >
-              删除
+              移除
             </button>
             <button
               type="button"
