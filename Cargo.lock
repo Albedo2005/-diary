@@ -64,11 +64,13 @@ name = "app"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "base64 0.22.1",
  "jieba-rs",
  "rand 0.9.5",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",

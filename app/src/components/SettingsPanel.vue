@@ -35,6 +35,7 @@ import {
   disableAutoLogin,
   enableAutoLogin,
   exportMarkdown,
+  pruneOrphanAttachments,
   revealDir,
   setAutoLockSecs,
   toAppError,
@@ -43,7 +44,9 @@ import {
   type ChangePasswordResult,
   type CryptoInfo,
   type ExportResult,
+  type PruneReport,
 } from "../api";
+import { humanBytes } from "../utils/date";
 
 const props = defineProps<{
   status: AppStatus;
@@ -396,6 +399,75 @@ async function openExportDir() {
     emit("notice", toAppError(err).message);
   }
 }
+
+// ---------------------------------------------------------------------------
+// 图片缓存（P1 #10）
+// ---------------------------------------------------------------------------
+
+const pruneBusy = ref(false);
+const pruneError = ref("");
+const pruneDone = ref<PruneReport | null>(null);
+
+/**
+ * 一句话说清清理结果。
+ *
+ * 没东西可清时也**必须**说出来 —— 否则用户不知道按钮到底起没起作用
+ *（一个什么都不显示的按钮，跟坏了没区别）。
+ */
+const pruneSummary = computed(() => {
+  const r = pruneDone.value;
+  if (!r) return "";
+  if (r.files_removed === 0 && r.rows_removed === 0) {
+    return "没有需要清理的东西，图片缓存是干净的";
+  }
+  const parts: string[] = [];
+  if (r.files_removed > 0) {
+    parts.push(
+      `删掉 ${r.files_removed} 个没人引用的图片文件，释放 ${humanBytes(
+        r.bytes_freed
+      )}`
+    );
+  }
+  if (r.rows_removed > 0) {
+    parts.push(`清掉 ${r.rows_removed} 条指向已丢失文件的记录`);
+  }
+  return parts.join("；");
+});
+
+/**
+ * 打开图片缓存目录。
+ *
+ * 路径来自后端（`AppStatus.attachments_dir`），界面**只显示不改** ——
+ * 附件必须和数据库待在同一个数据目录里，否则换台电脑库和图就对不上了。
+ * 目录在启动时已经建好（见 lib.rs 的 setup），所以这里不会遇到"目录不存在"。
+ */
+async function openAttachmentsDir() {
+  try {
+    await revealDir(props.status.attachments_dir);
+  } catch (err) {
+    emit("notice", toAppError(err).message);
+  }
+}
+
+/**
+ * 清理图片缓存。
+ *
+ * ⚠️ 它会**真的删文件**，所以结果必须如实报出来（删了几个、释放多少空间）。
+ *    只说一句"清理完成"，用户根本不知道刚才动了什么。
+ */
+async function doPrune() {
+  if (pruneBusy.value) return;
+  pruneBusy.value = true;
+  pruneError.value = "";
+  pruneDone.value = null;
+  try {
+    pruneDone.value = await pruneOrphanAttachments();
+  } catch (err) {
+    pruneError.value = toAppError(err).message;
+  } finally {
+    pruneBusy.value = false;
+  }
+}
 </script>
 
 <template>
@@ -715,6 +787,53 @@ async function openExportDir() {
               </div>
               <div class="ctl">
                 <button class="btn" @click="openExportDir">打开文件夹</button>
+              </div>
+            </div>
+
+            <!--
+              图片缓存（P1 #10）。
+              附件是**明文**文件、躺在数据目录的 attachments/ 里，所以位置必须让
+              用户看得见：完整路径 + 「打开文件夹」。
+              「清理图片缓存」清两样：① 有记录、文件没了的死记录；
+              ② 有文件、没人认领的孤儿。删日记时外键只清表行、**不动文件**，
+              所以这条清理是必须的（详见 db.rs::prune_orphan_attachments）。
+            -->
+            <div class="row stacked">
+              <div class="label">
+                <div class="t">图片缓存</div>
+                <div class="d">
+                  图片不加密、明文放在这个目录里（当初拍板接受的风险）；
+                  删图片会连文件一起删，删日记则要在这里清一次
+                </div>
+              </div>
+              <div class="ctl">
+                <input
+                  class="path-input"
+                  type="text"
+                  spellcheck="false"
+                  readonly
+                  :value="props.status.attachments_dir"
+                />
+                <button class="btn" @click="openAttachmentsDir">
+                  打开文件夹
+                </button>
+                <button class="btn" :disabled="pruneBusy" @click="doPrune">
+                  {{ pruneBusy ? "正在清理…" : "清理图片缓存" }}
+                </button>
+              </div>
+            </div>
+
+            <div v-if="pruneError" class="row">
+              <div class="label">
+                <div class="t">清理失败</div>
+                <div class="d">{{ pruneError }}</div>
+              </div>
+            </div>
+
+            <div v-else-if="pruneDone" class="row">
+              <div class="label">
+                <div class="t">清理完成</div>
+                <div class="d">{{ pruneSummary }}</div>
               </div>
             </div>
 

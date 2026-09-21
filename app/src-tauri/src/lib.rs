@@ -77,6 +77,15 @@ pub fn run() {
             //
             //    共享问题由 VaultState 内部持有的 Arc 解决：
             //    `clone()` 只是 Arc 计数 +1，两份共享同一份数据。
+            // 顺手把附件目录建好（`<数据目录>/attachments/`）。
+            //
+            // 为什么在启动时做：设置页要显示「图片缓存位置」并给一个"打开文件夹"
+            // 的按钮，而这个目录在用户还没插过任何图片时并不存在 —— 那时点开
+            // 会报"目录不存在"，太别扭。建一个空目录没有代价。
+            // 失败也不吭声（只读介质之类）：真要用附件时会再建一次，
+            // 那次的错误才该报给用户。
+            let _ = std::fs::create_dir_all(data_dir.join("attachments"));
+
             let state = VaultState::new(data_dir);
             app.manage(state.clone());
             // 后台线程持有另一个克隆，与命令层看到的是同一份解锁状态。
@@ -134,6 +143,16 @@ pub fn run() {
             commands::export_markdown,
             commands::export_entry_markdown,
             commands::reveal_dir,
+            // 图片附件（P1 #10）
+            // 附件是**明文**文件、放在库外的 <数据目录>/attachments/，但"有哪几张
+            // 图、哪一天有几张"本身也是隐私，所以这五条一律走 with_vault
+            //（未解锁时统一拒绝）。⚠️ save_attachment 的图片字节走的是 IPC 原始
+            // 通道，其余参数在请求头里 —— 详见 commands.rs 里那条的说明。
+            commands::save_attachment,
+            commands::list_attachments,
+            commands::read_attachment,
+            commands::delete_attachment,
+            commands::prune_orphan_attachments,
             // 应用设置
             // 读是"通用读"（一个结构体带所有项，以后加字段不用加命令），
             // 写是"专用写"（每项一条，因为写入要校验、要有明确语义）。

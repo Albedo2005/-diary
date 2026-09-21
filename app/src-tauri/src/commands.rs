@@ -12,8 +12,8 @@
 
 use crate::crypto::{self, CryptoMeta, KdfParams};
 use crate::db::{
-    derive_and_verify, AppSettings, BackupResult, DayMood, Entry, EntrySummary, ExportResult,
-    IntegrityReport, SearchHit, Stats, TagStat, Vault,
+    derive_and_verify, AppSettings, Attachment, BackupResult, DayMood, Entry, EntrySummary,
+    ExportResult, IntegrityReport, PruneReport, SearchHit, Stats, TagStat, Vault,
 };
 use crate::error::{AppError, AppResult};
 use serde::Serialize;
@@ -59,6 +59,17 @@ pub struct AppStatus {
     /// 它只是一段路径文本、不碰加密库，所以未解锁时也能给出来，
     /// 不违反"未解锁不读 `app_setting`"那条（见 `get_settings` 的说明）。
     pub export_default_dir: String,
+    /// 图片附件的缓存目录（`<数据目录>/attachments/`）。
+    ///
+    /// 和 `export_default_dir` 同一个理由放在这里：目录规则住在后端，
+    /// 前端再拼一份就是两处各算各的。设置页【数据与备份】用它显示
+    /// 「图片缓存位置」，并可一键打开 —— 附件不加密、明文躺在那个目录里
+    /// （用户已知风险），所以位置必须让他看得见、找得到。
+    ///
+    /// ⚠️ 它只是一段路径文本、不碰加密库，所以未解锁时也能给出来。
+    ///    应用启动时就会把这个目录建好（见 lib.rs 的 setup），
+    ///    所以"打开文件夹"在任何时候都点得动。
+    pub attachments_dir: String,
 }
 
 /// 全局可共享的应用状态。
@@ -230,6 +241,11 @@ pub fn app_status(state: State<'_, VaultState>) -> AppResult<AppStatus> {
         auto_login: crypto::auto_login_path(state.data_dir()).exists(),
         data_dir: state.data_dir().to_string_lossy().to_string(),
         export_default_dir: default_export_dir(state.data_dir())
+            .to_string_lossy()
+            .to_string(),
+        attachments_dir: state
+            .data_dir()
+            .join("attachments")
             .to_string_lossy()
             .to_string(),
     })
@@ -1137,6 +1153,111 @@ pub fn reveal_dir(app: tauri::AppHandle, path: String) -> AppResult<()> {
     tauri_plugin_opener::OpenerExt::opener(&app)
         .open_path(dir.to_string_lossy().to_string(), None::<&str>)
         .map_err(|e| AppError::State(format!("打开目录失败: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// 图片附件（P1 #10）
+// ---------------------------------------------------------------------------
+
+/// 存一张图片附件。
+///
+/// ⚠️ **这条命令的参数不像别的命令那样走 JSON**：图片字节走 Tauri 的
+///    **IPC 原始通道**。前端长这样：
+///
+///    ```text
+///    invoke("save_attachment", uint8Array, { headers: { ... } })
+///    ```
+///
+///    Tauri 的注入脚本（`process-ipc-message-fn.js`）看到 args 是
+///    ArrayBuffer / TypedArray / 数组，就把整个 body 当
+///    `application/octet-stream` 发过来；**夹在对象里**的 Uint8Array 则会被
+///    `Array.from()` 变成"两千万个数字的数组"—— 20 MB 的图会慢到不可用。
+///    所以这里必须收 `tauri::ipc::Request`，而不是普通的参数列表。
+///
+/// ⚠️ 其余三个参数只能走请求头（header 只允许 ASCII，所以**文件名由前端
+///    先做 base64**，中文名才不会在头里被拒）。
+///
+/// 📌 上面的示例只是示意，**用 ```text 围起来**是因为：缩进写在文档注释里
+///    会被 rustdoc 当成 Rust 代码去编译，而它不是 Rust —— `cargo test`
+///    会因此在 doctest 阶段红掉。
+///
+/// 不启用 Tauri 的 `asset:` 协议、改成后端读字节的理由见
+/// `db::Vault::read_attachment`（数据目录是便携式的，协议作用域写不死）。
+#[tauri::command]
+pub fn save_attachment(
+    state: State<'_, VaultState>,
+    request: tauri::ipc::Request<'_>,
+) -> AppResult<Attachment> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let bytes: Vec<u8> = match request.body() {
+        tauri::ipc::InvokeBody::Raw(b) => b.clone(),
+        // 自定义协议走不通时 Tauri 会退化成 postMessage + JSON（整个信封塞在
+        // body 里）。这条路传不动大图 —— 直接说清楚，别让人对着"图片坏了"发呆。
+        _ => {
+            return Err(AppError::State(
+                "图片数据没有走原始通道（IPC 退回 JSON 模式了）。重启应用后再试一次".into(),
+            ))
+        }
+    };
+
+    let header = |name: &str| -> AppResult<String> {
+        request
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .ok_or_else(|| AppError::Validation(format!("缺少请求头 {name}")))
+    };
+
+    let date = header("x-diary-date")?;
+    let mime = header("x-diary-mime")?;
+    let file_name = String::from_utf8(
+        STANDARD
+            .decode(header("x-diary-name")?.as_bytes())
+            .map_err(|_| AppError::Validation("文件名不是合法的 base64".into()))?,
+    )
+    .map_err(|_| AppError::Validation("文件名不是合法的 UTF-8".into()))?;
+
+    with_vault(&state, |v| {
+        v.save_attachment(&date, &file_name, &mime, &bytes)
+    })
+}
+
+/// 某一天的全部附件（**不含字节**，只有元信息）。编辑器里那块缩略图区用它。
+#[tauri::command]
+pub fn list_attachments(state: State<'_, VaultState>, date: String) -> AppResult<Vec<Attachment>> {
+    with_vault(&state, |v| v.list_attachments(&date))
+}
+
+/// 读一张图片的字节。
+///
+/// 返回 `tauri::ipc::Response`：响应体的 content-type 是
+/// `application/octet-stream`，前端那边落地成一个 **ArrayBuffer**
+///（见 tauri 的 `ipc-protocol.js`：默认分支就是 `response.arrayBuffer()`），
+/// 再用它造 Blob URL —— 全程不经过 base64，也不会把二进制塞进 JSON。
+///
+/// `mime` 不回在这里：`list_attachments` 已经给过前端每个附件的 mime，
+/// 前端就是拿着它来调这条命令的。
+#[tauri::command]
+pub fn read_attachment(state: State<'_, VaultState>, id: i64) -> AppResult<tauri::ipc::Response> {
+    let (_mime, bytes) = with_vault(&state, |v| v.read_attachment(id))?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// 删一张图片：删记录，并在没有别的记录引用同一份文件时把文件也删掉。
+#[tauri::command]
+pub fn delete_attachment(state: State<'_, VaultState>, id: i64) -> AppResult<()> {
+    with_vault(&state, |v| v.delete_attachment(id))
+}
+
+/// 清理图片缓存（设置页【数据与备份】里的按钮）。
+///
+/// 两个方向：清掉"有记录没文件"的死记录、清掉"有文件没人认领"的孤儿。
+/// 详细口径见 `db::Vault::prune_orphan_attachments`。
+#[tauri::command]
+pub fn prune_orphan_attachments(state: State<'_, VaultState>) -> AppResult<PruneReport> {
+    with_vault(&state, |v| v.prune_orphan_attachments())
 }
 
 /// 加密元信息摘要，仅供设置页展示（**不含 salt 与密钥**）。

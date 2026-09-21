@@ -173,15 +173,174 @@ pub struct ExportResult {
     pub index_path: String,
 }
 
+/// 一条附件（图片）记录 —— 对应 `attachments/` 里的一个文件。
+///
+/// ⚠️ **附件明文落盘、不进加密库**（用户 2026-09-20 已定决策，风险已知）：
+///    图片往往比正文更敏感，而且会被云同步软件连目录一起带走，造成
+///    "正文是加密的、图片却明文躺在云盘里"的错觉。
+///    数据库里**只存相对路径**（`attachments/<sha256>.<ext>`），因为绝对路径
+///    在换电脑、改用户名、移动数据目录之后全部失效。
+#[derive(Debug, Clone, Serialize)]
+pub struct Attachment {
+    pub id: i64,
+    /// 原文件名。**只用来显示**（正文里的 alt 文本），落盘文件名是 sha256。
+    pub file_name: String,
+    /// 相对**数据目录**的路径，形如 `attachments/<sha256>.<ext>`。
+    pub stored_rel: String,
+    /// 绝对路径，由 `stored_rel` 推导（不入库）。给界面显示位置用。
+    pub abs_path: String,
+    pub mime: String,
+    pub byte_size: i64,
+    pub sha256: String,
+    pub created_at: String,
+}
+
+/// 「清理图片缓存」的结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct PruneReport {
+    /// 删掉的孤儿文件（磁盘上有、表里没人认领）。
+    pub files_removed: usize,
+    /// 删掉的失效记录（表里有、磁盘上文件已经没了）。
+    pub rows_removed: usize,
+    /// 顺带释放的字节数（只算孤儿文件）。
+    pub bytes_freed: u64,
+}
+
+/// 单张图片的上限：20 MB。
+pub const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
+
+/// 单篇日记所有图片之和的上限：50 MB。
+///
+/// 在**落盘之前**就拒绝：让人把一整本相册塞进一篇日记，换来的只是
+/// 导出/备份时一个几 GB 的目录。
+pub const MAX_ENTRY_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
+
+/// 允许的图片格式：扩展名 → (MIME, 文件头魔数)。
+///
+/// 判定是**三重**的：扩展名 + 前端报的 MIME + **文件头魔数**。
+/// 前两个都是"别人说了算"的信息（改个名就能骗），所以最终落在文件头上
+/// —— 那才是文件真实的样子。规格只写了"扩展名 + MIME 双重判断"，
+/// 多这一层代价只有几行。
+const ATTACHMENT_TYPES: &[(&str, &str, &[u8])] = &[
+    ("png", "image/png", &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+    ("jpg", "image/jpeg", &[0xFF, 0xD8, 0xFF]),
+    ("jpeg", "image/jpeg", &[0xFF, 0xD8, 0xFF]),
+    ("gif", "image/gif", b"GIF8"),
+    ("webp", "image/webp", b"RIFF"),
+];
+
+/// 取归一化（小写）的扩展名。
+///
+/// ⚠️ `file_name` **永远不当作路径用** —— 它只贡献扩展名和界面上的 alt 文本，
+///    真正的落盘名字是 `sha256.<ext>`。所以文件名里带 `../` 也伤不到谁。
+fn attachment_ext(file_name: &str) -> AppResult<String> {
+    Path::new(file_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .ok_or_else(|| AppError::Validation("这个文件没有扩展名，认不出图片格式".into()))
+}
+
+/// 扩展名 + MIME + 文件头，三样都对上才算合法图片。返回 `(扩展名, 归一化 MIME)`。
+pub fn validate_attachment(
+    file_name: &str,
+    declared_mime: &str,
+    bytes: &[u8],
+) -> AppResult<(String, String)> {
+    let ext = attachment_ext(file_name)?;
+    let (_, mime, magic) = ATTACHMENT_TYPES
+        .iter()
+        .find(|(e, _, _)| *e == ext)
+        .copied()
+        .ok_or_else(|| {
+            AppError::Validation(format!("只支持 png / jpg / jpeg / gif / webp，这个是 .{ext}"))
+        })?;
+
+    // 前端报的 MIME 只能用来"对不上就拒绝"，不能用来放行：
+    // 它是浏览器按扩展名猜的，而且可以被改成任意值。
+    let declared = declared_mime.trim().to_ascii_lowercase();
+    if !declared.is_empty() && declared != mime {
+        return Err(AppError::Validation(format!(
+            "文件类型对不上：扩展名是 .{ext}（{mime}），但浏览器报的是 {declared}"
+        )));
+    }
+
+    // webp 的魔数分两段（`RIFF????WEBP`），只判 RIFF 会把 wav / avi 放进来。
+    let webp_ok = ext != "webp" || (bytes.len() >= 12 && &bytes[8..12] == b"WEBP");
+    if !bytes.starts_with(magic) || !webp_ok {
+        return Err(AppError::Validation(format!(
+            "文件内容不像 {mime}：扩展名和真实格式不一致（改过后缀名？）"
+        )));
+    }
+    Ok((ext, mime.to_string()))
+}
+
+/// 字节的 sha256（小写十六进制）。附件就是靠它做到"同一张图只存一份"。
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        // 写进 String 不可能失败，这个 let _ = 是给编译器的。
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// 把库里的 `stored_rel` 解析成绝对路径，并**挡死路径穿越**。
+///
+/// 规矩只有一条：`stored_rel` 必须是 `attachments/<文件名>`，中间**只允许
+/// 普通路径段** —— `..`、`.`、绝对路径、盘符在解析过程中直接拒绝。
+/// 于是"结果一定落在 `attachments/` 里面"是**结构上保证**的，
+/// 不靠事后 `starts_with` 断言（那种写法漏一个分支就穿了）。
+///
+/// 为什么不用 `std::fs::canonicalize`：① 它要求路径已经存在，而"表里有记录、
+/// 文件却被手工删了"正是要能报出来的情况；② Windows 上它会返回 `\\?\` 前缀，
+/// 拿它跟没规范化的目录做比较很容易出岔子。
+fn attachment_path(data_dir: &Path, stored_rel: &str) -> AppResult<PathBuf> {
+    let mut comps = Path::new(stored_rel).components();
+    match comps.next() {
+        Some(std::path::Component::Normal(c)) if c == "attachments" => {}
+        _ => {
+            return Err(AppError::Validation(
+                "附件路径非法：必须以 attachments/ 开头".into(),
+            ))
+        }
+    }
+
+    let mut out = data_dir.join("attachments");
+    for comp in comps {
+        match comp {
+            std::path::Component::Normal(c) => out.push(c),
+            _ => {
+                return Err(AppError::Validation(
+                    "附件路径非法：不允许 .. 或绝对路径".into(),
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// SQLite 的 `trim()` **默认只去半角空格**，不去制表符和换行。
 /// 这一点和 SQL Server 的 `TRIM`（去所有空白）不同，很容易想当然写错 ——
 /// 实测中"只敲了回车和缩进"的内容会被误判成"写过日记"。
 /// 所以必须显式列出所有要去掉的空白字符。
 const TRIM_CHARS: &str = "char(32) || char(9) || char(10) || char(13) || char(11) || char(12)";
 
-/// "这篇算写过吗"的**唯一判定规则**。
+/// "这篇算写过吗"的**唯一判定规则**（SQL 侧）。
 ///
-/// 规则：`content_md` 去掉各类空白后仍非空。
+/// 规则：`content_md` 去掉各类空白后仍非空，**或者这一篇挂着至少一张图片附件**。
+///
+/// 2026-09-21 加的后半个条件（用户拍板）：图片附件也算"写过"。
+/// 起因是"在一篇还没写正文的日记里插图片"这条需求 —— 两条路只能选一条：
+///   ① 插图片时凭空建一行正文为空的 entry，但这行在统计 / 日历 / 导出里
+///      **仍然不算写过** → 图片存着、日记不算写过，两套口径互相打架；
+///   ② 把"有附件"一起算进"写过"（就是现在这条），口径只有一套。
+/// 用户选了 ②。代价是**判定从"只看一列"变成"看两处"**，所以后半句必须
+/// 跟着 `has_content()` 的说明一起读（那边只回答"有没有正文文本"）。
 ///
 /// 为什么必须集中成一处：这是全应用语义的单一事实来源，被多处使用 ——
 ///   1. `written_dates` 日历标记
@@ -189,7 +348,9 @@ const TRIM_CHARS: &str = "char(32) || char(9) || char(10) || char(13) || char(11
 ///   3. `stats` 总篇数 / 总字数 / 连续天数
 ///   4. `integrity_check` 决定哪些行"应该有索引"
 ///   5. `rebuild_indexes` 决定重建哪些行
-///   6. `save_entry`（经由 `has_content()`）决定要不要收录进搜索索引
+///   6. `list_tags` 每个标签的"被 N 篇用过"
+///   7. `export_markdown` 导出哪些篇
+///   8. `is_locked` / `map_entry` 决定锁定标记算不算数
 /// 以前这些地方各自为政（只看"表里有没有行"），导致**点一下日历就被标记成
 /// 写过日记**。分散在多处的判定条件迟早会漂移，所以统一到这里。
 ///
@@ -197,10 +358,32 @@ const TRIM_CHARS: &str = "char(32) || char(9) || char(10) || char(13) || char(11
 ///   只填了标题、正文没写的情况，在用户心里不算"写完一篇"，标题往往是顺手
 ///   打的草稿。用正文作为真相条件最符合"写过日记"的直觉。
 pub fn has_content_sql() -> String {
-    format!("trim(coalesce(content_md, ''), {TRIM_CHARS}) <> ''")
+    has_content_sql_for("entry")
 }
 
-/// 判断一条日记是否算"写过"。必须与 `has_content_sql()` 的语义一致。
+/// 同 `has_content_sql()`，但用于**给 entry 起了别名**的 SQL。
+///
+/// 存在的理由只有一个：附件那半句要写 `a.entry_id = <本行>.id`，
+/// 而调用方的 SQL 有时是 `FROM entry`、有时是 `LEFT JOIN entry e`。
+/// 让调用方把名字传进来，好过在函数里猜、也好过把 `entry.` 写死
+/// （写死了 `list_tags` 那条就会在运行时报 "no such column: entry.id"）。
+pub fn has_content_sql_for(entry_ref: &str) -> String {
+    format!(
+        "(trim(coalesce({entry_ref}.content_md, ''), {TRIM_CHARS}) <> '' \
+         OR EXISTS(SELECT 1 FROM attachment a WHERE a.entry_id = {entry_ref}.id))"
+    )
+}
+
+/// 判断一段正文里**有没有文本**。
+///
+/// ⚠️ 这只回答"有没有正文文本"，**不等于**"这篇算不算写过" ——
+///    "算写过"是 `has_content_sql()` / `has_content_sql_for()` 的事，
+///    它还包含"有图片附件"那半句。两者用途不同：
+///      * 要不要进**搜索索引**、心情能不能落库 —— 问的是"有没有文本可搜"，
+///        所以用这个（纯图片日记没有可检索的文字，索引一条空文本没有意义）；
+///      * 日历标不标记、统计算不算一篇 —— 问的是"算不算写过"，
+///        所以走 `has_content_sql()`。
+///    历史上两者是同一条规则，2026-09-21 加附件之后分开了，别再合并回去。
 pub fn has_content(content_md: &str) -> bool {
     // char::is_whitespace 覆盖空格、制表、换行、回车、垂直制表、换页，
     // 与上面的 SQL 字符集一一对应。
@@ -778,7 +961,7 @@ impl Vault {
         }
     }
 
-    /// 该日期是否已经"写过"（有正文内容）。
+    /// 该日期是否已经"写过"（正文非空，**或挂着图片附件**）。
     pub fn is_written(&self, date: &str) -> AppResult<bool> {
         validate_date(date)?;
         let sql = format!(
@@ -789,11 +972,358 @@ impl Vault {
         Ok(n != 0)
     }
 
+    // -----------------------------------------------------------------------
+    // 图片附件（P1 #10）
+    // -----------------------------------------------------------------------
+
+    /// 数据目录。由 `db_path` 倒推 —— 与 `change_password` 找那几个库外文件
+    /// 是同一套做法：本应用是**便携式**的，数据目录跟着 exe 走，没有全局变量可查。
+    fn data_dir(&self) -> AppResult<PathBuf> {
+        Ok(self
+            .db_path
+            .parent()
+            .ok_or_else(|| AppError::State("无法定位数据目录".into()))?
+            .to_path_buf())
+    }
+
+    /// 附件目录（`<数据目录>/attachments/`）。
+    fn attachments_dir(&self) -> AppResult<PathBuf> {
+        Ok(self.data_dir()?.join("attachments"))
+    }
+
+    /// 该日期那一篇是否挂着至少一张附件。日期没有对应行时是 `false`。
+    pub fn entry_has_attachment_on(&self, date: &str) -> AppResult<bool> {
+        validate_date(date)?;
+        let n: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attachment a
+                           JOIN entry e ON e.id = a.entry_id
+                           WHERE e.entry_date = ?1)",
+            params![date],
+            |r| r.get(0),
+        )?;
+        Ok(n != 0)
+    }
+
+    /// 取（必要时**新建**）某一天的 entry 行 id，供附件挂靠。
+    ///
+    /// 为什么允许建一行正文为空的 entry：用户 2026-09-21 拍板 ——
+    /// 在一篇还没写正文的日记里也允许插图片，并且**把附件也算作"写过"**
+    ///（见 `has_content_sql()`）。这两件事必须一起做，否则"图存下来了、
+    /// 这篇却不算写过"，统计和日历立刻自相矛盾。
+    ///
+    /// 用 `ON CONFLICT ... DO NOTHING` 而**不是** DO UPDATE：这里绝不能碰
+    /// 已有的正文 —— 它只是"把挂靠点准备好"，不是一次保存。
+    fn entry_id_ensuring(&self, date: &str) -> AppResult<i64> {
+        let now = now_iso();
+        self.conn.execute(
+            "INSERT INTO entry (notebook_id, entry_date, title, content_md, word_count, mood, created_at, updated_at)
+             VALUES (?1, ?2, '', '', 0, NULL, ?3, ?3)
+             ON CONFLICT(entry_date) DO NOTHING",
+            params![DEFAULT_NOTEBOOK_ID, date, now],
+        )?;
+        self.conn
+            .query_row(
+                "SELECT id FROM entry WHERE entry_date = ?1",
+                params![date],
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// 存一张图片：校验 → 算 sha256 → 落盘 → 插表。
+    ///
+    /// 落盘名字由 sha256 决定（`attachments/<sha256>.<ext>`），所以
+    /// **同一张图插两次只占一份磁盘**。但表里会有两条记录 —— 这是有意的：
+    /// 用户可能在不同位置引用同一张图，删掉其中一处时不该把文件也带走
+    ///（见 `delete_attachment`）。
+    ///
+    /// ⚠️ 落盘和插表**不能放进同一个事务**（文件系统不参与 SQLite 事务）。
+    ///    万一是"文件写成功、插表失败"，留下的就是一个孤儿文件 ——
+    ///    那正是「清理图片缓存」要清的东西，不会永远赖着。
+    pub fn save_attachment(
+        &self,
+        date: &str,
+        file_name: &str,
+        declared_mime: &str,
+        bytes: &[u8],
+    ) -> AppResult<Attachment> {
+        validate_date(date)?;
+        // 与 save_entry / 标签同口径：锁定的日记不接受任何修改。
+        if self.is_locked(date)? {
+            return Err(AppError::Validation(
+                "这篇日记已锁定，先解锁再插入图片".into(),
+            ));
+        }
+        if bytes.is_empty() {
+            return Err(AppError::Validation("这个文件是空的".into()));
+        }
+
+        let size = bytes.len() as u64;
+        if size > MAX_ATTACHMENT_BYTES {
+            return Err(AppError::Validation(format!(
+                "单张图片上限 {} MB，这张是 {} MB",
+                MAX_ATTACHMENT_BYTES / 1024 / 1024,
+                size / 1024 / 1024
+            )));
+        }
+        let (ext, mime) = validate_attachment(file_name, declared_mime, bytes)?;
+        let sha = sha256_hex(bytes);
+
+        let entry_id = self.entry_id_ensuring(date)?;
+
+        // 单篇总量闸。同一张图重复插入**不占新配额**（它不会写第二份文件），
+        // 否则"把同一张图插三次"就能绕过 50 MB 的上限。
+        let existing: i64 = self.conn.query_row(
+            "SELECT coalesce(sum(byte_size), 0) FROM attachment WHERE entry_id = ?1",
+            params![entry_id],
+            |r| r.get(0),
+        )?;
+        let already: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attachment WHERE entry_id = ?1 AND sha256 = ?2)",
+            params![entry_id, sha],
+            |r| r.get(0),
+        )?;
+        if already == 0 && existing as u64 + size > MAX_ENTRY_ATTACHMENT_BYTES {
+            return Err(AppError::Validation(format!(
+                "这一篇的图片总量已经到上限（{} MB）",
+                MAX_ENTRY_ATTACHMENT_BYTES / 1024 / 1024
+            )));
+        }
+
+        let stored_rel = format!("attachments/{sha}.{ext}");
+        let dir = self.attachments_dir()?;
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{sha}.{ext}"));
+        // 文件已经在（同一张图第二次插入）就直接复用，不重写：省一次 IO，
+        // 也免得把可能正被别处读取的文件截断。
+        if !path.is_file() {
+            std::fs::write(&path, bytes)?;
+        }
+
+        let now = now_iso();
+        self.conn.execute(
+            "INSERT INTO attachment (entry_id, file_name, stored_rel, mime, byte_size, sha256, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![entry_id, file_name, stored_rel, mime, size as i64, sha, now],
+        )?;
+        let id = self.conn.last_insert_rowid();
+
+        Ok(Attachment {
+            id,
+            file_name: file_name.to_string(),
+            stored_rel,
+            abs_path: path.to_string_lossy().to_string(),
+            mime,
+            byte_size: size as i64,
+            sha256: sha,
+            created_at: now,
+        })
+    }
+
+    /// 某一天的全部附件，按插入顺序（先插的在前面）。
+    pub fn list_attachments(&self, date: &str) -> AppResult<Vec<Attachment>> {
+        validate_date(date)?;
+        let data_dir = self.data_dir()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT a.id, a.file_name, a.stored_rel, a.mime, a.byte_size, a.sha256, a.created_at
+             FROM attachment a
+             JOIN entry e ON e.id = a.entry_id
+             WHERE e.entry_date = ?1
+             ORDER BY a.id ASC",
+        )?;
+        let rows = stmt.query_map(params![date], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })?;
+
+        // 路径解析失败的行（只可能是库被手工改过、`stored_rel` 里塞了 `..`）
+        // **跳过而不是整页报错** —— 少显示一张图，比让编辑器打不开好。
+        // 真正该被拒绝的访问由 `read_attachment` 挡。
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, file_name, stored_rel, mime, byte_size, sha256, created_at) = row?;
+            let Ok(path) = attachment_path(&data_dir, &stored_rel) else {
+                continue;
+            };
+            out.push(Attachment {
+                id,
+                file_name,
+                stored_rel,
+                abs_path: path.to_string_lossy().to_string(),
+                mime,
+                byte_size,
+                sha256,
+                created_at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 读一张图片的字节，返回 `(mime, bytes)`。
+    ///
+    /// 这是"图片从磁盘到界面"的**唯一出口**：所有访问都要过
+    /// `attachment_path` 的路径穿越检查，命令层还包着 `with_vault`
+    ///（未解锁一律拒绝）。
+    ///
+    /// 为什么不用 Tauri 的 `asset:` 协议让 WebView 自己读文件：本应用的
+    /// 数据目录是**便携式**的（跟着 exe 走，见 `commands::resolve_data_dir`），
+    /// 而协议的作用域是编译期写死在 `tauri.conf.json` 里的，覆盖不到运行时
+    /// 才知道的目录。改成后端读字节，顺带把"这条路径能不能读"收进了我们
+    /// 自己的校验里 —— 安全边界反而更清楚。
+    pub fn read_attachment(&self, id: i64) -> AppResult<(String, Vec<u8>)> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT stored_rel, mime FROM attachment WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let (stored_rel, mime) =
+            row.ok_or_else(|| AppError::Validation(format!("附件不存在（id={id}）")))?;
+
+        let path = attachment_path(&self.data_dir()?, &stored_rel)?;
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok((mime, bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(AppError::Validation(
+                "图片文件已经不在磁盘上了。可以在 设置 →【数据与备份】里点「清理图片缓存」把它清掉"
+                    .into(),
+            )),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// 删一条附件记录，并在**没有别的记录引用同一个文件**时把文件也删掉。
+    ///
+    /// 为什么不能直接删文件：同一张图可以挂在多处，它们共用
+    /// `attachments/<sha256>.<ext>` 这一个文件。删之前必须问一句"还有谁引用它"。
+    pub fn delete_attachment(&self, id: i64) -> AppResult<()> {
+        let data_dir = self.data_dir()?;
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT stored_rel, sha256 FROM attachment WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let (stored_rel, sha) =
+            row.ok_or_else(|| AppError::Validation(format!("附件不存在（id={id}）")))?;
+
+        self.conn
+            .execute("DELETE FROM attachment WHERE id = ?1", params![id])?;
+
+        let left: i64 = self.conn.query_row(
+            "SELECT count(*) FROM attachment WHERE sha256 = ?1",
+            params![sha],
+            |r| r.get(0),
+        )?;
+        if left == 0 {
+            let path = attachment_path(&data_dir, &stored_rel)?;
+            // 文件可能早就没了（手工删过、或上次清理过）—— 不算错：
+            // 目标状态本来就是"这个文件不存在"。
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// 清理图片缓存 —— 设置页【数据与备份】里那个按钮。
+    ///
+    /// 两个方向都清：
+    ///   ① 表里有记录、磁盘上文件没了 → 删记录（否则列表里永远挂着一张
+    ///      加载不出来的图，点一次报一次错）；
+    ///   ② 磁盘上有文件、表里没有任何记录 → 删文件，并把释放的字节数报出来。
+    ///
+    /// ⚠️ ② 是**无条件删掉 `attachments/` 里所有没人认领的文件**。这个目录是
+    ///    本应用自己的缓存目录（见 schema.rs：附件只放这里，绝不放桌面或文档
+    ///    根目录），所以"没人认领"就等于垃圾。而且它是用户主动点的按钮，
+    ///    不会在后台静默删东西。
+    ///
+    /// 为什么必须有它：删日记时附件**不会**自动删 —— 外键上的
+    /// `ON DELETE CASCADE` 只清表行，文件在磁盘上没人管。所以
+    /// "删完日记，图片在一次清理之后才消失"是有意设计的行为。
+    pub fn prune_orphan_attachments(&self) -> AppResult<PruneReport> {
+        let data_dir = self.data_dir()?;
+        let dir = self.attachments_dir()?;
+
+        let all: Vec<(i64, String)> = {
+            let mut stmt = self.conn.prepare("SELECT id, stored_rel FROM attachment")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut rows_removed = 0usize;
+        // 按**文件名**收集"还活着的文件"。不用完整路径：两边都是同一个目录
+        // 拼出来的，比字符串不容易被分隔符差异坑到。
+        let mut alive: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for (id, stored_rel) in &all {
+            match attachment_path(&data_dir, stored_rel) {
+                Ok(path) if path.is_file() => {
+                    if let Some(name) = path.file_name() {
+                        alive.insert(name.to_string_lossy().to_string());
+                    }
+                }
+                // 两种情况都留不住这条记录：路径非法（手工改过库）、
+                // 或文件已经不在磁盘上。⚠️ 非法路径那条**只删记录**，
+                // 绝不照着它去删任何文件 —— 那正是路径穿越想达到的效果。
+                _ => {
+                    self.conn
+                        .execute("DELETE FROM attachment WHERE id = ?1", params![id])?;
+                    rows_removed += 1;
+                }
+            }
+        }
+
+        let mut files_removed = 0usize;
+        let mut bytes_freed = 0u64;
+        if dir.is_dir() {
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                // 只清文件，不动任何子目录（本应用的附件是平铺的）。
+                if !path.is_file() {
+                    continue;
+                }
+                if let Some(name) = path.file_name() {
+                    if alive.contains(&name.to_string_lossy().to_string()) {
+                        continue;
+                    }
+                }
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                // 删不掉就跳过（文件被占用等）：下次再点还能试，
+                // 不该让整个操作失败 —— 前面已经删掉的记录不该被回滚。
+                if std::fs::remove_file(&path).is_ok() {
+                    files_removed += 1;
+                    bytes_freed += size;
+                }
+            }
+        }
+
+        Ok(PruneReport {
+            files_removed,
+            rows_removed,
+            bytes_freed,
+        })
+    }
+
     pub fn find_entry_by_date(&self, date: &str) -> AppResult<Option<Entry>> {
         let entry = self
             .conn
             .query_row(
-                "SELECT id, entry_date, title, content_md, word_count, mood, created_at, updated_at, locked
+                "SELECT id, entry_date, title, content_md, word_count, mood, created_at, updated_at, locked,
+                        EXISTS(SELECT 1 FROM attachment a WHERE a.entry_id = entry.id)
                  FROM entry WHERE entry_date = ?1",
                 params![date],
                 map_entry,
@@ -871,7 +1401,14 @@ impl Vault {
         // 只有"算写过"的日记才进搜索索引。
         // 否则用户顺手打的标题草稿会出现在搜索结果里，而日历上又不标记它 ——
         // 那种不一致比"搜不到"更让人困惑。
-        let indexed = has_content(content_md);
+        //
+        // ⚠️ 附件也算"写过"（见 `has_content_sql()`），所以这里要先问一次本篇
+        //    有没有图片：下面两张硬闸（心情能不能落库、要不要进索引）都挂在
+        //    `indexed` 上，问错了就会出现"图片在、心情却存不进去"或者
+        //    "日历上有标记、搜索结果里却没有"。
+        //    这**不是**"先查再插"（写库仍然是那一条 `ON CONFLICT`），
+        //    只是把判定要用的信息先取出来。
+        let indexed = has_content(content_md) || self.entry_has_attachment_on(date)?;
 
         // 硬闸：正文为空时心情不落库（理由见方法头注释）。
         // 就算前端异常多传了一个 mood，也只会在这一行被丢掉，
@@ -1158,7 +1695,7 @@ impl Vault {
              WHERE t.retired = 0
              GROUP BY t.id, t.name
              ORDER BY t.name COLLATE NOCASE ASC",
-            has_content_sql()
+            has_content_sql_for("e")
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], |r| {
@@ -2257,7 +2794,14 @@ fn map_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
     //    点一下日历就建了行）。这种行一旦被标记成锁定，那一天就**永远写不进
     //    第一个字** —— 用户看到的是"空日记也是锁着的"，而且怎么点都解不开。
     //    locked 只对"写过"的日记成立，判定规则和日历、搜索共用同一条。
-    let locked = r.get::<_, i64>(8)? != 0 && has_content(&content_md);
+    //
+    // ⚠️ 第 10 列（`has_attachment`）由**调用方的 SELECT** 提供，它和
+    //    `is_locked()` 用的是同一条"算写过"规则（正文非空 **或** 有附件）——
+    //    两边不一致的话，界面会显示成未锁定、后端却拒绝保存
+    //    （"这篇日记已锁定，先解锁再修改"）。目前只有一个调用方
+    //    `find_entry_by_date`，它的 SELECT 里已经带上了这一列。
+    let has_attachment = r.get::<_, i64>(9)? != 0;
+    let locked = r.get::<_, i64>(8)? != 0 && (has_content(&content_md) || has_attachment);
     Ok(Entry {
         id: r.get(0)?,
         entry_date: r.get(1)?,
@@ -3075,6 +3619,203 @@ mod tests {
         // 空串也一样 —— 有些工具会把"空值"存成空字符串而不是删掉这一行
         vault.set_setting(setting_keys::AUTO_LOCK_SECS, "").unwrap();
         assert_eq!(vault.get_settings().unwrap().auto_lock_secs, 600);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // 图片附件（P1 #10 / 指令 8）
+    // -----------------------------------------------------------------------
+
+    /// 一张"合法"的 PNG：只有文件头魔数是真的，后面随便填。
+    /// 我们不做真正的解码，判定的就是魔数 —— 所以这样够用。
+    fn png_bytes(tag: u8) -> Vec<u8> {
+        let mut v = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        v.extend_from_slice(&[tag; 32]);
+        v
+    }
+
+    /// 一个空的临时库（数据目录与库文件在同一个目录里，正是便携式的布局）。
+    fn temp_vault(name: &str) -> (PathBuf, Vault) {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let vault = Vault::create(&dir, "135790", None).unwrap();
+        (dir, vault)
+    }
+
+    #[test]
+    fn attachment_rejects_path_traversal_but_never_deletes_outside() {
+        let (dir, vault) = temp_vault("dsh-diary-attach-traversal");
+
+        // 制造"库被外部工具改过"的场景：直接塞一条 stored_rel 指向数据目录**外面**。
+        let entry_id = vault.save_entry("2026-09-21", "", "正文").unwrap().id;
+        vault
+            .conn()
+            .execute(
+                "INSERT INTO attachment (entry_id, file_name, stored_rel, mime, byte_size, sha256, created_at)
+                 VALUES (?1, 'x.png', '../../crypto_meta.json', 'image/png', 1, 'deadbeef', '2026-09-21T00:00:00Z')",
+                params![entry_id],
+            )
+            .unwrap();
+        let bad_id = vault.conn().last_insert_rowid();
+
+        // ① 读：必须被拒 —— 而不是把数据目录外面那个文件读出来
+        let err = vault.read_attachment(bad_id).unwrap_err();
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "路径穿越必须以 validation 拒绝，实际: {err:?}"
+        );
+
+        // ② 列表：跳过这条，但**不许**让整页报错 —— 少显示一张图好过编辑器打不开
+        let list = vault.list_attachments("2026-09-21").unwrap();
+        assert!(
+            list.iter().all(|a| a.id != bad_id),
+            "非法路径的附件不该出现在列表里"
+        );
+
+        // ③ 清理：只删记录，绝不顺着这条路径去删任何文件
+        let outside = dir.join("crypto_meta.json");
+        std::fs::write(&outside, "{\"kdf\":\"argon2id\"}").unwrap();
+        let report = vault.prune_orphan_attachments().unwrap();
+        assert_eq!(report.rows_removed, 1, "非法路径的记录应被清理掉");
+        assert!(
+            outside.is_file(),
+            "清理绝不能跟着 ../ 删到数据目录外面的文件"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attachment_dedups_by_sha256_and_refcounts_before_deleting() {
+        let (dir, vault) = temp_vault("dsh-diary-attach-dedup");
+        let bytes = png_bytes(1);
+
+        let a = vault
+            .save_attachment("2026-09-21", "猫.png", "image/png", &bytes)
+            .unwrap();
+        let b = vault
+            .save_attachment("2026-09-21", "同一张.png", "image/png", &bytes)
+            .unwrap();
+        assert_eq!(a.sha256, b.sha256);
+        assert_eq!(a.stored_rel, b.stored_rel, "同一张图应落到同一个文件");
+
+        let files: Vec<String> = std::fs::read_dir(dir.join("attachments"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(files.len(), 1, "同一张图只该占一份磁盘，实际: {files:?}");
+
+        // 删掉其中一条：文件还被另一条引用着，必须留住
+        vault.delete_attachment(a.id).unwrap();
+        let on_disk = dir.join("attachments").join(format!("{}.png", a.sha256));
+        assert!(on_disk.is_file(), "还有记录引用它时不能删文件");
+        assert_eq!(vault.list_attachments("2026-09-21").unwrap().len(), 1);
+
+        // 删掉最后一条：文件才消失
+        vault.delete_attachment(b.id).unwrap();
+        assert!(!on_disk.exists(), "没人引用了，文件该跟着走");
+        assert!(vault.list_attachments("2026-09-21").unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attachment_rejects_wrong_type_and_oversize() {
+        let (dir, vault) = temp_vault("dsh-diary-attach-limits");
+
+        // 扩展名不在白名单
+        let e = vault
+            .save_attachment("2026-09-21", "笔记.txt", "text/plain", b"hello")
+            .unwrap_err();
+        assert!(matches!(e, AppError::Validation(_)), "实际: {e:?}");
+
+        // 扩展名说是 png、内容却是纯文本 —— 魔数这一关必须拦住"改后缀名"
+        // ⚠️ 字节串字面量只能是 ASCII，中文得走字符串再 as_bytes()
+        let e = vault
+            .save_attachment("2026-09-21", "假图.png", "image/png", "这不是图片".as_bytes())
+            .unwrap_err();
+        assert!(matches!(e, AppError::Validation(_)), "实际: {e:?}");
+
+        // 内容确实是 PNG，但浏览器报的 MIME 对不上
+        let e = vault
+            .save_attachment("2026-09-21", "a.png", "image/jpeg", &png_bytes(2))
+            .unwrap_err();
+        assert!(matches!(e, AppError::Validation(_)), "实际: {e:?}");
+
+        // 空文件
+        let e = vault
+            .save_attachment("2026-09-21", "空.png", "image/png", b"")
+            .unwrap_err();
+        assert!(matches!(e, AppError::Validation(_)), "实际: {e:?}");
+
+        // 超过单张 20 MB
+        let mut big = png_bytes(3);
+        big.resize(MAX_ATTACHMENT_BYTES as usize + 1, 0);
+        let e = vault
+            .save_attachment("2026-09-21", "大图.png", "image/png", &big)
+            .unwrap_err();
+        assert!(matches!(e, AppError::Validation(_)), "实际: {e:?}");
+
+        // 被拒绝的上传不该留下任何痕迹：表里空、磁盘上也没文件、这天也不算写过
+        assert!(vault.list_attachments("2026-09-21").unwrap().is_empty());
+        assert!(
+            !vault.is_written("2026-09-21").unwrap(),
+            "全部被拒的日期不该算写过"
+        );
+        let n = std::fs::read_dir(dir.join("attachments"))
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(n, 0, "被拒绝的上传不该留下文件");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attachment_counts_as_written_and_prune_cleans_both_ways() {
+        let (dir, vault) = temp_vault("dsh-diary-attach-prune");
+        let bytes = png_bytes(4);
+
+        // 正文一个字都没写、只插了一张图 —— 用户 2026-09-21 拍板：这也算写过
+        let a = vault
+            .save_attachment("2026-09-21", "图.png", "image/png", &bytes)
+            .unwrap();
+        assert!(
+            vault.is_written("2026-09-21").unwrap(),
+            "只有附件的日记也要算写过"
+        );
+        assert!(vault
+            .written_dates("2026-09-01", "2026-09-30")
+            .unwrap()
+            .contains(&"2026-09-21".to_string()));
+        assert_eq!(vault.written_entry_count().unwrap(), 1);
+
+        let file = dir.join("attachments").join(format!("{}.png", a.sha256));
+        assert!(file.is_file());
+
+        // 删掉这一天（正文为空、只有附件）：表行被级联删掉，文件却没人管
+        vault.delete_entry("2026-09-21").unwrap();
+        assert!(
+            vault.list_attachments("2026-09-21").unwrap().is_empty(),
+            "外键 ON DELETE CASCADE 应清掉表行"
+        );
+        assert!(file.is_file(), "删日记不会自动删文件，要等一次「清理图片缓存」");
+
+        // 方向 ①：磁盘上有、表里没人认领 → 删文件
+        let report = vault.prune_orphan_attachments().unwrap();
+        assert_eq!(report.files_removed, 1);
+        assert!(!file.exists(), "清理之后文件才消失");
+        assert!(report.bytes_freed >= bytes.len() as u64);
+
+        // 方向 ②：表里有记录、磁盘上文件被手工删了 → 删记录
+        let b = vault
+            .save_attachment("2026-09-22", "图.png", "image/png", &bytes)
+            .unwrap();
+        std::fs::remove_file(dir.join("attachments").join(format!("{}.png", b.sha256))).unwrap();
+        let report = vault.prune_orphan_attachments().unwrap();
+        assert_eq!(report.rows_removed, 1, "文件没了的记录应被清掉");
+        assert!(vault.list_attachments("2026-09-22").unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

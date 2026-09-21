@@ -47,6 +47,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+
+# 附件（P1 #10）：文件名用 sha256 生成（同一张图插两次天然去重），
+# 中文文件名要经过 IPC 头传给后端时先做 base64。
+#
+# ⚠️ 为什么这两个能加：本机的构建环境**拉不到任何新依赖**（出网被拦，见生产日志
+#    的坑表），但这两个 crate **本来就在 Cargo.lock 里**（是别的依赖的传递依赖），
+#    .crate 文件也已经躺在本地 registry 缓存里 —— 所以声明为直接依赖是零下载的。
+#    想加"lockfile 里没有"的 crate，只能先在有网的机器上拉一次。
+sha2 = "0.10"
+base64 = "0.22"
 tauri-build = { version = "2", features = [] }
 thiserror = "2"
 directories = "6"

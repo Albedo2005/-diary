@@ -55,6 +55,13 @@ export interface AppStatus {
    * 前端不要自己拼一份，否则两处各算各的、迟早对不上。
    */
   export_default_dir: string;
+  /**
+   * 图片附件的缓存目录（`<数据目录>/attachments/`）。
+   *
+   * 设置页【数据与备份】用它显示「图片缓存位置」，并配一个「打开文件夹」。
+   * 附件是**明文**文件（用户已知风险），所以位置必须让用户看得见。
+   */
+  attachments_dir: string;
 }
 
 export interface Entry {
@@ -634,3 +641,99 @@ export const getSettings = () => invoke<AppSettings>("get_settings");
  */
 export const setAutoLockSecs = (secs: number) =>
   invoke<void>("set_auto_lock_secs", { secs });
+
+// ---------------------------------------------------------------------------
+// 图片附件（P1 #10）
+// ---------------------------------------------------------------------------
+
+/** 一条附件记录（只有元信息，没有字节）。与 Rust 的 `db::Attachment` 一一对应。 */
+export interface Attachment {
+  id: number;
+  /** 原文件名。只用于显示（正文里的 alt 文本），落盘名字是 sha256。 */
+  file_name: string;
+  /** 相对数据目录的路径，形如 `attachments/<sha256>.<ext>`。 */
+  stored_rel: string;
+  /** 绝对路径，由 `stored_rel` 推导（不入库）。 */
+  abs_path: string;
+  mime: string;
+  byte_size: number;
+  sha256: string;
+  created_at: string;
+}
+
+/** 「清理图片缓存」的结果。 */
+export interface PruneReport {
+  files_removed: number;
+  rows_removed: number;
+  bytes_freed: number;
+}
+
+/** 单张图片上限（字节）。与后端 `db::MAX_ATTACHMENT_BYTES` 保持一致。 */
+export const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+
+/**
+ * 允许的图片扩展名。**前端这一道只是提前拦一下**（省得白传 20 MB 出去），
+ * 真正的判据在后端：扩展名 + MIME + 文件头魔数，三样都要对上。
+ */
+export const IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp"];
+
+/** 文件名要走 IPC 请求头，而头里只能放 ASCII —— 所以先 base64，后端再解回来。 */
+function toBase64Ascii(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+/**
+ * 存一张图片。
+ *
+ * ⚠️ 这条**故意不像别的封装那样传对象**：图片字节走 Tauri 的 IPC **原始通道**
+ *    —— args 直接传 `Uint8Array`，Tauri 就把整个 body 当作
+ *    `application/octet-stream` 发过来；其余三个参数走请求头。
+ *    要是把 `Uint8Array` 夹在对象里，Tauri 会先 `Array.from()` 成"两千万个
+ *    数字的数组"，20 MB 的图立刻变得不可用（见 commands.rs 里同名的说明）。
+ *
+ * 前端拿不到用户选中文件的**绝对路径**（WebView 不给），所以只能把字节传过去。
+ * 这也正好：后端要的本来就是"字节"，路径反而没有意义。
+ */
+export async function saveAttachment(
+  date: string,
+  file: File
+): Promise<Attachment> {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  return invoke<Attachment>("save_attachment", bytes, {
+    headers: {
+      "x-diary-date": date,
+      "x-diary-mime": file.type || "",
+      "x-diary-name": toBase64Ascii(file.name),
+    },
+  });
+}
+
+/** 某一天的全部附件（不含字节）。 */
+export const listAttachments = (date: string) =>
+  invoke<Attachment[]>("list_attachments", { date });
+
+/**
+ * 读一张图片的字节，返回可以直接 `URL.createObjectURL` 的 Blob。
+ *
+ * 后端回的是原始字节（`tauri::ipc::Response` → 前端拿到 `ArrayBuffer`），
+ * 全程不走 base64、也不进 JSON。`mime` 由调用方带上（从 `listAttachments`
+ * 的结果里来）—— 这条命令只回字节，因为响应体只能装一样东西。
+ */
+export async function readAttachmentBlob(
+  id: number,
+  mime: string
+): Promise<Blob> {
+  const buf = await invoke<ArrayBuffer>("read_attachment", { id });
+  return new Blob([buf], { type: mime || "application/octet-stream" });
+}
+
+/** 删一张图片（删记录，并在没有别的记录引用同一份文件时把文件也删掉）。 */
+export const deleteAttachment = (id: number) =>
+  invoke<void>("delete_attachment", { id });
+
+/** 清理图片缓存：清掉孤儿文件与失效记录。 */
+export const pruneOrphanAttachments = () =>
+  invoke<PruneReport>("prune_orphan_attachments");

@@ -22,18 +22,25 @@
  */
 import { computed, nextTick, onUnmounted, ref, watch } from "vue";
 import {
+  deleteAttachment,
   deleteEntry,
-  retireTag,
+  IMAGE_EXTS,
+  listAttachments,
   listTags,
   lockAllEntries,
+  MAX_IMAGE_BYTES,
   MOODS,
   openEntry,
+  readAttachmentBlob,
+  retireTag,
+  saveAttachment,
   saveEntry,
   setEntryLocked,
   setEntryTags,
   TAG_MAX_CHARS,
   tagsOfEntry,
   toAppError,
+  type Attachment,
   type Entry,
   type TagStat,
 } from "../api";
@@ -135,6 +142,32 @@ const pendingDelete = ref<TagStat | null>(null);
 const panelRef = ref<HTMLElement | null>(null);
 const triggerRef = ref<HTMLElement | null>(null);
 
+// ── 图片附件（P1 #10）──────────────────────────────────────────────────────
+/** 本篇的附件（只有元信息）。缩略图区按这个列表排。 */
+const attachments = ref<Attachment[]>([]);
+
+/**
+ * 附件 id → 已经取回来的图片地址（Blob URL）。
+ *
+ * 缓存的意义：同一张图既要在缩略图区显示、又要在放大浮层里显示，
+ * 不缓存就每次点开都重新读一遍磁盘、重建一个 URL。
+ *
+ * ⚠️ Blob URL 会一直占着内存，必须显式 revoke：换日期、卸载组件都要
+ *    （见 `releaseImageUrls`），否则每翻一天就漏一批。
+ */
+const imageUrls = ref<Record<number, string>>({});
+/** 正在传图片（按钮转"正在上传…"、并挡住重复点击）。 */
+const imageBusy = ref(false);
+const imageError = ref("");
+/** 被放大查看的那张图（`null` = 浮层关着）。 */
+const zoomed = ref<{ url: string; name: string } | null>(null);
+/** 隐藏的 `<input type="file">`：点「插入图片」时由代码去点它。 */
+const filePicker = ref<HTMLInputElement | null>(null);
+/** 正文输入框。插入图片语法时要往光标处塞，所以必须拿得到它。 */
+const contentRef = ref<HTMLTextAreaElement | null>(null);
+/** 有文件拖到正文上方（用来高亮一下，否则用户不知道"能不能放这里"）。 */
+const dragging = ref(false);
+
 /**
  * 标签区是否可编辑。
  *
@@ -225,14 +258,19 @@ let syncedTags: string[] = [];
 let tagInflight = false;
 
 /**
- * 这篇日记算不算"写过"（正文非空白）。
+ * 这篇日记算不算"写过"。
  *
- * ⚠️ 必须与后端 `db::HAS_CONTENT_SQL` 保持完全一致，否则会出现
+ * ⚠️ 必须与后端 `db::has_content_sql()` 保持完全一致，否则会出现
  *    "编辑器认为写过、日历认为没写"这类界面自相矛盾的状态。
- *    刻意只留正文、不看标题：只打了标题没写正文不算写完一篇。
+ *
+ * 2026-09-21 起它包含两半：**正文非空白，或者这篇已经挂着图片附件**。
+ * 后端同一天也改成了同一条规则（用户拍板：允许在一篇还没写正文的日记里插
+ * 图片，并且把附件也算作"写过"）。所以这里必须跟着改 —— 否则一篇只有图片的
+ * 日记会出现"日历上有标记、心情和标签却点不动"。
+ * 刻意只留正文和附件、不看标题：只打了标题没写正文不算写完一篇。
  */
 function hasContent(): boolean {
-  return content.value.trim().length > 0;
+  return content.value.trim().length > 0 || attachments.value.length > 0;
 }
 
 /** 数据库里是否已经存在这一行。 */
@@ -288,6 +326,9 @@ async function load() {
     tagInput.value = "";
     panelOpen.value = false;
     pendingDelete.value = null;
+    // 附件同理：先清空（连同已经建好的 Blob URL 一起释放），再读这一天的。
+    // 读失败时宁可"看不到图"，也不能把上一天的图留在屏幕上冒充这一天的。
+    await loadAttachments();
     await loadTags();
     dirty = false;
     saveState.value = "";
@@ -395,6 +436,229 @@ async function flush(forDate: string = props.date) {
  * 再点同一个档位 = 取消标记（传 null）。
  * 正文为空时直接返回 —— 按钮本来就是禁用的，这里是第二道闸。
  */
+// ── 图片附件（P1 #10）──────────────────────────────────────────────────────
+
+/**
+ * 放掉所有已经建好的 Blob URL。
+ *
+ * ⚠️ 必须显式 revoke：Blob URL 会让那份数据一直留在内存里，浏览器不会
+ *    因为"没人引用了"就回收。换日期、卸载组件都要调（否则每翻一天漏一批）。
+ */
+function releaseImageUrls() {
+  for (const url of Object.values(imageUrls.value)) URL.revokeObjectURL(url);
+  imageUrls.value = {};
+}
+
+/** 取某张图的显示地址；没取过就去后端读一次并缓存。 */
+async function urlOf(a: Attachment): Promise<string | null> {
+  const cached = imageUrls.value[a.id];
+  if (cached) return cached;
+  try {
+    const blob = await readAttachmentBlob(a.id, a.mime);
+    const url = URL.createObjectURL(blob);
+    imageUrls.value = { ...imageUrls.value, [a.id]: url };
+    return url;
+  } catch (e) {
+    // 单张读不出来不该让整块区域炸掉：记一句话，其余照常显示。
+    imageError.value = toAppError(e).message;
+    return null;
+  }
+}
+
+/** 读这一天的附件列表。 */
+async function loadAttachments() {
+  releaseImageUrls();
+  zoomed.value = null;
+  imageError.value = "";
+  try {
+    attachments.value = await listAttachments(props.date);
+    // 顺手把缩略图取回来：一篇日记通常只有几张图，界面上就该一眼看到。
+    for (const a of attachments.value) void urlOf(a);
+  } catch (e) {
+    attachments.value = [];
+    imageError.value = toAppError(e).message;
+  }
+}
+
+/** 打开文件选择框（锁定 / 正在上传时不给点）。 */
+function pickImage() {
+  if (locked.value || imageBusy.value) return;
+  filePicker.value?.click();
+}
+
+/**
+ * 存一张图，成功后把它插进正文。
+ *
+ * 顺序很关键：**先落库、再改正文**。反过来的话，一旦上传失败，正文里就留下
+ * 一行指不到任何文件的 `![](...)`。
+ *
+ * 为什么用原生 `<input type="file">` 而不是 Tauri 的 dialog 插件：
+ * 这个项目的构建环境**拉不到任何新依赖**，而这里真正需要的只是"字节"
+ * （`save_attachment` 要的就是字节，不是路径），原生选择框直接给 `File`
+ * 对象（名字 + 字节），弹的也还是系统文件选择框 —— 体验一样，
+ * 却不需要多一个插件（见生产日志的坑表）。
+ */
+async function uploadOne(file: File) {
+  imageError.value = "";
+  if (locked.value) {
+    imageError.value = "这篇日记已锁定，先解锁再插入图片";
+    return;
+  }
+
+  // 前端先把最明显的两类错误挡掉（省得白传一份出去）。真正的判据在后端：
+  // 扩展名 + MIME + 文件头魔数，三样都要对上。
+  const ext = (file.name.split(".").pop() ?? "").toLowerCase();
+  if (!IMAGE_EXTS.includes(ext)) {
+    imageError.value = `只支持 ${IMAGE_EXTS.join(" / ")}，这个是 ${
+      ext ? "." + ext : "(没有后缀的文件)"
+    }`;
+    return;
+  }
+  if (file.size > MAX_IMAGE_BYTES) {
+    imageError.value = `单张图片上限 ${MAX_IMAGE_BYTES / 1024 / 1024} MB，这张是 ${(
+      file.size /
+      1024 /
+      1024
+    ).toFixed(1)} MB`;
+    return;
+  }
+
+  imageBusy.value = true;
+  try {
+    const saved = await saveAttachment(props.date, file);
+    attachments.value = [...attachments.value, saved];
+    // 立刻把缩略图取回来，不然要等下次打开这一天才看得见。
+    await urlOf(saved);
+    insertImageSyntax(saved);
+    emit("notice", `已插入图片「${saved.file_name}」`);
+  } catch (e) {
+    imageError.value = toAppError(e).message;
+  } finally {
+    imageBusy.value = false;
+  }
+}
+
+/** 文件选择框 / 拖拽的公共入口，支持一次选多张。 */
+async function uploadFiles(files: FileList | File[] | null) {
+  if (!files) return;
+  for (const f of Array.from(files)) {
+    // **串行**：并发上传时两条记录的自增 id 顺序会和用户选的顺序错开，
+    // 插进正文的顺序也跟着乱。
+    await uploadOne(f);
+  }
+}
+
+/** 把图片语法插到正文光标处（正文永远是 Markdown 原文，这是 V1 约束）。 */
+function insertImageSyntax(a: Attachment) {
+  const syntax = `![${a.file_name}](${a.stored_rel})`;
+  const el = contentRef.value;
+  if (!el) {
+    // 拿不到输入框（极罕见）就追加到末尾，至少别把这张图丢掉。
+    const sep = content.value && !content.value.endsWith("\n") ? "\n" : "";
+    content.value = `${content.value}${sep}${syntax}\n`;
+    return;
+  }
+
+  const start = el.selectionStart ?? content.value.length;
+  const end = el.selectionEnd ?? start;
+  const before = content.value.slice(0, start);
+  const after = content.value.slice(end);
+  // 图片**单独占一行**（用户明确要的排版）：前后各补一个换行，
+  // 已经在行首 / 行尾就不补。
+  const lead = before && !before.endsWith("\n") ? "\n" : "";
+  const tail = after === "" || after.startsWith("\n") ? "" : "\n";
+  content.value = `${before}${lead}${syntax}${tail}${after}`;
+
+  const caret = (before + lead + syntax).length;
+  void nextTick(() => {
+    el.focus();
+    el.setSelectionRange(caret, caret);
+  });
+}
+
+/** 文件选择框选中之后：交给公共上传流程，然后把选择框清空。 */
+function onFilesPicked(ev: Event) {
+  const input = ev.target as HTMLInputElement;
+  void uploadFiles(input.files).finally(() => {
+    // ⚠️ 必须清空：不清空的话，第二次选**同一个文件**不会再触发 change
+    //    （值没变），用户会以为按钮坏了。
+    input.value = "";
+  });
+}
+
+/** 有文件拖到编辑区上方。用来高亮一下提示"可以放这里"。 */
+function onDragOver(ev: DragEvent) {
+  if (locked.value) return;
+  if (ev.dataTransfer?.types.includes("Files")) {
+    // 不 preventDefault 的话浏览器会把这次拖拽当成"打开这个文件"，
+    // 整个页面被那张图替换掉。
+    ev.preventDefault();
+    dragging.value = true;
+  }
+}
+
+function onDragLeave() {
+  dragging.value = false;
+}
+
+async function onDrop(ev: DragEvent) {
+  dragging.value = false;
+  if (locked.value) return;
+  const files = ev.dataTransfer?.files;
+  if (!files || files.length === 0) return;
+  ev.preventDefault();
+  await uploadFiles(files);
+}
+
+/** 删一张图。 */
+async function removeAttachment(a: Attachment) {
+  imageError.value = "";
+  try {
+    await deleteAttachment(a.id);
+    const url = imageUrls.value[a.id];
+    if (url) {
+      URL.revokeObjectURL(url);
+      const rest = { ...imageUrls.value };
+      delete rest[a.id];
+      imageUrls.value = rest;
+    }
+    if (url && zoomed.value?.url === url) zoomed.value = null;
+    attachments.value = attachments.value.filter((x) => x.id !== a.id);
+    // ⚠️ 正文里那行 `![](...)` **刻意不动**：那是用户自己写的东西，
+    //    悄悄改他的正文比留一行失效的引用更糟。所以提示里要说清楚。
+    emit(
+      "notice",
+      `已删除图片「${a.file_name}」（正文里那行图片语法还在，可以自己删掉）`
+    );
+  } catch (e) {
+    imageError.value = toAppError(e).message;
+  }
+}
+
+/** 点缩略图：取到地址后在中间放大显示。 */
+async function zoomIn(a: Attachment) {
+  const url = await urlOf(a);
+  if (url) zoomed.value = { url, name: a.file_name };
+}
+
+function closeZoom() {
+  zoomed.value = null;
+}
+
+function onZoomKeydown(ev: KeyboardEvent) {
+  if (ev.key === "Escape") closeZoom();
+}
+
+/**
+ * 放大浮层开着的时候才挂 Esc 监听，关掉立刻摘掉 —— 与标签面板同一套作业，
+ * 不留常驻的全局监听。
+ */
+watch(zoomed, (open, _old, onCleanup) => {
+  if (!open) return;
+  document.addEventListener("keydown", onZoomKeydown);
+  onCleanup(() => document.removeEventListener("keydown", onZoomKeydown));
+});
+
 function pickMood(value: number) {
   if (!canMarkMood.value) return;
   mood.value = mood.value === value ? null : value;
@@ -749,6 +1013,8 @@ onUnmounted(() => {
   // 面板的全局监听也要摘掉，避免反复挂载累积。
   document.removeEventListener("pointerdown", onDocPointerDown, true);
   document.removeEventListener("keydown", onDocKeydown);
+  // 图片的 Blob URL 也要放掉，否则每换一天就漏一批内存。
+  releaseImageUrls();
   // 组件卸载前把未落库的内容写下去。
   if (dirty) void flush();
 });
@@ -764,15 +1030,43 @@ onUnmounted(() => {
           saveLabel
         }}</span>
       </div>
-      <button
-        class="toggle"
-        :class="{ on: locked }"
-        :title="locked ? '解锁后可继续修改' : '锁定后正文只读，排版原样保留'"
-        @click="toggleLock"
-      >
-        {{ locked ? "🔒 已锁定" : "🔓 锁定" }}
-      </button>
+      <div class="right">
+        <!--
+          插入图片。原生 <input type="file">（隐藏）配一个普通按钮去点它 ——
+          不用 Tauri 的 dialog 插件，理由见 uploadOne 的注释。
+          锁定时禁用：后端也会拒（附件的写操作与正文同口径）。
+        -->
+        <button
+          class="toggle"
+          :disabled="locked || imageBusy"
+          :title="locked ? '这篇日记已锁定，先解锁' : '插入一张图片（也可以直接把图片拖进正文）'"
+          @click="pickImage"
+        >
+          {{ imageBusy ? "正在上传…" : "🖼 插入图片" }}
+        </button>
+        <button
+          class="toggle"
+          :class="{ on: locked }"
+          :title="locked ? '解锁后可继续修改' : '锁定后正文只读，排版原样保留'"
+          @click="toggleLock"
+        >
+          {{ locked ? "🔒 已锁定" : "🔓 锁定" }}
+        </button>
+      </div>
     </header>
+
+    <!--
+      隐藏的文件选择框。它只是个"由代码点的按钮"，不参与版面。
+      accept 让系统选择框默认只列图片；multiple 允许一次选多张。
+    -->
+    <input
+      ref="filePicker"
+      class="file-picker"
+      type="file"
+      accept="image/png,image/jpeg,image/gif,image/webp"
+      multiple
+      @change="onFilesPicked"
+    />
 
     <p v-if="errorText" class="error">{{ errorText }}</p>
 
@@ -969,23 +1263,75 @@ onUnmounted(() => {
       <p v-if="tagError" class="error">{{ tagError }}</p>
 
       <!--
+        附件缩略图区（P1 #10）。
+        ⚠️ **单独占一行**：正文里只保留 Markdown 语法，图片不挤进正文的排版里
+          （"正文永远是 Markdown 原文"是 V1 约束，这一条让不了步）。
+        点缩略图在中间放大看；点右上角 × 删掉这张图。⚠️ 删图**不动正文里那行
+        语法** —— 那是用户自己写的东西，悄悄改它比留一行失效引用更糟。
+      -->
+      <div v-if="attachments.length > 0" class="shot-row">
+        <span v-for="a in attachments" :key="a.id" class="shot">
+          <button
+            type="button"
+            class="shot-img"
+            :title="`点击放大：${a.file_name}`"
+            @click="zoomIn(a)"
+          >
+            <img
+              v-if="imageUrls[a.id]"
+              :src="imageUrls[a.id]"
+              :alt="a.file_name"
+            />
+            <span v-else class="shot-loading">…</span>
+          </button>
+          <button
+            type="button"
+            class="shot-x"
+            :disabled="locked"
+            :title="
+              locked ? '这篇日记已锁定，先解锁' : `删除图片「${a.file_name}」`
+            "
+            @click="removeAttachment(a)"
+          >
+            ×
+          </button>
+        </span>
+      </div>
+
+      <p v-if="imageError" class="error">{{ imageError }}</p>
+
+      <!--
         锁定与编辑共用同一个 textarea，**刻意不切换成渲染视图**。
         看得见的就是将要保存的原文：换行、空格、缩进全部原样，
         所以"锁定"不会改变排版。只读靠 readonly（不是 disabled）——
         disabled 的输入框不能选中、不能滚动，想复制一段都做不到。
       -->
       <textarea
+        ref="contentRef"
         v-model="content"
         class="content-input"
-        :class="{ locked }"
+        :class="{ locked, dragging }"
         placeholder="今天发生了什么…"
         spellcheck="false"
         :readonly="locked"
         @compositionstart="onCompositionStart"
         @compositionend="onCompositionEnd"
         @keydown="onKeydown"
+        @dragover="onDragOver"
+        @dragleave="onDragLeave"
+        @drop="onDrop"
       />
     </template>
+
+    <!--
+      放大查看：应用内居中浮层（点空白处 / 按 Esc 关闭）。
+      刻意**不**另开一个系统窗口 —— 那要注册新的 webview 窗口和对应权限，
+      而这里要的只是"把这张图看清楚"。
+    -->
+    <div v-if="zoomed" class="zoom-mask" @click="closeZoom">
+      <img class="zoom-img" :src="zoomed.url" :alt="zoomed.name" @click.stop />
+      <p class="zoom-tip">{{ zoomed.name }} ·（点空白处或按 Esc 关闭）</p>
+    </div>
   </section>
 </template>
 
@@ -1403,5 +1749,127 @@ onUnmounted(() => {
 .error {
   color: var(--danger);
   margin-bottom: 10px;
+}
+
+/* ── 图片附件（P1 #10）───────────────────────────────────────────────── */
+
+/* 头部右侧：「插入图片」和「锁定」排在一起。 */
+.right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 隐藏的文件选择框。它只是个"由代码点的按钮"，不参与版面。 */
+.file-picker {
+  display: none;
+}
+
+/* 附件缩略图区：**单独一行**，横向排，放不下就换行。 */
+.shot-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.shot {
+  position: relative;
+  display: inline-flex;
+}
+
+.shot-img {
+  width: 84px;
+  height: 84px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.shot-img:hover {
+  border-color: var(--accent);
+}
+
+.shot-img img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.shot-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  color: var(--text-3);
+}
+
+/* 删除键贴在缩略图右上角（与标签 chip 的 × 同一套观感）。 */
+.shot-x {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.shot-x:hover:not(:disabled) {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.shot-x:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* 有文件拖到正文上方时给它一圈提示 —— 否则用户不知道"这里能放"。 */
+.content-input.dragging {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* 放大查看：铺满窗口的遮罩 + 居中大图（点遮罩关，点图不关）。 */
+.zoom-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 4vh 4vw;
+  background: rgba(0, 0, 0, 0.72);
+  cursor: zoom-out;
+}
+
+.zoom-img {
+  max-width: 100%;
+  max-height: 84vh;
+  object-fit: contain;
+  border-radius: 6px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  cursor: default;
+}
+
+.zoom-tip {
+  margin: 0;
+  font-size: 12px;
+  color: #fff;
+  opacity: 0.85;
 }
 </style>

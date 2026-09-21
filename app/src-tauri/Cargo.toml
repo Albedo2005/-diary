@@ -43,6 +43,13 @@ jieba-rs = { workspace = true }
 # instead of a raw driver error.
 thiserror = { workspace = true }
 
+# Attachments (P1 #10): sha256 names the stored file (so the same image inserted
+# twice is stored once), base64 carries the original file name through an IPC
+# header. Both are already in the lockfile as transitive dependencies -- that
+# matters because this machine cannot fetch new crates at all.
+sha2 = { workspace = true }
+base64 = { workspace = true }
+
 # NOTE: the `directories` crate was removed on purpose.
 # The app is portable: its data lives in a `data/` folder found by walking up
 # from the executable, not in the platform AppData directory. See
