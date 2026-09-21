@@ -455,6 +455,7 @@ onUnmounted(() => {
             :tag-token="tagToken"
             @saved="onSaved"
             @tags-changed="onTagsChanged"
+            @notice="flash"
           />
         </template>
         <div v-else class="search-wrap">

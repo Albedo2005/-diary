@@ -23,6 +23,7 @@
 import { computed, nextTick, onUnmounted, ref, watch } from "vue";
 import {
   deleteEntry,
+  deleteTag,
   listTags,
   lockAllEntries,
   MOODS,
@@ -53,6 +54,8 @@ const emit = defineEmits<{
   (e: "saved"): void;
   /** 本组件的标签改动也要让侧栏的标签列表知道（篇数变了）。 */
   (e: "tags-changed"): void;
+  /** 给用户的一句话反馈（由 App.vue 弹 toast）—— 与侧栏走同一条通道。 */
+  (e: "notice", message: string): void;
 }>();
 
 /**
@@ -120,6 +123,14 @@ const allTags = ref<TagStat[]>([]);
 const panelOpen = ref(false);
 const tagError = ref("");
 
+/**
+ * 待确认删除的标签（null = 没有）。
+ *
+ * 「其他」组 chip 上那个 × **不直接删** —— 先把目标放这儿，面板底部弹出
+ * 一条确认。理由见 confirmDelete()。
+ */
+const pendingDelete = ref<TagStat | null>(null);
+
 /** 面板容器 / ＋ 触发按钮，用于判断"点面板外关闭"。 */
 const panelRef = ref<HTMLElement | null>(null);
 const triggerRef = ref<HTMLElement | null>(null);
@@ -173,6 +184,21 @@ const moodHint = computed(() => {
 const otherTags = computed(() =>
   allTags.value.filter((t) => !PRESET_TAGS.includes(t.name))
 );
+
+/**
+ * 确认条上的那句话：把"会影响几篇日记"如实说清楚。
+ *
+ * 删除标签**碰不到正文**（外键方向是 tag → entry_tag，级联只清关联行），
+ * 但用户看见"删除"两个字，第一反应就是"我的日记呢" —— 必须当场说明。
+ * 篇数取自 `TagStat.entry_count`（后端按"写过"统计），前端不另算一份。
+ */
+const deleteHint = computed(() => {
+  const t = pendingDelete.value;
+  if (!t) return "";
+  return t.entry_count > 0
+    ? `删除标签「${t.name}」？它正被 ${t.entry_count} 篇日记使用，删除后这些日记将失去该标签（日记正文不受影响）。`
+    : `删除标签「${t.name}」？目前没有日记在用它。`;
+});
 
 /**
  * 分类：某标签当前是否挂在这一篇上。面板 chip 的选中态用它。
@@ -260,6 +286,7 @@ async function load() {
     syncedTags = [];
     tagInput.value = "";
     panelOpen.value = false;
+    pendingDelete.value = null;
     await loadTags();
     dirty = false;
     saveState.value = "";
@@ -482,11 +509,74 @@ function addTag(raw: string) {
   void syncTags();
 }
 
-/** chip × ：移除一个标签。 */
+/** chip × ：把标签从**这一篇**上撤掉（标签本身还留在库里）。 */
 function removeTag(name: string) {
   if (!canTag.value) return;
   tags.value = tags.value.filter((t) => t !== name);
   void syncTags();
+}
+
+/**
+ * 「其他」组的 × ：请求删除一个**自己写的**标签（连库一起删）。
+ *
+ * ⚠️ 和 removeTag 是两件事，别混：
+ *    - removeTag = 只把标签从这一篇上摘掉，标签本身留在库里；
+ *    - askDelete = 把标签从**整库**删掉（所有日记都不再挂它）。
+ *    前者是日常编辑，后者是不可逆的管理动作，所以后者要过一道确认。
+ *
+ * 为什么只有这一组的 chip 有 ×：预设名单是**前端常量**、根本没进库，
+ * 没有可删的东西；而"其他"里的每一个都是用户自己敲出来的 ——
+ * 打错一个（"旅游" 与 "旅行" 会各占一个标签）或过阵子不想要了，
+ * 应该能就地清掉，不必专门跑一趟侧栏。这正是本次增强要解的结。
+ */
+function askDelete(t: TagStat) {
+  pendingDelete.value = t;
+}
+
+function cancelDelete() {
+  pendingDelete.value = null;
+}
+
+/**
+ * 确认删除：把标签从库里删掉。
+ *
+ * 后端 `delete_tag` 只做 `DELETE FROM tag`，挂着的关联行交给
+ * `ON DELETE CASCADE`（连接已开 foreign_keys）—— **正文一行都不碰**。
+ * 它返回受影响的关联行数，用来在提示里答"几篇日记失去了它"。
+ *
+ * 后端是幂等的（删不存在的标签不报错），连点两下不会出错。
+ */
+async function confirmDelete() {
+  const t = pendingDelete.value;
+  if (!t) return;
+  try {
+    const affected = await deleteTag(t.id);
+    /*
+      这个标签可能正挂在本篇上。库里那条 entry_tag 已随级联删掉了，
+      所以本地这两份状态必须**同步摘掉** ——
+      否则下一次 syncTags() 会拿着旧名单去提交，而 set_entry_tags 遇到
+      库里不存在的名字会**新建**一个同名标签，等于刚删掉的又长了回来。
+    */
+    if (tags.value.includes(t.name)) {
+      tags.value = tags.value.filter((n) => n !== t.name);
+    }
+    syncedTags = syncedTags.filter((n) => n !== t.name);
+    pendingDelete.value = null;
+    // 候选变了（被删的那个从「其他」里消失），重读全库标签。
+    allTags.value = await listTags();
+    // 与侧栏删除同一句话：先答"我的日记呢"，再报篇数。
+    emit(
+      "notice",
+      affected > 0
+        ? `已删除标签「${t.name}」——${affected} 篇日记的标签被移除，内容未受影响`
+        : `已删除标签「${t.name}」（本来就没有日记在用它）`
+    );
+    // 侧栏那份标签列表要跟着变。
+    emit("tags-changed");
+  } catch (e) {
+    tagError.value = toAppError(e).message;
+    pendingDelete.value = null;
+  }
 }
 
 function togglePanel() {
@@ -496,6 +586,9 @@ function togglePanel() {
 
 function closePanel() {
   panelOpen.value = false;
+  // 关面板时顺手把悬着的删除确认撤掉：换一篇日记 / 点别处再回来，
+  // 不该看到一条"上回没确认完"的问句。
+  pendingDelete.value = null;
 }
 
 /**
@@ -512,9 +605,19 @@ function onDocPointerDown(ev: PointerEvent) {
   closePanel();
 }
 
-/** 按 Esc 关闭面板。 */
+/**
+ * 按 Esc：**先撤删除确认，再关面板**。
+ *
+ * 顺序有讲究：确认条已经弹出来了，用户按 Esc 十有八九是想反悔，
+ * 而不是想把整个面板收走 —— 一下关掉会让人以为"刚才那一删执行了"。
+ */
 function onDocKeydown(ev: KeyboardEvent) {
-  if (ev.key === "Escape" && panelOpen.value) closePanel();
+  if (ev.key !== "Escape") return;
+  if (pendingDelete.value) {
+    cancelDelete();
+    return;
+  }
+  if (panelOpen.value) closePanel();
 }
 
 /**
@@ -711,8 +814,13 @@ onUnmounted(() => {
       </div>
 
       <!--
-        标签区：已挂的标签是 chip（点 × 移除），末尾一个 ＋ 按钮弹出面板。
-        面板分三块 —— 常用（预设名单）/ 其他（用户自己写过的）/ 新建输入框。
+        标签区：已挂的标签是 chip（点 × 把它从**本篇**撤掉），
+        末尾一个 ＋ 按钮弹出面板。
+        面板分三块 —— 常用（预设名单）/ 其他（用户自己写过的，每个带一个
+        × 可**从库里删除**）/ 新建输入框。
+
+        ⚠️ 两种 × 不是一回事：chip 行那个只把标签从本篇摘掉；面板「其他」组
+           那个是删整库、且删前要过一条确认。见 removeTag / askDelete 的注释。
 
         ⚠️ 正文为空 / 已锁定时整个区置灰，并把原因写在旁边（tagHint）——
            "为什么点不动"必须当场说清楚，否则用户只会觉得按钮坏了。
@@ -775,17 +883,65 @@ onUnmounted(() => {
           <div class="panel-group">
             <div class="panel-label">其他</div>
             <div class="panel-chips">
-              <button
+              <span v-if="otherTags.length === 0" class="panel-empty">
+                你写的标签会出现在这里（点 × 可删除）
+              </span>
+              <!--
+                「其他」组用**可删除**的 chip：药丸里再切一小块当删除键。
+                ⚠️ <button> 不能嵌 <button>（HTML 不允许，行为也不可预期），
+                   所以外层用 <span> 承载边框与圆角，里面放两个并列的按钮。
+              -->
+              <span
                 v-for="t in otherTags"
                 :key="t.id"
-                type="button"
-                class="panel-chip"
+                class="panel-tag"
                 :class="{ on: isSelected(t.name) }"
-                @click="toggleTag(t.name)"
               >
-                {{ t.name }}
-              </button>
+                <button
+                  type="button"
+                  class="panel-tag-name"
+                  :title="
+                    isSelected(t.name) ? '从这篇日记上撤掉' : '贴到这篇日记上'
+                  "
+                  @click="toggleTag(t.name)"
+                >
+                  {{ t.name }}
+                </button>
+                <button
+                  type="button"
+                  class="panel-tag-x"
+                  :title="`删除标签「${t.name}」（只清标签，日记内容不受影响）`"
+                  @click="askDelete(t)"
+                >
+                  ×
+                </button>
+              </span>
             </div>
+          </div>
+
+          <!--
+            删除确认条。
+            ⚠️「其他」组的 × **不直接删库** —— 那是个不可逆的管理动作，
+               而它就贴在一排可点的 chip 旁边，误触的代价（几十篇日记失去标签）
+               远大于多点一次的麻烦。侧栏那处不做确认，是因为它是**专门的**
+               管理区、动作单一；这里混在"选择标签"的动作里，必须多一道手。
+          -->
+          <div v-if="pendingDelete" class="panel-confirm">
+            <span class="panel-confirm-text">{{ deleteHint }}</span>
+            <button
+              type="button"
+              class="panel-confirm-del"
+              @click="confirmDelete"
+            >
+              删除
+            </button>
+            <button
+              type="button"
+              class="panel-confirm-cancel"
+              @click="cancelDelete"
+            >
+              取消
+            </button>
           </div>
 
           <div class="panel-add">
@@ -1061,6 +1217,114 @@ onUnmounted(() => {
   color: #fff;
   background: var(--accent);
   border-color: var(--accent);
+}
+
+/* 「其他」组的 chip：药丸里再切一小块当删除键。
+   <button> 不能嵌 <button>，所以这一组的外层是 <span>（见模板注释）。 */
+.panel-tag {
+  display: inline-flex;
+  align-items: stretch;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+.panel-tag:hover {
+  border-color: var(--accent);
+}
+.panel-tag.on {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.panel-tag-name {
+  padding: 3px 4px 3px 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-2);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+.panel-tag-name:hover {
+  background: var(--hover);
+}
+.panel-tag.on .panel-tag-name {
+  color: #fff;
+}
+.panel-tag.on .panel-tag-name:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+/* 删除键：压暗常显、悬停才转红 —— 与侧栏的 .tag-op 同一套语言。
+   刻意**不做成"悬停才出现"**：那会让触屏 / 触控板用户找不到它。 */
+.panel-tag-x {
+  width: 20px;
+  padding: 0;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--text-3);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+.panel-tag-x:hover {
+  color: var(--danger);
+  background: var(--hover);
+}
+.panel-tag.on .panel-tag-x {
+  color: rgba(255, 255, 255, 0.85);
+}
+.panel-empty {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+/* 删除确认条：左边一条红边点明"这是危险动作"，但仍是面板内的一小块，
+   不弹系统对话框 —— 原生 confirm() 与这套界面风格无关、还会阻塞 webview；
+   面板内自绘一条，位置贴近那个 ×，用户一眼知道在确认什么。
+   注意 text 会折行（要说清"影响几篇"），用 flex + min-width:0 让它撑开。 */
+.panel-confirm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: var(--hover);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--danger);
+  border-radius: 8px;
+}
+.panel-confirm-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-2);
+}
+.panel-confirm-del {
+  flex-shrink: 0;
+  padding: 4px 12px;
+  font-size: 12px;
+  color: #fff;
+  background: var(--danger);
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.panel-confirm-del:hover {
+  filter: brightness(1.05);
+}
+.panel-confirm-cancel {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--text-2);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.panel-confirm-cancel:hover {
+  background: var(--surface);
+  border-color: var(--text-3);
 }
 .panel-add {
   display: flex;
