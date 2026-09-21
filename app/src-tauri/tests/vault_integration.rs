@@ -26,6 +26,13 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 
 const PIN: &str = "135790";
 
+/// 统计测试里固定用的"今天"。
+///
+/// `stats(today)` 的 today 由前端传（本地日期），测试里就固定这一天。
+/// 只有**本周 / 本月**两项依赖它；篇数、总字数、连续天数与它无关。
+/// 选 2026-09-21 是因为那天是**周一**：本周 = 09-21…09-27，边界一眼能看懂。
+const TEST_TODAY: &str = "2026-09-21";
+
 // ---------------------------------------------------------------------------
 // 加密与密码
 // ---------------------------------------------------------------------------
@@ -38,7 +45,7 @@ fn create_then_unlock_with_correct_pin() {
         drop(vault);
     }
     let vault = Vault::unlock(&dir, PIN).expect("正确密码必须能解锁");
-    assert_eq!(vault.stats().unwrap().total_entries, 0);
+    assert_eq!(vault.stats(TEST_TODAY).unwrap().total_entries, 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -178,7 +185,7 @@ fn opening_a_date_does_not_write_to_the_database() {
         .query_row("SELECT count(*) FROM entry", [], |r| r.get(0))
         .unwrap();
     assert_eq!(rows, 0, "仅仅打开某天不应在数据库里留下记录");
-    assert_eq!(vault.stats().unwrap().total_entries, 0);
+    assert_eq!(vault.stats(TEST_TODAY).unwrap().total_entries, 0);
     assert!(!vault.is_written("2026-09-12").unwrap());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -243,7 +250,7 @@ fn title_only_does_not_count_as_written() {
         "只填标题不应在日历上留下标记"
     );
     assert!(vault.list_month("2026-09").unwrap().is_empty());
-    assert_eq!(vault.stats().unwrap().total_entries, 0);
+    assert_eq!(vault.stats(TEST_TODAY).unwrap().total_entries, 0);
     // 也不应进搜索索引，否则会出现"搜得到但日历没标记"的矛盾状态。
     assert!(vault.search("标题", 10).unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
@@ -262,7 +269,7 @@ fn whitespace_only_content_does_not_count_as_written() {
         .unwrap();
     assert!(!vault.is_written("2026-09-12").unwrap());
     assert!(vault.written_dates("2026-09-01", "2026-09-30").unwrap().is_empty());
-    assert_eq!(vault.stats().unwrap().total_entries, 0);
+    assert_eq!(vault.stats(TEST_TODAY).unwrap().total_entries, 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -309,7 +316,7 @@ fn writing_then_reopening_threads_the_needle() {
         vec!["2026-09-10".to_string()],
         "只有真正写了内容的那天应被标记，实际: {marked:?}"
     );
-    assert_eq!(vault.stats().unwrap().total_entries, 1);
+    assert_eq!(vault.stats(TEST_TODAY).unwrap().total_entries, 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -341,7 +348,7 @@ fn delete_removes_entry_and_its_index() {
         0,
         "删除日记后索引必须同步清理"
     );
-    assert_eq!(vault.stats().unwrap().total_entries, 0);
+    assert_eq!(vault.stats(TEST_TODAY).unwrap().total_entries, 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -519,7 +526,7 @@ fn stats_counts_entries_words_and_streak() {
     vault.save_entry("2026-09-03", "", "第三天。").unwrap();
     vault.save_entry("2026-09-05", "", "断了一天之后。").unwrap();
 
-    let s = vault.stats().unwrap();
+    let s = vault.stats(TEST_TODAY).unwrap();
     assert_eq!(s.total_entries, 4);
     assert!(s.total_words > 0);
     assert_eq!(s.streak_days, 1, "最近一天与前一天不连续，连续天数应为 1");
@@ -529,8 +536,191 @@ fn stats_counts_entries_words_and_streak() {
     // 再把断掉的那天补上：日期变成 09-01…09-05，全部相接，连续应为 5 天。
     // （我一开始把这里写成 4，是没算清楚"补上缺口后连成一条整段"。）
     vault.save_entry("2026-09-04", "", "补写的。").unwrap();
-    let s2 = vault.stats().unwrap();
+    let s2 = vault.stats(TEST_TODAY).unwrap();
     assert_eq!(s2.streak_days, 5, "补上缺口后 09-01..09-05 应连续 5 天");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 统计（指令 6）：最长连续、本周/本月、心情分布、每月字数
+// ---------------------------------------------------------------------------
+
+/// 「最长连续」必须独立于「当前连续」：断一天再写，当前归 1，
+/// 但历史纪录不能被冲掉。
+#[test]
+fn longest_streak_keeps_the_record_after_a_gap() {
+    let dir = temp_dir("stats-longest");
+    let vault = Vault::create(&dir, PIN, None).unwrap();
+
+    // 先只写 09-01…09-03：**验收第 1 条**——连续写 3 天，当前与最长都应是 3。
+    for d in ["2026-09-01", "2026-09-02", "2026-09-03"] {
+        vault.save_entry(d, "", "写过了。").unwrap();
+    }
+    let three = vault.stats(TEST_TODAY).unwrap();
+    assert_eq!(three.streak_days, 3, "连续写满 3 天");
+    assert_eq!(three.longest_streak, 3, "连续写满 3 天");
+
+    // 断 09-04，再写 09-05、09-06 —— **验收第 2 条**：
+    // 当前连续归 2，但最长连续仍是 3，不能被后一段冲掉。
+    vault.save_entry("2026-09-05", "", "写过了。").unwrap();
+    vault.save_entry("2026-09-06", "", "写过了。").unwrap();
+
+    let s = vault.stats(TEST_TODAY).unwrap();
+    assert_eq!(s.total_entries, 5);
+    assert_eq!(s.streak_days, 2, "当前连续＝收尾那一段（09-05、09-06）");
+    assert_eq!(
+        s.longest_streak, 3,
+        "最长连续＝09-01…09-03，不能被后面的 2 盖掉"
+    );
+
+    // 把断掉的那天补上 —— 这正是用户说的"昨天没空写、今天补上也算连续"
+    // 的场景：整条连成 6 天，两个数字都应变成 6。
+    vault.save_entry("2026-09-04", "", "补写的。").unwrap();
+    let s2 = vault.stats(TEST_TODAY).unwrap();
+    assert_eq!(s2.streak_days, 6);
+    assert_eq!(s2.longest_streak, 6);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 关键回归点：**打开过但没写**的日期既不能把连续骗高，也不能把它打断。
+#[test]
+fn opening_a_date_without_writing_does_not_affect_the_streak() {
+    let dir = temp_dir("stats-open-only");
+    let vault = Vault::create(&dir, PIN, None).unwrap();
+
+    vault.save_entry("2026-09-01", "", "写过了。").unwrap();
+    vault.save_entry("2026-09-02", "", "写过了。").unwrap();
+
+    // 两种"打开过但没写"：① 只打开，连行都不建；② 建了行但正文是空的。
+    vault.open_entry("2026-09-03").unwrap();
+    vault.save_entry("2026-09-04", "只有标题", "").unwrap();
+
+    let s = vault.stats(TEST_TODAY).unwrap();
+    assert_eq!(s.total_entries, 2, "没写正文的不算篇数");
+    assert_eq!(s.streak_days, 2, "空日期不该打断连续");
+    assert_eq!(s.longest_streak, 2);
+    assert_eq!(s.last_date.as_deref(), Some("2026-09-02"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 本周（**周一起算**）与本月写作天数，都以传进来的 `today` 为基准。
+#[test]
+fn week_and_month_counts_follow_the_passed_today() {
+    let dir = temp_dir("stats-week-month");
+    let vault = Vault::create(&dir, PIN, None).unwrap();
+
+    // 2026-09-21 是周一 → 本周 = 09-21…09-27；09-20 是周日，属**上一周**。
+    for d in [
+        "2026-08-31", // 上个月
+        "2026-09-14", // 本月、上一周
+        "2026-09-20", // 本月、上一周（周日）
+        "2026-09-21", // 本周（周一）
+        "2026-09-23", // 本周
+        "2026-10-01", // 下个月
+    ] {
+        vault.save_entry(d, "", "写过了。").unwrap();
+    }
+
+    let s = vault.stats("2026-09-21").unwrap();
+    assert_eq!(s.days_this_week, 2, "本周＝09-21、09-23；09-20 是上一周");
+    assert_eq!(s.days_this_month, 4, "本月＝09-14、09-20、09-21、09-23");
+
+    // 换一个 today，两项都要跟着变 —— 证明它们真的用了传进来的日期，
+    // 而不是悄悄取了系统时间（那在凌晨会算错一整天）。
+    let s2 = vault.stats("2026-10-02").unwrap();
+    assert_eq!(s2.days_this_week, 1, "10-02 所在周＝09-28…10-04，只有 10-01");
+    assert_eq!(s2.days_this_month, 1, "10 月只有 10-01");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 心情分布：按档位分组计数，且**只在有正文的行上数**。
+#[test]
+fn mood_distribution_counts_only_entries_with_content() {
+    let dir = temp_dir("stats-moods");
+    let vault = Vault::create(&dir, PIN, None).unwrap();
+
+    vault
+        .save_entry_with_mood("2026-09-01", "", "开心的一天。", Some(5))
+        .unwrap();
+    vault
+        .save_entry_with_mood("2026-09-02", "", "有点茫然。", Some(3))
+        .unwrap();
+    vault
+        .save_entry_with_mood("2026-09-03", "", "还是很开心。", Some(5))
+        .unwrap();
+    // 没标心情的那天不该出现在分布里。
+    vault.save_entry("2026-09-04", "", "没标心情。").unwrap();
+
+    // 造一条"有心情没正文"的历史脏行：直接改库，绕开 save_entry_with_mood
+    // 那道"正文为空就不写心情"的硬闸（真实库里早年可能留下这种行）。
+    // 分布必须把它挡在外面 —— 口径与日历的 written_moods() 一致。
+    vault.save_entry("2026-09-05", "只有标题", "").unwrap();
+    vault
+        .conn()
+        .execute(
+            "UPDATE entry SET mood = 2 WHERE entry_date = '2026-09-05'",
+            [],
+        )
+        .unwrap();
+
+    let s = vault.stats(TEST_TODAY).unwrap();
+    let mut counts: Vec<(i64, i64)> = s.mood_counts.iter().map(|m| (m.mood, m.count)).collect();
+    counts.sort();
+    assert_eq!(
+        counts,
+        vec![(3, 1), (5, 2)],
+        "只有 3 和 5 两档，且不含那条「有心情没正文」的脏行"
+    );
+    assert_eq!(s.total_entries, 4, "脏行不算篇数");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 每月字数趋势：按 `YYYY-MM` 分组、升序返回，空草稿不参与。
+#[test]
+fn monthly_words_group_by_month() {
+    let dir = temp_dir("stats-months");
+    let vault = Vault::create(&dir, PIN, None).unwrap();
+
+    vault.save_entry("2026-07-05", "", "七月的一篇。").unwrap();
+    vault.save_entry("2026-08-01", "", "八月第一篇。").unwrap();
+    vault.save_entry("2026-08-02", "", "八月第二篇。").unwrap();
+    vault.save_entry("2026-08-03", "只有标题", "").unwrap();
+
+    let s = vault.stats(TEST_TODAY).unwrap();
+    let months: Vec<&str> = s.monthly_words.iter().map(|m| m.month.as_str()).collect();
+    assert_eq!(months, vec!["2026-07", "2026-08"], "升序，且只含有正文的月份");
+
+    // 八月的字数应等于那两篇之和（空草稿的字数不进趋势）。
+    let w1 = vault
+        .find_entry_by_date("2026-08-01")
+        .unwrap()
+        .unwrap()
+        .word_count;
+    let w2 = vault
+        .find_entry_by_date("2026-08-02")
+        .unwrap()
+        .unwrap()
+        .word_count;
+    assert!(w1 > 0 && w2 > 0);
+    assert_eq!(s.monthly_words[1].words, w1 + w2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `today` 格式不对要**直接报错**，不能默默按某个默认日期算 ——
+/// 那会让统计面板显示一个用户看不懂的数字。
+#[test]
+fn stats_rejects_a_malformed_today() {
+    let dir = temp_dir("stats-bad-today");
+    let vault = Vault::create(&dir, PIN, None).unwrap();
+
+    assert!(matches!(
+        vault.stats("2026-9-21"),
+        Err(AppError::Validation(_))
+    ));
+    assert!(matches!(
+        vault.stats(""),
+        Err(AppError::Validation(_))
+    ));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1056,7 +1246,7 @@ fn locking_a_date_never_written_creates_no_row() {
     assert_eq!(e.id, 0, "不该创建数据库行");
     assert!(!e.locked);
     assert!(!vault.is_written("2026-09-11").unwrap());
-    assert_eq!(vault.stats().unwrap().total_entries, 0);
+    assert_eq!(vault.stats(TEST_TODAY).unwrap().total_entries, 0);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1158,7 +1348,7 @@ fn change_password_rekeys_and_old_pin_stops_working() {
     );
 
     // 数据不能有任何变化：正文、日历标记、搜索索引、统计全都要原样。
-    assert_eq!(vault.stats().unwrap().total_entries, 4);
+    assert_eq!(vault.stats(TEST_TODAY).unwrap().total_entries, 4);
     assert_eq!(vault.list_month("2026-09").unwrap().len(), 4);
     assert_eq!(vault.written_dates("2026-09-01", "2026-09-30").unwrap().len(), 4);
     assert_eq!(vault.search("火锅", 10).unwrap().len(), 1, "搜索索引必须原样");
@@ -1206,7 +1396,7 @@ fn change_password_with_wrong_old_pin_leaves_the_vault_untouched() {
     // 这一条防的是"验证旧密码时把连接或密钥弄脏"的写法。
     drop(vault);
     let v = Vault::unlock(&dir, PIN).expect("失败的改密码不该动到库");
-    assert_eq!(v.stats().unwrap().total_entries, 4);
+    assert_eq!(v.stats(TEST_TODAY).unwrap().total_entries, 4);
     assert!(Vault::unlock(&dir, NEW_PIN).is_err());
 
     // 失败必须计数。否则"改密码"就是一个能无限次试旧密码的后门。
@@ -1238,7 +1428,7 @@ fn change_password_rejects_invalid_new_pin_without_touching_anything() {
 
     drop(vault);
     let v = Vault::unlock(&dir, PIN).expect("旧密码必须仍然有效");
-    assert_eq!(v.stats().unwrap().total_entries, 4);
+    assert_eq!(v.stats(TEST_TODAY).unwrap().total_entries, 4);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1386,7 +1576,7 @@ fn rekey_leaves_no_old_key_pages_behind() {
     }
 
     let v = Vault::unlock(&copy, NEW_PIN).expect("整目录搬走后必须能用新密码读全");
-    assert_eq!(v.stats().unwrap().total_entries, 4);
+    assert_eq!(v.stats(TEST_TODAY).unwrap().total_entries, 4);
     assert_eq!(v.search("火锅", 10).unwrap().len(), 1);
     assert!(Vault::unlock(&copy, PIN).is_err(), "搬出来的库里不该还有旧密钥能解开的页");
 
@@ -1433,7 +1623,7 @@ fn enable_auto_login_writes_a_key_that_really_opens_the_vault() {
     let mut key = al.key().unwrap();
     {
         let vault = Vault::unlock_with_key(&dir, &key).expect("钥匙必须能开库");
-        assert_eq!(vault.stats().unwrap().total_entries, 0);
+        assert_eq!(vault.stats(TEST_TODAY).unwrap().total_entries, 0);
     }
     app_lib::crypto::zeroize(&mut key);
 
@@ -1525,7 +1715,7 @@ fn a_vault_without_a_key_file_behaves_exactly_as_before() {
 
     // 常规解锁一行都没变。
     let vault = Vault::unlock(&dir, PIN).expect("密码解锁必须照旧可用");
-    assert_eq!(vault.stats().unwrap().total_entries, 0);
+    assert_eq!(vault.stats(TEST_TODAY).unwrap().total_entries, 0);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1545,7 +1735,7 @@ fn a_broken_key_file_is_deleted_and_the_pin_still_works() {
 
     // 主路径不受影响：密码仍然能开。
     let vault = Vault::unlock(&dir, PIN).expect("密码必须仍然有效");
-    assert_eq!(vault.stats().unwrap().total_entries, 0);
+    assert_eq!(vault.stats(TEST_TODAY).unwrap().total_entries, 0);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1569,7 +1759,7 @@ fn a_key_that_no_longer_matches_the_vault_is_deleted() {
     );
 
     let vault = Vault::unlock(&dir, PIN).expect("密码必须仍然有效");
-    assert!(vault.stats().is_ok());
+    assert!(vault.stats(TEST_TODAY).is_ok());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1603,7 +1793,7 @@ fn after_changing_the_pin_the_key_file_holds_the_new_key() {
     // "同步成功"的标准是**新钥匙真能开库**，不是"文件内容变了"。
     {
         let vault = Vault::unlock_with_key(&dir, &new_key).expect("新钥匙必须能开库");
-        assert!(vault.stats().is_ok());
+        assert!(vault.stats(TEST_TODAY).is_ok());
     }
 
     // 旧钥匙必须开不了 —— 否则等于密码根本没改。
@@ -1770,7 +1960,7 @@ fn retiring_a_tag_hides_it_from_the_list_but_keeps_it_on_entries() {
     let e1 = v.open_entry("2026-09-18").unwrap();
     assert_eq!(e1.title, "第一篇");
     assert_eq!(e1.content_md, "在青海湖边上坐了一下午。");
-    assert_eq!(v.stats().unwrap().total_entries, 2);
+    assert_eq!(v.stats(TEST_TODAY).unwrap().total_entries, 2);
     assert_eq!(v.search("青海湖", 10).unwrap().len(), 1);
 
     // ⑤ 幂等：再调一次不报错（界面上连点两下不该炸）。
@@ -2102,7 +2292,7 @@ fn tag_counts_only_count_written_entries() {
     // 篇数口径必须与 `stats()` 一致 —— 否则会出现
     // "标签说 2 篇、顶栏统计说 1 篇"这种自相矛盾的界面。
     v.save_entry("2026-09-19", "", "").unwrap();
-    assert_eq!(v.stats().unwrap().total_entries, 1);
+    assert_eq!(v.stats(TEST_TODAY).unwrap().total_entries, 1);
     assert_eq!(
         v.list_tags().unwrap()[0].entry_count,
         1,

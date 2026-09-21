@@ -8,6 +8,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { todayKey } from "../utils/date";
 
 // ---------------------------------------------------------------------------
 // 类型：与 Rust 侧结构一一对应
@@ -125,12 +126,48 @@ export interface SearchHit {
   matched_by: "word" | "char";
 }
 
+/** 一个心情档位的出现次数。后端只返回**出现过**的档位。 */
+export interface MoodCount {
+  mood: number;
+  count: number;
+}
+
+/** 某个月的总字数。 */
+export interface MonthWords {
+  /** `YYYY-MM` */
+  month: string;
+  words: number;
+}
+
+/**
+ * 统计面板要用的全部数字，**一条命令取齐**（`getStats()`）。
+ *
+ * ⚠️ 这份是手抄 Rust 侧 `db::Stats` 的，加字段必须**两边同时改** ——
+ *    漏了不会编译报错，只会在运行时读到 `undefined`。
+ */
 export interface Stats {
   total_entries: number;
   total_words: number;
+  /**
+   * **当前连续**：以"最新写过的那一天"收尾的那一段天数。
+   *
+   * ⚠️ 口径是"从最近一篇往前逐日相接"，**不是"必须写到今天"**：
+   *    今天还没写、昨天写了，仍显示到昨天为止（用户 2026-09-21 拍板）。
+   *    所以界面上要标注"截至 {last_date}"，否则用户会以为今天是断的。
+   */
   streak_days: number;
   first_date: string | null;
   last_date: string | null;
+  /** **最长连续**：历史纪录。断一天再写，上面那个归 1，这里保留。 */
+  longest_streak: number;
+  /** 本周（**周一起算**）写过几天。 */
+  days_this_week: number;
+  /** 本月写过几天。 */
+  days_this_month: number;
+  /** 各档位的出现次数。没出现过的档位不在里面，展示时按 `MOODS` 补 0。 */
+  mood_counts: MoodCount[];
+  /** 每月字数，按月份升序。没有内容的月份不出现，画图时自己补空位。 */
+  monthly_words: MonthWords[];
 }
 
 export interface BackupResult {
@@ -391,7 +428,15 @@ export const writtenDates = (from: string, to: string) =>
 export const writtenMoods = (from: string, to: string) =>
   invoke<DayMood[]>("written_moods", { from, to });
 
-export const getStats = () => invoke<Stats>("stats");
+/**
+ * 统计（统计面板与顶栏那行小字共用）。
+ *
+ * `today` 在这里补上，调用方不用管。为什么由前端提供"今天"：
+ * 只有前端知道用户的**本地日期**（`todayKey()`）；后端只有 UTC，
+ * 东八区凌晨 0~8 点会被算成前一天 —— 那正是日记应用最不能错的地方。
+ * 它只影响"本周 / 本月"两项。
+ */
+export const getStats = () => invoke<Stats>("stats", { today: todayKey() });
 
 // ---------------------------------------------------------------------------
 // 搜索

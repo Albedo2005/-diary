@@ -11,6 +11,7 @@ import EditorPane from "./components/EditorPane.vue";
 import HiddenScreen from "./components/HiddenScreen.vue";
 import SearchPanel from "./components/SearchPanel.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
+import StatsPanel from "./components/StatsPanel.vue";
 import UnlockScreen from "./components/UnlockScreen.vue";
 import {
   backupNow,
@@ -38,7 +39,18 @@ const booting = ref(true);
 const fatal = ref("");
 
 const selected = ref(todayKey());
-const mode = ref<"write" | "search">("write");
+/**
+ * 当前主视图：写日记 / 搜索 / 统计。
+ *
+ * ⚠️ 默认**永远是写日记** —— 三个 tab 里它是"家"。别把这个选择持久化：
+ *    用户下次打开软件看到一屏统计，会以为软件坏了。
+ *
+ * ⚠️ 切走时正文区会**卸载**（`v-if` / `v-else-if`）。`EditorPane` 的
+ *    `onUnmounted` 里有 `if (dirty) void flush()`，没落盘的字会先被存掉，
+ *    所以**不丢内容**；代价是切回来属于重挂，光标与滚动位置归零。
+ *    这与「搜索」的行为完全一致（它也是这么切的）。
+ */
+const mode = ref<"write" | "search" | "stats">("write");
 /** 递增以要求日历刷新标记。 */
 const refreshToken = ref(0);
 
@@ -428,9 +440,26 @@ onUnmounted(() => {
           <button :class="{ on: mode === 'search' }" @click="mode = 'search'">
             搜索
           </button>
+          <!--
+            统计是**整屏视图**，与「搜索」同级：都是"看"，不是"改"。
+            它不在设置弹窗里 —— 一个用来鼓励坚持的数字，不该埋在配置项里。
+          -->
+          <button :class="{ on: mode === 'stats' }" @click="mode = 'stats'">
+            统计
+          </button>
         </nav>
         <div class="right">
-          <span v-if="stats" class="stat">
+          <!--
+            连续天数的口径是"从最近一篇往前逐日相接"——**今天还没写也照常显示到
+            最近写过的那天**（用户 2026-09-21 拍板，比"今天没写就归 0"友好）。
+            顶栏太窄，放不下"截至 X月X日"，就写进悬停说明；
+            完整标注在统计面板里（那边是数字的主场）。
+          -->
+          <span
+            v-if="stats"
+            class="stat"
+            :title="`共 ${stats.total_entries} 篇 · 连续 ${stats.streak_days} 天（截至 ${stats.last_date ?? '—'}）。今天还没写也照常显示到那一天。`"
+          >
             共 {{ stats.total_entries }} 篇 · 连续 {{ stats.streak_days }} 天
           </span>
           <button class="btn ghost" title="设置" @click="showSettings = true">
@@ -458,7 +487,7 @@ onUnmounted(() => {
             @notice="flash"
           />
         </template>
-        <div v-else class="search-wrap">
+        <div v-else-if="mode === 'search'" class="search-wrap">
           <SearchPanel
             @open="
               (d) => {
@@ -468,6 +497,9 @@ onUnmounted(() => {
             "
           />
         </div>
+        <div v-else class="stats-wrap">
+          <StatsPanel :stats="stats" />
+        </div>
       </main>
 
       <div v-if="toast" class="toast">{{ toast }}</div>
@@ -475,14 +507,14 @@ onUnmounted(() => {
       <!--
         设置：可以改的东西都在这儿。
         状态一律从 App.vue 传进去 —— 它自己不再拉一次 status，
-        免得出现"弹窗里的备份状态和顶栏统计各说各话"。
+        免得出现"弹窗里的状态和顶栏各说各话"。
+        （统计不再往里传：它已挪去顶栏第三个 tab，见 StatsPanel。）
       -->
       <SettingsPanel
         v-if="showSettings"
         :status="status"
         :backup="backup"
         :crypto="crypto"
-        :stats="stats"
         :auto-lock-secs="autoLockSecs"
         @close="showSettings = false"
         @backup="doBackup"
@@ -580,11 +612,22 @@ onUnmounted(() => {
   display: flex;
   min-height: 0;
 }
-.search-wrap {
+/*
+  搜索与统计都是"整屏视图"，共用同一套留白与滚动。
+  统计图表比搜索结果宽一些，所以各给自己的 max-width。
+*/
+.search-wrap,
+.stats-wrap {
   flex: 1;
   min-width: 0;
   padding: 20px 24px;
+  overflow-y: auto;
+}
+.search-wrap {
   max-width: 720px;
+}
+.stats-wrap {
+  max-width: 820px;
 }
 .toast {
   position: fixed;

@@ -604,8 +604,10 @@ pub fn change_password_core(
 /// 让"改密码"报错就是骗人。处理口径与后台自动备份一致（记日志、不打断用户）。
 fn post_change_backup(data_dir: &Path, vault: &Vault, mut warnings: Vec<String>) -> Vec<String> {
     // 一篇都没写就不备份 —— 与自动备份同一口径，免得备份目录里堆空库。
-    match vault.stats() {
-        Ok(s) if s.total_entries == 0 => return warnings,
+    // 这里只要"有没有内容"这一个数字，所以用 written_entry_count()，
+    // 不必为它去算整份统计（那要走全表日期）。
+    match vault.written_entry_count() {
+        Ok(0) => return warnings,
         Ok(_) => {}
         Err(e) => {
             warnings.push(format!("改密码后的备份被跳过（{e}）"));
@@ -729,9 +731,14 @@ pub fn written_moods(
     with_vault(&state, |v| v.written_moods(&from, &to))
 }
 
+/// 统计面板的全部数字，**一条命令取齐**。
+///
+/// `today`（`YYYY-MM-DD`）由前端传：只有前端知道用户的**本地日期**
+/// （Rust 侧只有 UTC，东八区凌晨会被算成前一天）。它只影响"本周 / 本月"，
+/// 连续天数不依赖它。详见 `db::Vault::stats`。
 #[tauri::command]
-pub fn stats(state: State<'_, VaultState>) -> AppResult<Stats> {
-    with_vault(&state, |v| v.stats())
+pub fn stats(state: State<'_, VaultState>, today: String) -> AppResult<Stats> {
+    with_vault(&state, |v| v.stats(&today))
 }
 
 // ---------------------------------------------------------------------------
@@ -971,7 +978,8 @@ fn try_auto_backup(state: &VaultState) -> AppResult<Option<BackupResult>> {
 
     // 一篇都没写就不备份，省得备份目录里堆一堆空库。
     // 但仍要推进计时器，否则每 5 分钟都会重复走到这里。
-    if vault.stats()?.total_entries == 0 {
+    // （只要篇数 → written_entry_count，不必为它算整份统计。）
+    if vault.written_entry_count()? == 0 {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())

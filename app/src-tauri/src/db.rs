@@ -1375,16 +1375,38 @@ impl Vault {
         Ok(affected as usize)
     }
 
-    /// 统计：总篇数、总字数、连续写作天数。
+    /// 只数"写过"的日记篇数。
     ///
-    /// 全部只统计**写过的**日记（`has_content_sql()`）。
-    /// 否则"共 N 篇"会把打开过但没写的空记录也算进去 —— 与用户直觉不符。
-    pub fn stats(&self) -> AppResult<Stats> {
-        let total_entries: i64 = self.conn.query_row(
+    /// 单独抽出来，是因为有两个调用方**只要这一个数字**（改密码后要不要备份、
+    /// 自动备份前判断库是不是空的）—— 它们不该为此走一遍全表日期。
+    /// 判定口径仍然只有一条：`has_content_sql()`。
+    pub fn written_entry_count(&self) -> AppResult<i64> {
+        let n = self.conn.query_row(
             &format!("SELECT count(*) FROM entry WHERE {}", has_content_sql()),
             [],
             |r| r.get(0),
         )?;
+        Ok(n)
+    }
+
+    /// 统计：总篇数、总字数、连续写作天数（当前 / 最长）、本周与本月写作天数、
+    /// 心情分布、每月字数趋势。
+    ///
+    /// 全部只统计**写过的**日记（`has_content_sql()`）。
+    /// 否则"共 N 篇"会把打开过但没写的空记录也算进去 —— 与用户直觉不符。
+    ///
+    /// `today` 是 `YYYY-MM-DD`，**由前端传入**，这里不取系统时间。两条理由：
+    ///   1. 前端 `todayKey()` 算的是**本地日期**；Rust 侧只有 `SystemTime`（UTC），
+    ///      东八区凌晨 0~8 点会被算成前一天 —— 那正是日记应用最不能错的地方
+    ///      （见 `utils/date.ts` 顶部那段说明）。
+    ///   2. "今天是哪天"全应用只应有一个来源。`list_month` / `written_dates` 的
+    ///      日期区间也是前端传的，这里是同一套做法。
+    ///
+    /// ⚠️ `today` 只影响**本周 / 本月**两项。连续天数不依赖它（见下面的口径）。
+    pub fn stats(&self, today: &str) -> AppResult<Stats> {
+        validate_date(today)?;
+
+        let total_entries = self.written_entry_count()?;
         let total_words: i64 = self.conn.query_row(
             &format!(
                 "SELECT coalesce(sum(word_count),0) FROM entry WHERE {}",
@@ -1394,38 +1416,103 @@ impl Vault {
             |r| r.get(0),
         )?;
 
-        // 连续天数：从最近一篇开始往前推，日期必须逐日相接。
         // 只取写过的日期，否则打开过的空日期会把"连续"打断（或错误地连起来）。
+        // 这次是**升序**取。
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT entry_date FROM entry WHERE {} ORDER BY entry_date DESC",
+            "SELECT entry_date FROM entry WHERE {} ORDER BY entry_date ASC",
             has_content_sql()
         ))?;
         let dates: Vec<String> = stmt
             .query_map([], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
 
-        let mut streak = 0i64;
-        let mut expected: Option<String> = None;
+        // 连续天数：**一次遍历同时算出「当前连续」与「最长连续」**。
+        //
+        // 为什么必须一次算完：这两项用的是同一条"相接"判定（`previous_date`）。
+        // 写成两段循环（一段从最近往前、一段从头到尾）就是把同一条规则抄了两份，
+        // 哪天要调"断"的口径，必然只改其中一处 —— 于是两个数字开始互相矛盾，
+        // 而且几乎不会被发现。这就是本项目"判定只实现一次"那条铁律。
+        //
+        // 升序遍历，`run` = 当前这一段连续了多少天：
+        //   - 与上一篇**逐日相接** → run += 1
+        //   - 否则（第一段，或中间断了）→ run 从 1 重新起算
+        // 循环结束时 `run` 就是以**最新一篇收尾**的那一段长度，即"当前连续"；
+        // `longest` 是历史最大值。从未写过时两者都是 0。
+        let mut run = 0i64;
+        let mut longest = 0i64;
+        let mut prev: Option<&str> = None;
         for d in &dates {
-            match &expected {
-                None => {
-                    streak = 1;
-                    expected = Some(previous_date(d)?);
-                }
-                Some(exp) if exp == d => {
-                    streak += 1;
-                    expected = Some(previous_date(d)?);
-                }
-                Some(_) => break,
+            match prev {
+                Some(p) if previous_date(d)? == p => run += 1,
+                _ => run = 1,
             }
+            if run > longest {
+                longest = run;
+            }
+            prev = Some(d);
         }
+        let streak = run;
+
+        // 本周 / 本月写作天数：直接在**已经取出来的日期**上过滤，不再多跑两条 SQL。
+        // 日期是定长 ISO 字符串，字典序即时间序，所以能直接比字符串。
+        let week_start = week_start(today)?;
+        let week_end = shift_date(&week_start, 6)?;
+        let month_prefix = &today[0..7];
+        let days_this_week = dates
+            .iter()
+            .filter(|d| d.as_str() >= week_start.as_str() && d.as_str() <= week_end.as_str())
+            .count() as i64;
+        let days_this_month = dates
+            .iter()
+            .filter(|d| d.starts_with(month_prefix))
+            .count() as i64;
+
+        // 心情分布：只在"有正文"的行上数 —— 库里有"有 mood 没正文"的历史脏行，
+        // 口径必须与日历的 written_moods() 一致。
+        // 没出现过的档位不返回（由前端按 MOODS 补 0）。
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT mood, count(*) FROM entry
+             WHERE mood IS NOT NULL AND {}
+             GROUP BY mood ORDER BY mood",
+            has_content_sql()
+        ))?;
+        let mood_counts: Vec<MoodCount> = stmt
+            .query_map([], |r| {
+                Ok(MoodCount {
+                    mood: r.get(0)?,
+                    count: r.get(1)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+
+        // 每月字数趋势：按 entry_date 的前 7 位（YYYY-MM）分组。
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT substr(entry_date, 1, 7) AS m, coalesce(sum(word_count), 0) FROM entry
+             WHERE {}
+             GROUP BY m ORDER BY m ASC",
+            has_content_sql()
+        ))?;
+        let monthly_words: Vec<MonthWords> = stmt
+            .query_map([], |r| {
+                Ok(MonthWords {
+                    month: r.get(0)?,
+                    words: r.get(1)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
 
         Ok(Stats {
             total_entries,
             total_words,
             streak_days: streak,
-            first_date: dates.last().cloned(),
-            last_date: dates.first().cloned(),
+            // dates 是升序：第一个是最早，最后一个是最近。
+            first_date: dates.first().cloned(),
+            last_date: dates.last().cloned(),
+            longest_streak: longest,
+            days_this_week,
+            days_this_month,
+            mood_counts,
+            monthly_words,
         })
     }
 
@@ -1904,13 +1991,49 @@ pub fn prune_backups(dir: &Path, keep_recent: usize) -> AppResult<(usize, usize)
     Ok((deleted, keep.len()))
 }
 
+/// 统计面板要用的全部数字（一次取齐 —— 面板只调一条命令）。
+///
+/// ⚠️ 加字段要**同时改前端**：`api/index.ts` 里那份 `Stats` interface 是手抄的，
+///    不会自动跟着变；漏了会在运行时读到 `undefined`（编译期查不出来）。
 #[derive(Debug, Clone, Serialize)]
 pub struct Stats {
     pub total_entries: i64,
     pub total_words: i64,
+    /// **当前连续**：以最新写过的日期收尾的那一段连续天数。
+    ///
+    /// ⚠️ 口径是"从最近一篇往前逐日相接"，**不是**"必须写到今天" ——
+    ///    今天还没写、昨天写了，仍然显示到昨天为止的天数（用户 2026-09-21 拍板）。
+    ///    所以界面必须标注"截至 {last_date}"，否则用户会以为今天是断的。
     pub streak_days: i64,
     pub first_date: Option<String>,
     pub last_date: Option<String>,
+    /// **最长连续**：历史上最长的那一段（断一天再写，当前归 1，但这里保留纪录）。
+    pub longest_streak: i64,
+    /// 本周（**周一起算**）写过日记的天数。以 `stats(today)` 的 today 为基准。
+    pub days_this_week: i64,
+    /// 本月写过日记的天数。同样以 today 为基准。
+    pub days_this_month: i64,
+    /// 各心情档位各出现过多少次。**没出现过的档位不会出现**在结果里，
+    /// 由前端按 `MOODS` 补 0（心情档位表全项目只留一份）。
+    pub mood_counts: Vec<MoodCount>,
+    /// 每月字数趋势，按月份升序。没有内容的月份不会出现（前端会补 0 格）。
+    pub monthly_words: Vec<MonthWords>,
+}
+
+/// 一个心情档位的出现次数。
+#[derive(Debug, Clone, Serialize)]
+pub struct MoodCount {
+    /// 1~5，含义见 `api/index.ts` 的 `MOODS`（只是编号，不是程度刻度）。
+    pub mood: i64,
+    pub count: i64,
+}
+
+/// 某个月的总字数。
+#[derive(Debug, Clone, Serialize)]
+pub struct MonthWords {
+    /// `YYYY-MM`
+    pub month: String,
+    pub words: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2013,16 +2136,42 @@ fn is_valid_month(month: &str) -> bool {
             .all(|(i, c)| if i == 4 { c == '-' } else { c.is_ascii_digit() })
 }
 
-/// 前一天的日期字符串。用于连续天数统计。
-fn previous_date(date: &str) -> AppResult<String> {
+/// 日期加减若干天（`delta` 可负）。
+///
+/// 用于连续天数（前一天）和"本周"的收尾（周一 + 6 天）。
+/// ⚠️ 只保留这一份加法：`previous_date` 就是它减一天，别再写第二遍。
+fn shift_date(date: &str, delta: i64) -> AppResult<String> {
     validate_date(date)?;
     let y: i64 = date[0..4].parse().unwrap_or(0);
     let m: i64 = date[5..7].parse().unwrap_or(1);
     let d: i64 = date[8..10].parse().unwrap_or(1);
 
-    // 转成"自纪元起的天数"，减一，再转回日期。
-    let days = days_from_civil(y, m, d) - 1;
+    // 转成"自纪元起的天数"，加减，再转回日期。
+    let days = days_from_civil(y, m, d) + delta;
     let (ny, nm, nd) = civil_from_days(days);
+    Ok(format!("{ny:04}-{nm:02}-{nd:02}"))
+}
+
+/// 前一天的日期字符串。用于连续天数统计。
+fn previous_date(date: &str) -> AppResult<String> {
+    shift_date(date, -1)
+}
+
+/// 该日期所在周的**周一**（`YYYY-MM-DD`）。
+///
+/// 周一起算，与日历的排布一致（`utils/date.ts::monthGrid` 也是"周一为 0"）。
+/// 1970-01-01 是**星期四**，也就是 `days_from_civil` 的 0 对应周四，
+/// 所以偏移 +3 才是"周一为 0"的星期序号；外层先 +10 再取模是为了让
+/// 负天数（1970 年之前）也落在 0~6，不至于出现负下标。
+fn week_start(date: &str) -> AppResult<String> {
+    validate_date(date)?;
+    let y: i64 = date[0..4].parse().unwrap_or(0);
+    let m: i64 = date[5..7].parse().unwrap_or(1);
+    let d: i64 = date[8..10].parse().unwrap_or(1);
+
+    let days = days_from_civil(y, m, d);
+    let monday_index = ((days % 7) + 10) % 7; // 0 = 周一 … 6 = 周日
+    let (ny, nm, nd) = civil_from_days(days - monday_index);
     Ok(format!("{ny:04}-{nm:02}-{nd:02}"))
 }
 
@@ -2069,6 +2218,28 @@ mod tests {
         assert_eq!(previous_date("2026-09-01").unwrap(), "2026-08-31");
         assert_eq!(previous_date("2026-01-01").unwrap(), "2025-12-31");
         assert_eq!(previous_date("2024-03-01").unwrap(), "2024-02-29"); // 闰年
+    }
+
+    #[test]
+    fn shift_date_moves_forward_across_boundaries() {
+        assert_eq!(shift_date("2026-09-21", 6).unwrap(), "2026-09-27");
+        assert_eq!(shift_date("2026-09-30", 1).unwrap(), "2026-10-01");
+        assert_eq!(shift_date("2026-12-31", 1).unwrap(), "2027-01-01");
+        assert_eq!(shift_date("2024-02-28", 1).unwrap(), "2024-02-29"); // 闰年
+        assert_eq!(shift_date("2023-02-28", 1).unwrap(), "2023-03-01"); // 平年
+        assert_eq!(shift_date("2026-01-01", -1).unwrap(), "2025-12-31");
+    }
+
+    /// "本周"必须是**周一到周日**，且跨月 / 跨年都要对。
+    /// 基准：2026-09-21 是周一（写这条断言的那天）。
+    #[test]
+    fn week_start_is_monday_and_handles_boundaries() {
+        assert_eq!(week_start("2026-09-21").unwrap(), "2026-09-21"); // 周一
+        assert_eq!(week_start("2026-09-24").unwrap(), "2026-09-21"); // 周四
+        assert_eq!(week_start("2026-09-20").unwrap(), "2026-09-14"); // 周日 → 上一周
+        assert_eq!(week_start("2026-10-01").unwrap(), "2026-09-28"); // 跨月
+        assert_eq!(week_start("2027-01-01").unwrap(), "2026-12-28"); // 跨年
+        assert!(week_start("2026-9-21").is_err()); // 格式不对要报错，不猜
     }
 
     #[test]

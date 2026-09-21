@@ -3,8 +3,11 @@
  * 设置面板 —— 集中放"可以改的东西"。
  *
  * 与「关于」的分界线只有一条：**能改的进设置，只能看的留关于**。
- * 只读信息（版本、数据目录、加密参数、统计）在【关于】分类里，
+ * 只读信息（版本、数据目录、加密参数）在【关于】分类里，
  * 这里是全应用**唯一**的只读出口（顶栏那个「关于」入口已经删掉了）。
+ *
+ * ⚠️ 原来【关于】里那行"统计"已撤（2026-09-21）：统计挪去了**顶栏第三个 tab**
+ *    （`StatsPanel.vue`）。同一个信息只放一处 —— 留在【关于】里就成了第三个出处。
  *
  * 已接线的项：
  *   - 数据与备份 三项 —— 逻辑留在 App.vue，这里只发信号
@@ -36,14 +39,12 @@ import {
   type BackupStatus,
   type ChangePasswordResult,
   type CryptoInfo,
-  type Stats,
 } from "../api";
 
 const props = defineProps<{
   status: AppStatus;
   backup: BackupStatus | null;
   crypto: CryptoInfo | null;
-  stats: Stats | null;
   /** 自动锁定时长（秒）。0 = 永不。由 App.vue 持有，是唯一真值源。 */
   autoLockSecs: number;
 }>();
@@ -647,15 +648,6 @@ async function submitAutoLogin() {
 
               <dt>搜索索引</dt>
               <dd>中文分词双索引（jieba 词索引 + 单字兜底索引）</dd>
-
-              <dt v-if="stats">统计</dt>
-              <dd v-if="stats">
-                {{ stats.total_entries }} 篇 · 累计 {{ stats.total_words }} 字 ·
-                连续 {{ stats.streak_days }} 天
-                <template v-if="stats.first_date">
-                  <br />从 {{ stats.first_date }} 到 {{ stats.last_date }}
-                </template>
-              </dd>
             </dl>
           </section>
         </div>
