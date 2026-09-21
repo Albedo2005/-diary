@@ -7,7 +7,7 @@
  *   - 有日记的日子做标记，让用户一眼看到这个月写了哪些天
  *   - 所有日期都按**本地时区**处理（见 utils/date.ts 的说明）
  */
-import { computed, ref, watch } from "vue";
+import { computed, onUnmounted, ref, watch } from "vue";
 import {
   retireTag,
   listTags,
@@ -34,6 +34,10 @@ const props = defineProps<{
   refreshToken: number;
   /** 标签被别处改动（编辑器加/撤了标签）时由父组件递增 */
   tagToken: number;
+  /** 这一本最早写过的那天（一篇都没写过时是 null）—— 给「第一篇」用 */
+  firstDate: string | null;
+  /** 最近写过的那天（一篇都没写过时是 null）—— 给「最近一篇」用 */
+  lastDate: string | null;
 }>();
 
 const emit = defineEmits<{
@@ -52,6 +56,8 @@ const loading = ref(false);
 const errorText = ref("");
 
 const today = todayKey();
+/** 今年。年月面板能翻到哪一年要用它（见 yearFloor / yearCeil）。 */
+const currentYear = Number(today.slice(0, 4));
 const cells = computed(() => monthGrid(month.value));
 const weekLabels = ["一", "二", "三", "四", "五", "六", "日"];
 
@@ -191,6 +197,114 @@ async function removeTag(t: TagStat) {
   }
 }
 
+/* ── 年月面板（指令 9）────────────────────────────────────────────────
+   标题此前是「一点就回今天」：既没有视觉提示（悬停才看得到），又把
+   「回今天」这件常用的事藏了起来。现在点标题弹一个面板 ——
+   上面翻年 + 选月，下面三个快捷入口。
+
+   ⚠️ 面板只换 `month`，**不动 `selected`** —— 与 ‹ › 是同一套行为。
+      用户只是想看看 2024 年写了什么，编辑区那篇日记不该被切走。
+      唯一的例外是底部那三个入口，它们的语义本来就是「跳过去」。
+   ⚠️ 浮层用 position:absolute，所以 .head 必须是定位上下文，
+      否则它相对整个窗口定位、位置乱飞。z-index 20 才盖得住日期格。
+   ⚠️ 切月后的标记重载由已有的 watch(month, load) 负责，这里**不再手动 load()** ——
+      手动加一次会让每次切月发两遍 IPC。 */
+
+const pickerOpen = ref(false);
+const pickerYear = ref(currentYear);
+const pickerRef = ref<HTMLElement | null>(null);
+const headRef = ref<HTMLElement | null>(null);
+
+const MONTH_LABELS = Array.from({ length: 12 }, (_, i) => `${i + 1}月`);
+
+/**
+ * 年份能翻的范围：最早写过的那年 −1 ～ 今年 +1。
+ * 一篇都没写过时两头都钉在今年 —— 那时候往前往后都是空日历，翻它没有意义。
+ */
+const yearFloor = computed(() =>
+  props.firstDate ? Number(props.firstDate.slice(0, 4)) - 1 : currentYear
+);
+const yearCeil = computed(() =>
+  props.firstDate ? currentYear + 1 : currentYear
+);
+
+function clampYear(y: number): number {
+  return Math.min(Math.max(y, yearFloor.value), yearCeil.value);
+}
+
+/** 面板里该高亮的那个月：年份和月份都要对上。 */
+function isCurrentMonth(m: number): boolean {
+  return (
+    pickerYear.value === Number(month.value.slice(0, 4)) &&
+    m === Number(month.value.slice(5, 7))
+  );
+}
+
+/** 点标题：开面板时把年份对到当前看的月份上，别让面板和日历各说各话。 */
+function togglePicker() {
+  if (!pickerOpen.value) {
+    pickerYear.value = clampYear(Number(month.value.slice(0, 4)));
+  }
+  pickerOpen.value = !pickerOpen.value;
+}
+
+function shiftYear(delta: number) {
+  pickerYear.value = clampYear(pickerYear.value + delta);
+}
+
+/** 点某个月：只换月份，选中日期不动。 */
+function pickMonth(m: number) {
+  month.value = `${pickerYear.value}-${String(m).padStart(2, "0")}`;
+  pickerOpen.value = false;
+}
+
+/**
+ * 「第一篇」/「最近一篇」：没有日记时置灰（模板里 :disabled），
+ * 真点进来也直接返回，不让 null 混进 month。
+ */
+function jumpToEdge(date: string | null) {
+  if (!date) return;
+  month.value = date.slice(0, 7);
+  emit("select", date);
+  pickerOpen.value = false;
+}
+
+/**
+ * 「点外部关闭」。
+ *
+ * ⚠️ 不能用 click 判断 —— 打开面板的那次 click 会接着冒泡到 document，
+ *    于是「刚开就被自己关掉」。用 pointerdown，并且把**标题栏**（含 ‹ ›）
+ *    也算成内部：它们只是旁观者，不该顺手把面板关掉。
+ */
+function onDocPointerDown(ev: PointerEvent) {
+  if (!pickerOpen.value) return;
+  const t = ev.target as Node | null;
+  if (!t) return;
+  if (pickerRef.value?.contains(t) || headRef.value?.contains(t)) return;
+  pickerOpen.value = false;
+}
+
+function onDocKeydown(ev: KeyboardEvent) {
+  if (ev.key === "Escape") pickerOpen.value = false;
+}
+
+/** 监听器跟着面板开关走，关掉就摘。 */
+watch(pickerOpen, (open, _old, onCleanup) => {
+  if (!open) return;
+  document.addEventListener("pointerdown", onDocPointerDown, true);
+  document.addEventListener("keydown", onDocKeydown);
+  onCleanup(() => {
+    document.removeEventListener("pointerdown", onDocPointerDown, true);
+    document.removeEventListener("keydown", onDocKeydown);
+  });
+});
+
+/** 再摘一次：组件反复挂载不能把监听器攒起来。 */
+onUnmounted(() => {
+  document.removeEventListener("pointerdown", onDocPointerDown, true);
+  document.removeEventListener("keydown", onDocKeydown);
+});
+
 function goto(delta: number) {
   month.value = shiftMonth(month.value, delta);
 }
@@ -198,6 +312,7 @@ function goto(delta: number) {
 function gotoToday() {
   month.value = toMonthKey(new Date());
   emit("select", today);
+  pickerOpen.value = false;
 }
 
 function pick(date: string) {
@@ -206,6 +321,13 @@ function pick(date: string) {
 
 // 切换月份时重新加载标记。
 watch(month, load, { immediate: true });
+/**
+ * 面板开着时用户仍可按标题两侧的 ‹ › 翻月（它们算「内部」，不会被当成
+ * 点外部关掉）。翻完把年份对回去，免得面板写着 2026、日历已经翻到 2025。
+ */
+watch(month, (m) => {
+  if (pickerOpen.value) pickerYear.value = clampYear(Number(m.slice(0, 4)));
+});
 // 保存日记后刷新标记。
 watch(() => props.refreshToken, load);
 /**
@@ -228,12 +350,77 @@ watch(
 
 <template>
   <aside class="calendar">
-    <header class="head">
+    <header ref="headRef" class="head">
       <button class="nav" title="上个月" @click="goto(-1)">‹</button>
-      <button class="month-label" title="回到今天" @click="gotoToday">
+      <button
+        class="month-label"
+        :class="{ on: pickerOpen }"
+        title="选择年月，或跳到第一篇 / 最近一篇"
+        @click="togglePicker"
+      >
         {{ humanMonth(month) }}
       </button>
       <button class="nav" title="下个月" @click="goto(1)">›</button>
+
+      <!--
+        年月面板。只换月份，不动选中日期（底部那三个入口除外）。
+        年份的可翻范围见 yearFloor / yearCeil，不会无限翻到 1900 年去。
+      -->
+      <div v-if="pickerOpen" ref="pickerRef" class="picker">
+        <div class="picker-year">
+          <button
+            class="nav"
+            :disabled="pickerYear <= yearFloor"
+            title="上一年"
+            @click="shiftYear(-1)"
+          >
+            ‹
+          </button>
+          <span class="picker-year-text">{{ pickerYear }} 年</span>
+          <button
+            class="nav"
+            :disabled="pickerYear >= yearCeil"
+            title="下一年"
+            @click="shiftYear(1)"
+          >
+            ›
+          </button>
+        </div>
+
+        <div class="picker-months">
+          <button
+            v-for="(label, i) in MONTH_LABELS"
+            :key="label"
+            class="picker-month"
+            :class="{ on: isCurrentMonth(i + 1) }"
+            @click="pickMonth(i + 1)"
+          >
+            {{ label }}
+          </button>
+        </div>
+
+        <div class="picker-quick">
+          <button class="picker-link" title="跳到今天" @click="gotoToday">
+            今天
+          </button>
+          <button
+            class="picker-link"
+            :disabled="!props.firstDate"
+            title="跳到最早写过的那天"
+            @click="jumpToEdge(props.firstDate)"
+          >
+            第一篇
+          </button>
+          <button
+            class="picker-link"
+            :disabled="!props.lastDate"
+            title="跳到最近写过的那天"
+            @click="jumpToEdge(props.lastDate)"
+          >
+            最近一篇
+          </button>
+        </div>
+      </div>
     </header>
 
     <div class="weekdays">
@@ -342,6 +529,8 @@ watch(
   align-items: center;
   justify-content: space-between;
   margin-bottom: 14px;
+  /* 年月面板（position:absolute）的定位上下文 —— 少了它面板会相对窗口定位。 */
+  position: relative;
 }
 .nav {
   width: 28px;
@@ -562,5 +751,83 @@ watch(
   border: 1px solid var(--accent);
   border-radius: 5px;
   outline: none;
+}
+
+/* ── 年月面板（指令 9）─────────────────────────────────────────────────── */
+.picker {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 20;
+  width: 100%;
+  padding: 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
+}
+.picker-year {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.picker-year-text {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+}
+.picker-months {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+}
+.picker-month {
+  padding: 6px 0;
+  font-size: 12px;
+  color: var(--text-1);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+.picker-month:hover {
+  background: var(--hover);
+}
+.picker-month.on {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+.picker-quick {
+  display: flex;
+  gap: 4px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.picker-link {
+  flex: 1;
+  padding: 6px 0;
+  font-size: 12px;
+  color: var(--text-1);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.picker-link:hover:not(:disabled) {
+  background: var(--hover);
+  border-color: var(--accent);
+}
+.picker-link:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+/* 面板开着时标题亮一下，表示"这个浮层是从这儿出来的"。 */
+.month-label.on {
+  background: var(--hover);
 }
 </style>

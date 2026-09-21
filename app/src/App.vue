@@ -475,6 +475,8 @@ onUnmounted(() => {
             :selected="selected"
             :refresh-token="refreshToken"
             :tag-token="tagToken"
+            :first-date="stats?.first_date ?? null"
+            :last-date="stats?.last_date ?? null"
             @select="(d) => (selected = d)"
             @tags-changed="onTagsChanged"
             @notice="flash"
