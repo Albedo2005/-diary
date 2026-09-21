@@ -2,20 +2,25 @@
 /**
  * 日记编辑器。
  *
- * 形态：**Markdown 源码 + 语法高亮**（形态 A），配一个一键**锁定**。
- * 为什么不做所见即所得：那是 V1 的目标（见 docs/backlog.md），
- * 复杂度是现在的 5~8 倍。而写日记最需要的是"打开就能写"，排版好看是**回看**时的需求。
+ * 形态：**可编辑的正文 + 图片就地显示**，配一个一键**锁定**。
  *
- * ⚠️ 右上角按钮的历史：它原来是"阅读"，把正文当 Markdown 渲染成 HTML。
- *    那个视图**会吃掉用户手动排的版** —— Markdown 的规矩是单个换行等于空格、
- *    行首空格被吞掉。用户自己排的版很好看，一进"阅读"就全塌了。
- *    所以改成了"锁定"：**正文一字不改地原样显示**，只是不可编辑。
- *    结论：Markdown 渲染对"手工排版"是破坏性的，这也是将来上所见即所得（V1）
- *    而不是继续加渲染开关的理由。
+ * ⚠️ 2026-09-21：**图片改成在正文里就地显示成真图片**。
+ *    在此之前，插一张图会往正文里写进 `![1.png](attachments/<64 位 sha256>.png)`
+ *    这行原文，用户看到的就是"照片的名称和那串哈希路径" —— 原话是
+ *    "把照片的名称和相关信息也插入进去"。现在只放开**图片**一类就地渲染，
+ *    其余一切（`#`、`**`、列表、缩进）仍是原样文字。
  *
- * ⚠️ 铁律：正文永远以 **Markdown 原文**落库。
- *    将来升级到所见即所得时，富文本只在内存里存在，存库前仍转回 Markdown。
- *    一旦改成 HTML/富文本 JSON，导出、搜索、备份全要重写，升级也不再平滑。
+ * ⚠️ 右上角按钮的历史（这段别删，它解释"为什么只放开图片"）：
+ *    那个按钮原来是"阅读"，把正文当 Markdown 渲染成 HTML。那个视图**会吃掉
+ *    用户手动排的版** —— Markdown 的规矩是单个换行等于空格、行首空格被吞掉。
+ *    用户自己排的版很好看，一进"阅读"就全塌了。所以改成了"锁定"：
+ *    **正文一字不改地原样显示**，只是不可编辑。这一次只动图片一类，
+ *    正是吸取了那个教训：**整体渲染对"手工排版"是破坏性的**。
+ *
+ * ⚠️ 铁律没变：正文永远以 **Markdown 原文**落库。
+ *    编辑区里的 `<img>` 只是内存里的一张视图，存库前一律转回 Markdown
+ *    （见 serializeEditor）。一旦让 HTML / 富文本 JSON 进库，
+ *    导出、搜索、备份全要重写，升级也不再平滑。
  *
  * 自动保存策略：输入停止 1 秒后落库。
  * 中文输入法组字期间**暂停保存** —— 否则会把打到一半的拼音存进数据库。
@@ -45,6 +50,7 @@ import {
   type TagStat,
 } from "../api";
 import { humanDate } from "../utils/date";
+import { imageMd, splitMarkdownImages, textOnly } from "../utils/inlineImages";
 
 const props = defineProps<{
   date: string;
@@ -163,8 +169,21 @@ const imageError = ref("");
 const zoomed = ref<{ url: string; name: string } | null>(null);
 /** 隐藏的 `<input type="file">`：点「插入图片」时由代码去点它。 */
 const filePicker = ref<HTMLInputElement | null>(null);
-/** 正文输入框。插入图片语法时要往光标处塞，所以必须拿得到它。 */
-const contentRef = ref<HTMLTextAreaElement | null>(null);
+/** 正文编辑区（可编辑 div）。插图、把 DOM 收回成 Markdown，都要经由它。 */
+const contentRef = ref<HTMLDivElement | null>(null);
+/**
+ * 正文是不是空的 —— 只用来决定占位提示那行字露不露。
+ * 不能用 `:empty` 判断：正文里永远至少有一个 `<div>`，`:empty` 永远不命中。
+ */
+const editorEmpty = ref(true);
+/**
+ * 最后一次落在正文里的光标。
+ *
+ * ⚠️ 点「插入图片」时焦点已经跑到按钮上，`window.getSelection()` 取不到正文里的
+ *    光标（拿到的可能是按钮上的一个空选区），图片就会掉到文末去。所以每次
+ *    敲键 / 松鼠标都顺手记一份。
+ */
+let lastCaret: Range | null = null;
 /** 有文件拖到正文上方（用来高亮一下，否则用户不知道"能不能放这里"）。 */
 const dragging = ref(false);
 
@@ -278,8 +297,13 @@ function isPersisted(): boolean {
   return entry.value !== null && entry.value.id !== 0;
 }
 
+/**
+ * 字数。
+ * ⚠️ 只数纯文字：图片那行 `![名](attachments/<sha256>…)` 有九十来个字符，
+ *    算进去的话贴一张图就等于"多写了九十多个字"，纯属骗自己。
+ */
 const wordCount = computed(
-  () => content.value.replace(/\s/g, "").length
+  () => textOnly(content.value).replace(/\s/g, "").length
 );
 
 /**
@@ -330,6 +354,7 @@ async function load() {
     // 读失败时宁可"看不到图"，也不能把上一天的图留在屏幕上冒充这一天的。
     await loadAttachments();
     await loadTags();
+    lastCaret = null;
     dirty = false;
     saveState.value = "";
   } catch (e) {
@@ -337,6 +362,12 @@ async function load() {
   } finally {
     loading.value = false;
   }
+  // ⚠️ 渲染正文必须等到"这个可编辑 div 真的出现在页面上"之后。
+  //    load() 一开头就把 loading 置真，而正文区整块挂在 v-else 上 ——
+  //    那一刻 contentRef 还是 null，抢在前面渲染会**整个落空**，
+  //    界面上就是一片空白。所以只能等 loading 归假、再等一次 DOM 更新。
+  await nextTick();
+  renderEditor();
 }
 
 function cancelPendingSave() {
@@ -472,12 +503,279 @@ async function loadAttachments() {
   imageError.value = "";
   try {
     attachments.value = await listAttachments(props.date);
-    // 顺手把缩略图取回来：一篇日记通常只有几张图，界面上就该一眼看到。
-    for (const a of attachments.value) void urlOf(a);
+    // 把图取回来再往下走（不是"顺手发出去就不管"）：正文里要拿它当 <img> 的
+    // src，缩略图区也要用。一篇日记通常只有几张图，等一下换来的是一次到位，
+    // 而不是先闪一排打不开的图、再慢慢补上。
+    await Promise.all(attachments.value.map((a) => urlOf(a)));
   } catch (e) {
     attachments.value = [];
     imageError.value = toAppError(e).message;
   }
+}
+
+// ── 正文里的图片就地显示（2026-09-21 起）──────────────────────────────────
+//
+// 落库的仍然是 Markdown（铁律），编辑区里看到的却是真图片 —— 也就是说正文
+// 在内存里有**两份表示**：
+//   · `content.value` —— Markdown 原文：保存、算字数、判断"脏没脏"都用它；
+//   · 编辑区里的 DOM —— 用户看见、并直接动手的那一份。
+// 两者靠下面这组函数互相推导，**只在两个时刻同步**：
+//   · 打开一篇日记（Markdown → DOM，renderEditor）；
+//   · 每次输入 / 程序改完 DOM（DOM → Markdown，syncFromDom）。
+// 刻意**不做**"content 一变就重建 DOM" —— 那会在打字中途把光标顶走。
+
+/** 正文里的一行：若干文字片段 + 若干张图。 */
+type LineItem = string | Attachment;
+
+/**
+ * 把 Markdown 正文渲染进编辑区。
+ *
+ * ⚠️ **一行一个 `<div>`**，而不是"一串文字节点夹几个 `<br>`"。两个理由：
+ *   1. 浏览器按回车时插的就是 `<div>` —— 渲染出来的结构跟它一致，才不会
+ *      越编辑越乱（否则第一次回车就会把整篇重排一遍）；
+ *   2. 图片是块级元素，跟文字挤在同一行里，光标的落点会变得很难预测。
+ */
+function renderEditor() {
+  const root = contentRef.value;
+  if (!root) return;
+  const byRel = new Map(attachments.value.map((a) => [a.stored_rel, a]));
+
+  // 先把 Markdown 摊成"行 → 该行里的片段"，再统一建节点。
+  // 边解析边建的话，"文字里的换行"和"图片各占一行"会互相多吐一个空行。
+  const lines: LineItem[][] = [[]];
+  for (const seg of splitMarkdownImages(content.value)) {
+    if (seg.kind === "image") {
+      const a = byRel.get(seg.rel);
+      // 指不到任何附件的语法（图被删了 / 手写的）：**原样当文字留着**。
+      // 悄悄吃掉用户写过的东西，比留一行看不懂的语法更糟。
+      lines[lines.length - 1].push(a ?? imageMd(seg.name, seg.rel));
+      continue;
+    }
+    seg.text.split("\n").forEach((part, i) => {
+      if (i > 0) lines.push([]);
+      if (part) lines[lines.length - 1].push(part);
+    });
+  }
+
+  const frag = document.createDocumentFragment();
+  for (const items of lines) {
+    const line = document.createElement("div");
+    for (const item of items) {
+      line.appendChild(
+        typeof item === "string"
+          ? document.createTextNode(item)
+          : makeImgEl(item)
+      );
+    }
+    frag.appendChild(line);
+  }
+  while (root.firstChild) root.removeChild(root.firstChild);
+  root.appendChild(frag);
+  markEmpty();
+}
+
+/**
+ * 造一张"正文里的图片"。
+ *
+ * `data-rel`（= `attachments/<sha256>.<ext>`）是回写 Markdown 时**唯一**的依据：
+ * 显示地址是内存里的 Blob URL，换一天日期就换一批，靠它认不出这张图是谁。
+ */
+function makeImgEl(a: Attachment): HTMLImageElement {
+  const img = document.createElement("img");
+  img.className = "inline-img";
+  img.dataset.rel = a.stored_rel;
+  img.dataset.name = a.file_name;
+  img.alt = a.file_name;
+  img.draggable = false;
+  // 原子化：光标不能钻到图片里面去；退格一次是整张删掉，不是一个字符。
+  img.contentEditable = "false";
+  const url = imageUrls.value[a.id];
+  if (url) img.src = url;
+  return img;
+}
+
+/** 一个节点里的行内文字（图片折回 Markdown 语法）。 */
+function inlineTextOf(node: Node): string {
+  let out = "";
+  node.childNodes.forEach((child) => {
+    if (child.nodeType === Node.TEXT_NODE) {
+      out += child.textContent ?? "";
+    } else if (child.nodeName === "BR") {
+      out += "\n";
+    } else if (child.nodeName === "IMG") {
+      const el = child as HTMLElement;
+      out += imageMd(el.dataset.name ?? "", el.dataset.rel ?? "");
+    } else if (child.nodeType === Node.ELEMENT_NODE) {
+      out += inlineTextOf(child);
+    }
+  });
+  return out;
+}
+
+/**
+ * 一个"行"（`<div>`）的文字。
+ * ⚠️ 只含一个 `<br>` 的行是浏览器给**空行**垫的占位，算空串 ——
+ *    否则每按一次回车都会多存一个换行，越存越长。
+ */
+function lineTextOf(el: Element): string {
+  if (el.childNodes.length === 1 && el.firstChild?.nodeName === "BR") return "";
+  return inlineTextOf(el);
+}
+
+/** 编辑区的 DOM → Markdown。 */
+function serializeEditor(): string {
+  const root = contentRef.value;
+  if (!root) return "";
+  const parts: string[] = [];
+  let buf = "";
+  let started = false;
+  root.childNodes.forEach((child) => {
+    const isBlock =
+      child.nodeType === Node.ELEMENT_NODE &&
+      ["DIV", "P"].includes((child as Element).nodeName);
+    if (isBlock) {
+      if (started) parts.push(buf);
+      buf = lineTextOf(child as Element);
+      started = true;
+      return;
+    }
+    buf += inlineTextOf(child);
+    started = true;
+  });
+  if (started) parts.push(buf);
+  return parts.join("\n");
+}
+
+/** DOM 改完（用户输入 / 程序插了图）之后：把 Markdown 同步回来，并刷新"空没空"。 */
+function syncFromDom() {
+  content.value = serializeEditor();
+  markEmpty();
+}
+
+/** 正文区是不是空的（占位提示用）。判据与 `hasContent` 的文字那一半一致。 */
+function markEmpty() {
+  editorEmpty.value = content.value.trim() === "";
+}
+
+/** 正文被用户改动：把 DOM 收回成 Markdown。落库仍交给 content 的防抖监听。 */
+function onContentInput() {
+  syncFromDom();
+}
+
+/** 点正文里的图片 → 放大看（与点缩略图等效）。 */
+function onContentClick(ev: MouseEvent) {
+  const t = ev.target as HTMLElement | null;
+  if (!t || t.tagName !== "IMG" || !t.classList.contains("inline-img")) return;
+  const rel = t.dataset.rel ?? "";
+  const a = attachments.value.find((x) => x.stored_rel === rel);
+  if (a) void zoomIn(a);
+}
+
+/** 记一下光标。点按钮之后焦点跑掉了，届时就靠这一份。 */
+function rememberCaret() {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) return;
+  const r = sel.getRangeAt(0);
+  if (contentRef.value?.contains(r.startContainer)) lastCaret = r.cloneRange();
+}
+
+/** 当前该往哪儿插：优先活的光标，退而用记下来的那一个。 */
+function currentCaret(): Range | null {
+  const root = contentRef.value;
+  if (!root) return null;
+  const sel = window.getSelection();
+  if (sel && sel.rangeCount > 0) {
+    const r = sel.getRangeAt(0);
+    if (root.contains(r.startContainer)) return r;
+  }
+  if (lastCaret && root.contains(lastCaret.startContainer)) return lastCaret;
+  return null;
+}
+
+/** 光标所在的那一行（`root` 的直接子元素）。落在行与行之间时返回 null。 */
+function lineOf(node: Node | null, root: HTMLElement): HTMLElement | null {
+  let n: Node | null = node;
+  while (n && n !== root) {
+    if (n.nodeType === Node.ELEMENT_NODE && n.parentNode === root) {
+      return n as HTMLElement;
+    }
+    n = n.parentNode;
+  }
+  return null;
+}
+
+/**
+ * 在光标处插一张图，把光标留在图片**下一行的行首**，并返回那个新光标。
+ *
+ * ⚠️ 图片自己占一整行（不挤在半个句子里）：块级图片插在一句话中间的话，
+ *    "光标该落哪儿""退格删的是字还是图"都会变得不可预测。
+ *    做法是把光标所在那一行**按光标切成两半**，中间夹进图片这一行。
+ *
+ * 返回新光标是为了"一次多张"：第二张要接着第一张往下排，
+ * 不能各自回到同一个旧位置上去。
+ */
+function insertImageAtCaret(a: Attachment, caret?: Range | null): Range | null {
+  const root = contentRef.value;
+  if (!root) return null;
+  const range = caret ?? currentCaret();
+
+  const imgLine = document.createElement("div");
+  imgLine.appendChild(makeImgEl(a));
+  const restLine = document.createElement("div");
+
+  if (range && range.startContainer === root) {
+    // 光标正停在两行之间：直接插在那一行的位置上。
+    const ref = root.childNodes[range.startOffset] ?? null;
+    root.insertBefore(imgLine, ref);
+    root.insertBefore(restLine, ref);
+  } else {
+    const line = range ? lineOf(range.startContainer, root) : null;
+    if (!line) {
+      // 取不到光标（从系统文件框回来、焦点丢了）：老老实实追加到最后，
+      // 至少别把这张图丢掉。
+      root.appendChild(imgLine);
+      root.appendChild(restLine);
+    } else {
+      const parent = line.parentNode as Node;
+      const next = line.nextSibling;
+      // 把光标右边的内容整块摘出来，挪到图片下面那一行去。
+      // try 兜底：选区边界偶尔会落在一个取不到偏移量的节点上（比如图片本身），
+      // 那种情况下宁可不切分，也不能让整个插入动作抛出去。
+      try {
+        if (line.lastChild) {
+          const tail = document.createRange();
+          tail.setStart(range!.startContainer, range!.startOffset);
+          tail.setEndAfter(line.lastChild);
+          restLine.appendChild(tail.extractContents());
+        }
+      } catch {
+        restLine.replaceChildren();
+      }
+      parent.insertBefore(imgLine, next);
+      parent.insertBefore(restLine, next);
+      // 左边那一行被切空了就撤掉，否则白多一个空行。
+      if (line.childNodes.length === 0) line.remove();
+    }
+  }
+
+  // 光标落点：新行的行首。垫一个 <br> 是给"这一行还没有内容"时留的立脚点。
+  if (restLine.childNodes.length === 0) {
+    restLine.appendChild(document.createElement("br"));
+  }
+  syncFromDom();
+
+  const after = document.createRange();
+  after.setStart(restLine, 0);
+  after.collapse(true);
+  const sel = window.getSelection();
+  if (sel) {
+    sel.removeAllRanges();
+    sel.addRange(after);
+  }
+  // 立刻刷新 lastCaret：焦点若在按钮上（文件选择框那条路），
+  // 下一张图还得接着这一张往下排。
+  lastCaret = after.cloneRange();
+  return after;
 }
 
 /** 打开文件选择框（锁定 / 正在上传时不给点）。 */
@@ -498,11 +796,14 @@ function pickImage() {
  * 对象（名字 + 字节），弹的也还是系统文件选择框 —— 体验一样，
  * 却不需要多一个插件（见生产日志的坑表）。
  */
-async function uploadOne(file: File) {
+async function uploadOne(
+  file: File,
+  caret?: Range | null
+): Promise<Range | null> {
   imageError.value = "";
   if (locked.value) {
     imageError.value = "这篇日记已锁定，先解锁再插入图片";
-    return;
+    return null;
   }
 
   // 前端先把最明显的两类错误挡掉（省得白传一份出去）。真正的判据在后端：
@@ -512,7 +813,7 @@ async function uploadOne(file: File) {
     imageError.value = `只支持 ${IMAGE_EXTS.join(" / ")}，这个是 ${
       ext ? "." + ext : "(没有后缀的文件)"
     }`;
-    return;
+    return null;
   }
   if (file.size > MAX_IMAGE_BYTES) {
     imageError.value = `单张图片上限 ${MAX_IMAGE_BYTES / 1024 / 1024} MB，这张是 ${(
@@ -520,61 +821,44 @@ async function uploadOne(file: File) {
       1024 /
       1024
     ).toFixed(1)} MB`;
-    return;
+    return null;
   }
 
   imageBusy.value = true;
   try {
     const saved = await saveAttachment(props.date, file);
     attachments.value = [...attachments.value, saved];
-    // 立刻把缩略图取回来，不然要等下次打开这一天才看得见。
+    // 立刻把图取回来：正文里要拿它当 <img> 的 src。
     await urlOf(saved);
-    insertImageSyntax(saved);
+    const after = insertImageAtCaret(saved, caret);
     emit("notice", `已插入图片「${saved.file_name}」`);
+    return after;
   } catch (e) {
     imageError.value = toAppError(e).message;
+    return null;
   } finally {
     imageBusy.value = false;
   }
 }
 
-/** 文件选择框 / 拖拽的公共入口，支持一次选多张。 */
-async function uploadFiles(files: FileList | File[] | null) {
+/**
+ * 文件选择框 / 拖拽 / 粘贴的公共入口，支持一次多张。
+ *
+ * ⚠️ **串行**，而且每张都接着上一张插完之后的光标 —— 并发上传时两条记录的自增
+ *    id 会跟用户选的顺序错开，插进正文的顺序也跟着乱。
+ */
+async function uploadFiles(
+  files: FileList | File[] | null,
+  caret?: Range | null
+) {
   if (!files) return;
+  let at = caret ?? null;
   for (const f of Array.from(files)) {
-    // **串行**：并发上传时两条记录的自增 id 顺序会和用户选的顺序错开，
-    // 插进正文的顺序也跟着乱。
-    await uploadOne(f);
+    at = await uploadOne(f, at);
   }
 }
 
-/** 把图片语法插到正文光标处（正文永远是 Markdown 原文，这是 V1 约束）。 */
-function insertImageSyntax(a: Attachment) {
-  const syntax = `![${a.file_name}](${a.stored_rel})`;
-  const el = contentRef.value;
-  if (!el) {
-    // 拿不到输入框（极罕见）就追加到末尾，至少别把这张图丢掉。
-    const sep = content.value && !content.value.endsWith("\n") ? "\n" : "";
-    content.value = `${content.value}${sep}${syntax}\n`;
-    return;
-  }
-
-  const start = el.selectionStart ?? content.value.length;
-  const end = el.selectionEnd ?? start;
-  const before = content.value.slice(0, start);
-  const after = content.value.slice(end);
-  // 图片**单独占一行**（用户明确要的排版）：前后各补一个换行，
-  // 已经在行首 / 行尾就不补。
-  const lead = before && !before.endsWith("\n") ? "\n" : "";
-  const tail = after === "" || after.startsWith("\n") ? "" : "\n";
-  content.value = `${before}${lead}${syntax}${tail}${after}`;
-
-  const caret = (before + lead + syntax).length;
-  void nextTick(() => {
-    el.focus();
-    el.setSelectionRange(caret, caret);
-  });
-}
+// 插入图片的动作本身在 insertImageAtCaret（见上面那一整段说明）。
 
 /** 文件选择框选中之后：交给公共上传流程，然后把选择框清空。 */
 function onFilesPicked(ev: Event) {
@@ -605,12 +889,95 @@ async function onDrop(ev: DragEvent) {
   dragging.value = false;
   if (locked.value) return;
   const files = ev.dataTransfer?.files;
-  if (!files || files.length === 0) return;
+  if (!files || files.length === 0) {
+    // 拖的是**选中的文字**（不是文件）：让浏览器自己搬，搬完再把 DOM 收回成
+    // Markdown。不补这一下，文字挪了位置而 content.value 还是旧的 ——
+    // 下一次落库会把这次挪动覆盖回去，等于白拖。
+    window.setTimeout(syncFromDom, 0);
+    return;
+  }
   ev.preventDefault();
   await uploadFiles(files);
 }
 
-/** 删一张图。 */
+/** 剪贴板里的图片文件（系统截图、复制的图片文件都从这儿来）。 */
+function clipboardImages(dt: DataTransfer | null): File[] {
+  const out: File[] = [];
+  if (!dt) return out;
+  for (const item of Array.from(dt.items ?? [])) {
+    if (item.kind !== "file" || !item.type.startsWith("image/")) continue;
+    const f = item.getAsFile();
+    if (f) out.push(f);
+  }
+  return out;
+}
+
+/** 从 MIME 或文件名推一个扩展名出来（后端还要拿它 + MIME + 魔数三样对着验）。 */
+function extOf(f: File): string {
+  const byMime = (f.type.split("/")[1] ?? "").toLowerCase();
+  if (byMime === "jpeg") return "jpg";
+  if (IMAGE_EXTS.includes(byMime)) return byMime;
+  const byName = (f.name.split(".").pop() ?? "").toLowerCase();
+  return IMAGE_EXTS.includes(byName) ? byName : "png";
+}
+
+/**
+ * 粘贴进来的图叫什么。
+ *
+ * ⚠️ 系统截图（Win+Shift+S）给的是**空名字**或千篇一律的 "image.png" ——
+ *    全叫这个的话，将来导出 Markdown 根本认不出哪张是哪张。所以起一个带时间的。
+ *    从资源管理器复制的图片文件带着真名字，原样保留，别抢着改。
+ */
+function nameForPasted(f: File, stem: string): string {
+  const n = f.name ?? "";
+  const generic = !n || n === "blob" || /^image\.(png|jpe?g|gif|webp)$/i.test(n);
+  return generic ? `${stem}.${extOf(f)}` : n;
+}
+
+/** `File` 的名字不可写，包一层新的；内容照旧（`saveAttachment` 读的是字节）。 */
+function renameImage(f: File, name: string): File {
+  return new File([f], name, { type: f.type || "image/png" });
+}
+
+/** 一次粘贴的时间戳，形如 `粘贴-20260921-164312`。 */
+function pasteStamp(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `粘贴-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(
+    d.getHours()
+  )}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+/**
+ * Ctrl+V / 右键粘贴（用户 2026-09-21 明确要的）。
+ *
+ * 规则：**剪贴板里有图片就插图，没有就把这次粘贴整个交还给浏览器**（普通文字
+ * 粘贴）。刻意不做"有文字也有图片时两个都插" —— 从网页复制一段图文时，
+ * 那种行为会让用户看着一堆莫名多出来的图发懵。
+ */
+async function onPaste(ev: ClipboardEvent) {
+  if (locked.value) return;
+  const files = clipboardImages(ev.clipboardData);
+  if (files.length === 0) return;
+  // 有图片，就别让浏览器再按"富文本/纯文本"那套粘一遍。
+  ev.preventDefault();
+  // ⚠️ 先把光标存下来：下面要 await 落盘，回来时焦点可能已经不在正文里了。
+  const caret = currentCaret()?.cloneRange() ?? null;
+  const stamp = pasteStamp();
+  const named = files.map((f, i) =>
+    renameImage(f, nameForPasted(f, files.length > 1 ? `${stamp}-${i + 1}` : stamp))
+  );
+  await uploadFiles(named, caret);
+}
+
+/**
+ * 删一张图。
+ *
+ * ⚠️ 与上一版的**重要区别**：正文里那一处现在**跟着一起消失**。
+ *    图片在正文里就是这张附件的一个视图，留着一张打不开的图比"发现正文少了一行"
+ *    更糟。反面（在正文里退格删掉图）**不会**删记录 —— 记录仍挂在这一天上，
+ *    可以在缩略图区里再删一次；真多余的记录交给「清理图片缓存」。
+ */
 async function removeAttachment(a: Attachment) {
   imageError.value = "";
   try {
@@ -624,15 +991,29 @@ async function removeAttachment(a: Attachment) {
     }
     if (url && zoomed.value?.url === url) zoomed.value = null;
     attachments.value = attachments.value.filter((x) => x.id !== a.id);
-    // ⚠️ 正文里那行 `![](...)` **刻意不动**：那是用户自己写的东西，
-    //    悄悄改他的正文比留一行失效的引用更糟。所以提示里要说清楚。
-    emit(
-      "notice",
-      `已删除图片「${a.file_name}」（正文里那行图片语法还在，可以自己删掉）`
-    );
+    dropInlineImages(a.stored_rel);
+    emit("notice", `已删除图片「${a.file_name}」`);
   } catch (e) {
     imageError.value = toAppError(e).message;
   }
+}
+
+/** 把正文里引用这张图的节点摘掉，并同步 Markdown。 */
+function dropInlineImages(rel: string) {
+  const root = contentRef.value;
+  if (!root) return;
+  let touched = false;
+  root.querySelectorAll("img.inline-img").forEach((n) => {
+    if ((n as HTMLElement).dataset.rel !== rel) return;
+    const parent = n.parentNode;
+    n.remove();
+    // 那一行只剩空白的话，把这一行也收掉，免得正文里留下一片空。
+    if (parent && parent !== root && parent.childNodes.length === 0) {
+      (parent as Element).remove();
+    }
+    touched = true;
+  });
+  if (touched) syncFromDom();
 }
 
 /** 点缩略图：取到地址后在中间放大显示。 */
@@ -923,24 +1304,22 @@ function onCompositionEnd() {
 }
 
 /**
- * 文本域里按下 Tab 时插入缩进而不是移动焦点。
- * 日记里写代码块或列表时很需要。
+ * 正文区的按键。
+ *
+ * Tab 插入两个空格而不是把焦点移走（日记里写代码块、缩进列表都要它）。
+ *
+ * ⚠️ 这里必须用 `execCommand("insertText")`：它走的是浏览器自己的编辑命令，
+ *    DOM 和光标一起动。**光改 `content.value` 是改不动 DOM 的** ——
+ *    那正是老 textarea 的写法搬不过来的一点。
  */
 function onKeydown(ev: KeyboardEvent) {
-  // 只读输入框仍然会触发 keydown。不挡住的话，在锁定状态下按 Tab 会悄悄改掉
+  // 锁定态仍然会触发 keydown。不挡住的话，在锁定状态下按 Tab 会悄悄改掉
   // 内存里的 content —— 界面上看不见变化，解锁后那次编辑却会被保存进去。
   if (locked.value) return;
   if (ev.key === "Tab") {
     ev.preventDefault();
-    const el = ev.target as HTMLTextAreaElement;
-    const start = el.selectionStart;
-    const end = el.selectionEnd;
-    content.value =
-      content.value.slice(0, start) + "  " + content.value.slice(end);
-    void nextTick(() => {
-      el.selectionStart = el.selectionEnd = start + 2;
-    });
-    scheduleSave();
+    document.execCommand("insertText", false, "  ");
+    return;
   }
   // Ctrl+S 手动保存（虽然自动保存已覆盖，但符合直觉）
   if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s") {
@@ -1039,7 +1418,11 @@ onUnmounted(() => {
         <button
           class="toggle"
           :disabled="locked || imageBusy"
-          :title="locked ? '这篇日记已锁定，先解锁' : '插入一张图片（也可以直接把图片拖进正文）'"
+          :title="
+            locked
+              ? '这篇日记已锁定，先解锁'
+              : '插入一张图片（也可以直接拖进来，或 Ctrl+V 粘贴）'
+          "
           @click="pickImage"
         >
           {{ imageBusy ? "正在上传…" : "🖼 插入图片" }}
@@ -1263,11 +1646,14 @@ onUnmounted(() => {
       <p v-if="tagError" class="error">{{ tagError }}</p>
 
       <!--
-        附件缩略图区（P1 #10）。
-        ⚠️ **单独占一行**：正文里只保留 Markdown 语法，图片不挤进正文的排版里
-          （"正文永远是 Markdown 原文"是 V1 约束，这一条让不了步）。
-        点缩略图在中间放大看；点右上角 × 删掉这张图。⚠️ 删图**不动正文里那行
-        语法** —— 那是用户自己写的东西，悄悄改它比留一行失效引用更糟。
+        本日图片（P1 #10）。
+        ⚠️ 2026-09-21 起图片在正文里**就地显示**了，这一排不再是唯一看图的地方，
+          它现在的定位是"这一天挂了哪些图"的**总览 + 删除入口**：
+          · 点缩略图 = 在中间放大看（与直接点正文里那张图等效）；
+          · 点 × = 删掉这张图（记录 + 文件），**正文里那一处也一起消失**
+            —— 现在它就是这张附件的一个视图，留着只会变成一张打不开的图。
+          · 反过来，在正文里退格删掉图片**不会**删掉记录：记录仍挂在这一天上，
+            可以在这里再删一次。真多出来的记录交给设置里的「清理图片缓存」。
       -->
       <div v-if="attachments.length > 0" class="shot-row">
         <span v-for="a in attachments" :key="a.id" class="shot">
@@ -1301,26 +1687,41 @@ onUnmounted(() => {
       <p v-if="imageError" class="error">{{ imageError }}</p>
 
       <!--
-        锁定与编辑共用同一个 textarea，**刻意不切换成渲染视图**。
-        看得见的就是将要保存的原文：换行、空格、缩进全部原样，
-        所以"锁定"不会改变排版。只读靠 readonly（不是 disabled）——
-        disabled 的输入框不能选中、不能滚动，想复制一段都做不到。
+        正文区：可编辑 div（2026-09-21 起，原先是一个 textarea）。
+
+        换过来的原因只有一个：**图片要在正文里就地显示成图片**。textarea 里
+        只能放字符，插一张图就必须把 `![名](attachments/<sha256>.<ext>)` 那行
+        原文摆到用户眼前 —— 用户的原话是"把照片的名称和相关信息也插入进去"。
+        只有 DOM 才能让一张图长成一张图。
+
+        ⚠️ 换过来之后仍然守着两条老规矩：
+          1. **别的内容一律不渲染**（`#`、`**`、列表照旧是原样文字）。
+             "阅读视图"当年吃掉过用户手排的版，这次只放开图片这一类；
+          2. 锁定时**不是 disabled 而是 contenteditable=false** ——
+             还能选中、还能滚动、还能复制，只是不能改。
       -->
-      <textarea
+      <div
         ref="contentRef"
-        v-model="content"
         class="content-input"
-        :class="{ locked, dragging }"
-        placeholder="今天发生了什么…"
+        :class="{ locked, dragging, empty: editorEmpty }"
+        :contenteditable="locked ? 'false' : 'true'"
+        role="textbox"
+        aria-multiline="true"
+        :aria-readonly="locked"
         spellcheck="false"
-        :readonly="locked"
+        data-placeholder="今天发生了什么…"
+        @input="onContentInput"
+        @keydown="onKeydown"
+        @keyup="rememberCaret"
+        @mouseup="rememberCaret"
+        @click="onContentClick"
+        @paste="onPaste"
         @compositionstart="onCompositionStart"
         @compositionend="onCompositionEnd"
-        @keydown="onKeydown"
         @dragover="onDragOver"
         @dragleave="onDragLeave"
         @drop="onDrop"
-      />
+      ></div>
     </template>
 
     <!--
@@ -1712,10 +2113,15 @@ onUnmounted(() => {
   filter: brightness(1.05);
 }
 
+/* 正文区：可编辑 div（2026-09-21 起，原先是 textarea）。
+   ⚠️ 换行由每行那个子 <div> 承担，这里的 pre-wrap 只负责**行内**的连续空格 ——
+      Tab 打出来的两个空格要看得见，默认的 collapse 会把它压成一个。 */
 .content-input {
+  position: relative;
   flex: 1;
   width: 100%;
   min-height: 0;
+  overflow-y: auto;
   padding: 0;
   font-family: var(--mono);
   font-size: 15px;
@@ -1724,11 +2130,36 @@ onUnmounted(() => {
   background: transparent;
   border: none;
   outline: none;
-  resize: none;
+  white-space: pre-wrap;
+  word-break: break-word;
   tab-size: 2;
+  cursor: text;
 }
-.content-input::placeholder {
+/* 占位提示：绝对定位到左上角，落点与原来的 textarea placeholder 一致。
+   不用 `:empty` —— 正文里永远至少有一个 <div>，`:empty` 永远不命中。 */
+.content-input.empty::before {
+  content: attr(data-placeholder);
+  position: absolute;
+  left: 0;
+  top: 0;
   color: var(--text-3);
+  pointer-events: none;
+  user-select: none;
+}
+/* 正文里的图片：块级、独自占一行（不跟文字抢同一行的宽度），点一下放大看。 */
+.inline-img {
+  display: block;
+  max-width: 100%;
+  max-height: 60vh;
+  margin: 10px 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  cursor: zoom-in;
+  user-select: none;
+}
+.inline-img:hover {
+  border-color: var(--accent);
 }
 .preview {
   flex: 1;
