@@ -31,7 +31,6 @@ import {
   setEntryLocked,
   setEntryTags,
   TAG_MAX_CHARS,
-  TAG_SUGGEST_LIMIT,
   tagsOfEntry,
   toAppError,
   type Entry,
@@ -45,7 +44,7 @@ const props = defineProps<{
   onSaved?: () => void;
   /**
    * 标签变更信号。侧栏删掉 / 改名了某个标签时由父组件递增，
-   * 用来让这里的 chip 行与下拉候选跟着刷新。
+   * 用来让这里的 chip 行与面板候选跟着刷新。
    */
   tagToken?: number;
 }>();
@@ -55,6 +54,35 @@ const emit = defineEmits<{
   /** 本组件的标签改动也要让侧栏的标签列表知道（篇数变了）。 */
   (e: "tags-changed"): void;
 }>();
+
+/**
+ * 常用标签（预设名单）—— **前端常量，一行都不要写进库**。
+ *
+ * 只有用户**真正选中**的标签才进 `tag` 表。若启动时把预设 seed 进库，
+ * 侧栏那份标签列表立刻会冒出十几个"0 篇"的标签，把用户自己写过的挤没。
+ * 附带好处：以后想改预设名单，改这一行即可，不需要数据迁移。
+ *
+ * 取词按**维度**分布（兜底 / 事务 / 输入 / 精神 / 关系 / 身体 / 出行 / 生活），
+ * **刻意不含情绪类** —— 心情标记（MOODS）已经承担了"今天整体怎么样"，
+ * 标签负责的是"这篇写了什么主题"，两套体系不重叠。
+ * 详细理由见《Diary-P1功能设计规格.md》功能 1 →「增强」。
+ */
+const PRESET_TAGS = [
+  "日常",
+  "工作",
+  "学习",
+  "计划",
+  "读书",
+  "灵感",
+  "反思",
+  "家人",
+  "朋友",
+  "运动",
+  "旅行",
+  "假期",
+  "美食",
+  "健康",
+];
 
 const loading = ref(false);
 const errorText = ref("");
@@ -75,24 +103,26 @@ const entry = ref<Entry | null>(null);
 const mood = ref<number | null>(null);
 
 /**
- * 这一篇的标签（后端返回的权威名字，不是本地猜的）。
+ * 这一篇当前**应当**有的标签（界面渲染 + 提交依据）。
  *
- * ⚠️ 每次改动都**用后端的返回值整体替换**（`set_entry_tags` 返回实际存下来的
- *    列表）。本地自己 push/splice 看着更省一次往返，但清洗规则在后端
- *    （去空白、限长、忽略大小写去重），本地那份迟早与库里差一点 ——
- *    那就成了两套真相。
+ * 每次交互先本地更新它（即时反馈），随后串行提交给后端；
+ * 提交返回后**用后端返回的那份覆盖回来** —— 清洗规则（去空白 / 限长 /
+ * 忽略大小写去重）住在后端，本地那份必然差一点，界面的最终状态
+ * 必须以库里为准，不能停在"前端自己那条推理链"上。
  */
 const tags = ref<string[]>([]);
 
 /** 标签输入框里的内容（还没提交）。 */
 const tagInput = ref("");
-/** 全库的标签（含篇数）。下拉候选与"已存在过"的提示都来自它。 */
+/** 全库的标签（含篇数）。「其他」组的候选来自它。 */
 const allTags = ref<TagStat[]>([]);
-/** 下拉候选是否展开。 */
-const tagOpen = ref(false);
-/** 标签请求进行中。避免连点两下产生两次"整组覆盖"（会互相覆盖）。 */
-const tagBusy = ref(false);
+/** 标签面板是否展开。 */
+const panelOpen = ref(false);
 const tagError = ref("");
+
+/** 面板容器 / ＋ 触发按钮，用于判断"点面板外关闭"。 */
+const panelRef = ref<HTMLElement | null>(null);
+const triggerRef = ref<HTMLElement | null>(null);
 
 /**
  * 标签区是否可编辑。
@@ -110,21 +140,7 @@ const canTag = computed(() => hasContent() && !locked.value);
 const tagHint = computed(() => {
   if (locked.value) return "解锁后可改标签";
   if (!hasContent()) return "先写点内容，再贴标签";
-  return "回车添加；点 × 移除";
-});
-
-/**
- * 下拉候选：已有的、这篇还没有的、且与输入内容沾边的。
- *
- * 空输入时给出**全部**已有标签 —— 标签的价值在于复用，
- * 让用户在打第一个字之前就看见"上次那个叫什么"，比让他凭记忆打更实用。
- */
-const tagSuggestions = computed(() => {
-  const q = tagInput.value.trim().toLowerCase();
-  return allTags.value
-    .filter((t) => !tags.value.includes(t.name))
-    .filter((t) => q === "" || t.name.toLowerCase().includes(q))
-    .slice(0, TAG_SUGGEST_LIMIT);
+  return "点 ＋ 选择标签";
 });
 
 /**
@@ -145,11 +161,41 @@ const moodHint = computed(() => {
   return "今天心情如何？再点一次可取消";
 });
 
+/**
+ * 「其他」组：库里真实存在的、**不在预设名单里**的标签。
+ *
+ * 不新增命令、不新增字段 —— `allTags`（= `listTags()`）本来就返回
+ * "库里真实存在的标签"，减去预设名单，剩下的正是"用户自己写过的那些"。
+ *
+ * ⚠️「其他」是**分组显示**，不是合并成一个名叫"其他"的标签。
+ *    标签本身各自独立（否则"旅行"和"失眠"再也分不出来，还和改名/删除打架）。
+ */
+const otherTags = computed(() =>
+  allTags.value.filter((t) => !PRESET_TAGS.includes(t.name))
+);
+
+/**
+ * 分类：某标签当前是否挂在这一篇上。面板 chip 的选中态用它。
+ */
+function isSelected(name: string): boolean {
+  return tags.value.includes(name);
+}
+
 /** 输入法组字中。中文打字时输入法会先给出拼音候选，这段时间不能保存。 */
 let composing = false;
 let saveTimer: number | null = null;
 /** 标记"当前内容是否已被改动但尚未保存"，避免无谓写库。 */
 let dirty = false;
+
+/**
+ * 后端**最后一次确认**的标签状态。
+ *
+ * 用来判断"还需不需要再提交一次"（`tags` 与它不一致 = 有未落库的改动），
+ * 也用来在提交失败时回滚 —— 别让界面停在一个其实没存进去的样子。
+ */
+let syncedTags: string[] = [];
+/** 是否有一次"整组覆盖"正在飞。串行化用，见 syncTags。 */
+let tagInflight = false;
 
 /**
  * 这篇日记算不算"写过"（正文非空白）。
@@ -211,8 +257,9 @@ async function load() {
     // 先清空再读：读失败时宁可"看不到标签"，也不能把上一天的标签
     // 留在屏幕上冒充这一天的（那会让用户以为标签串了）。
     tags.value = [];
+    syncedTags = [];
     tagInput.value = "";
-    tagOpen.value = false;
+    panelOpen.value = false;
     await loadTags();
     dirty = false;
     saveState.value = "";
@@ -279,6 +326,7 @@ async function flush(forDate: string = props.date) {
         // entry 行没了 → entry_tag 的 ON DELETE CASCADE 把关联行清掉
         //（标签本身还在，可能别的日记在用）。所以这里清空的是"这一篇的标签"。
         tags.value = [];
+        syncedTags = [];
         dirty = false;
         saveState.value = "";
         emit("saved");
@@ -328,7 +376,7 @@ function pickMood(value: number) {
 }
 
 /**
- * 读这一篇的标签 + 全库标签（下拉候选用）。
+ * 读这一篇的标签 + 全库标签（面板「其他」组候选用）。
  *
  * 两个查询互不依赖，并发发出去。失败只记错误、不阻塞编辑 ——
  * 标签是附加信息，读不到不该让整个编辑器用不了。
@@ -341,6 +389,7 @@ async function loadTags() {
       listTags(),
     ]);
     tags.value = mine;
+    syncedTags = [...mine];
     allTags.value = all;
   } catch (e) {
     tagError.value = toAppError(e).message;
@@ -348,44 +397,77 @@ async function loadTags() {
 }
 
 /**
- * 把这一篇的标签整组提交给后端，并用后端返回的那份刷新界面。
+ * 把当前标签（`tags.value`）整组同步到后端。
  *
- * ⚠️ 提交前必须先把正文落库。标签挂的是 `entry_id`，而 entry 行是
- *    `save_entry` 的 upsert 产生的：用户打下第一个字、还没到 1 秒防抖就
- *    去贴标签的话，库里根本没有那一行 —— 后端会回"先写点内容再打标签"，
- *    而他明明已经写了。那种错最让人摸不着头脑，所以在这一层先 flush。
+ * ⚠️ **串行 + "最后一次为准"** —— 本条最容易写错的地方。
+ *
+ * `set_entry_tags` 是**整组覆盖**语义：两个请求乱序到达时，后到的旧值会把
+ * 新值盖掉（表现是"点了三个标签，最后只剩两个"）。所以：
+ *   - 同一时刻只允许**一个**请求在飞（`tagInflight`）；
+ *   - 飞行期间的每次点击都只更新 `tags.value`（累积用户意图），
+ *     等当前请求回来后再用**最新**的 `tags.value` 补提交一次。
+ * 这样连点多个标签最终全部落库，不会被中间态覆盖。**不要裸用 Promise.all。**
+ *
+ * 提交前先把正文落库：标签挂 `entry_id`，而 entry 行是 `save_entry` 的
+ * upsert 产生的 —— 打了字还没到防抖就去贴标签的话，库里根本没有那一行。
  */
-async function commitTags(next: string[]) {
-  // 整组覆盖是"读-改-写"，两次并发会互相覆盖（后到的把先到的结果冲掉），
-  // 所以同一时刻只允许一次在飞。
-  if (tagBusy.value) return;
-  tagBusy.value = true;
+/** 两个标签数组是否完全一致。用来判断"还有没有改动没落库"。 */
+function sameTags(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((t, i) => t === b[i]);
+}
+
+async function syncTags() {
+  if (tagInflight) return;
+  tagInflight = true;
   tagError.value = "";
   try {
-    if (dirty) await flush();
-    // flush 失败（例如已锁定）时就别往下走了：库里的行没变，
-    // 这时候提交标签只会再报一个看不懂的错。
-    if (saveState.value === "error") return;
-
-    tags.value = await setEntryTags(props.date, next);
-    // 篇数变了，侧栏那份列表也得跟着变。
-    allTags.value = await listTags();
-    tagInput.value = "";
-    emit("tags-changed");
+    while (!sameTags(tags.value, syncedTags)) {
+      const target = [...tags.value];
+      if (dirty) await flush();
+      // flush 失败（例如恰好被锁定）时别往下走：库里的行没变，
+      // 提交标签只会再报一个看不懂的错。回滚到库里已知的状态。
+      if (saveState.value === "error") {
+        tags.value = [...syncedTags];
+        break;
+      }
+      const saved = await setEntryTags(props.date, target);
+      // 以后端返回为准：清洗规则在后端，本地那份必然差一点。
+      syncedTags = [...saved];
+      tags.value = [...saved];
+      allTags.value = await listTags();
+      // 篇数变了，侧栏那份列表也得跟着变。
+      emit("tags-changed");
+    }
   } catch (e) {
     tagError.value = toAppError(e).message;
+    tags.value = [...syncedTags];
   } finally {
-    tagBusy.value = false;
+    tagInflight = false;
   }
 }
 
 /**
- * 添加一个标签。
+ * 面板 / chip 上点一下：选中 ↔ 取消，立即生效。
+ *
+ * 先本地更新（即时反馈），再交给 syncTags 串行提交；提交成功后会被
+ * 后端的返回值覆盖回来，所以最终状态始终来自数据库。
+ */
+function toggleTag(name: string) {
+  if (!canTag.value) return;
+  tags.value = isSelected(name)
+    ? tags.value.filter((t) => t !== name)
+    : [...tags.value, name];
+  void syncTags();
+}
+
+/**
+ * 从面板输入框添加一个标签。
  *
  * 重复的直接吞掉（不报错、也不发请求）：用户常常记不清有没有加过，
  * 连点两下就弹个"已存在"很烦人。判定**忽略大小写** ——
  * 后端 `tag.name` 是 `UNIQUE COLLATE NOCASE`，`Travel` 与 `travel`
- * 本来就是同一个标签。
+ * 本来就是同一个标签。清洗（trim / 限长 / 去重）不在这里重做一份，
+ * 原样交给后端，再拿后端返回的那份刷界面。
  */
 function addTag(raw: string) {
   const name = raw.trim();
@@ -395,19 +477,61 @@ function addTag(raw: string) {
     tagInput.value = "";
     return;
   }
-  void commitTags([...tags.value, name]);
+  tags.value = [...tags.value, name];
+  tagInput.value = "";
+  void syncTags();
 }
 
+/** chip × ：移除一个标签。 */
 function removeTag(name: string) {
-  void commitTags(tags.value.filter((t) => t !== name));
+  if (!canTag.value) return;
+  tags.value = tags.value.filter((t) => t !== name);
+  void syncTags();
 }
 
-/** 点下拉里的候选。加完保持展开，方便连着加几个。 */
-function pickSuggestion(name: string) {
-  tagOpen.value = true;
-  addTag(name);
+function togglePanel() {
+  if (!canTag.value) return;
+  panelOpen.value = !panelOpen.value;
 }
 
+function closePanel() {
+  panelOpen.value = false;
+}
+
+/**
+ * 点面板外关闭。
+ *
+ * ⚠️ 用 `pointerdown` 而不是 `click`：`click` 会和"打开面板的那一次点击"
+ *    打架（同一个事件先打开又立刻关掉）。这跟指令 9（日历快速跳转）
+ *    踩过的是同一个坑，直接抄它的作业。
+ */
+function onDocPointerDown(ev: PointerEvent) {
+  if (!panelOpen.value) return;
+  const t = ev.target as Node;
+  if (panelRef.value?.contains(t) || triggerRef.value?.contains(t)) return;
+  closePanel();
+}
+
+/** 按 Esc 关闭面板。 */
+function onDocKeydown(ev: KeyboardEvent) {
+  if (ev.key === "Escape" && panelOpen.value) closePanel();
+}
+
+/**
+ * 面板开着时才挂全局监听，关掉就摘 —— 并且**在 onUnmounted 里再摘一次**，
+ * 否则反复挂载 / 卸载会累积监听器。
+ */
+watch(panelOpen, (open) => {
+  if (open) {
+    document.addEventListener("pointerdown", onDocPointerDown, true);
+    document.addEventListener("keydown", onDocKeydown);
+  } else {
+    document.removeEventListener("pointerdown", onDocPointerDown, true);
+    document.removeEventListener("keydown", onDocKeydown);
+  }
+});
+
+/** 面板输入框的键盘处理：回车提交、Esc 关闭；组字期间一律不提交。 */
 function onTagKeydown(ev: KeyboardEvent) {
   // ⚠️ 输入法组字期间的回车是在**选词**，不是在提交标签。
   //    不挡这一下，中文用户每打完一个词都会顺手 . 提交一次。
@@ -416,8 +540,9 @@ function onTagKeydown(ev: KeyboardEvent) {
     ev.preventDefault();
     addTag(tagInput.value);
   } else if (ev.key === "Escape") {
-    tagOpen.value = false;
+    ev.preventDefault();
     tagInput.value = "";
+    closePanel();
   }
 }
 
@@ -489,7 +614,7 @@ watch(
 watch([title, content], scheduleSave);
 
 /**
- * 侧栏删掉了某个标签 / 把它改了名 → 这里的 chip 行与下拉候选都得刷新
+ * 侧栏删掉了某个标签 / 把它改了名 → 这里的 chip 行与面板候选都得刷新
  *（被删的那个可能正挂在这一篇上）。
  *
  * 自己发出的改动也会绕回来触发一次（父组件把 tagToken 递增后传回来），
@@ -518,6 +643,9 @@ function beforeUnload(e: BeforeUnloadEvent) {
 window.addEventListener("beforeunload", beforeUnload);
 onUnmounted(() => {
   window.removeEventListener("beforeunload", beforeUnload);
+  // 面板的全局监听也要摘掉，避免反复挂载累积。
+  document.removeEventListener("pointerdown", onDocPointerDown, true);
+  document.removeEventListener("keydown", onDocKeydown);
   // 组件卸载前把未落库的内容写下去。
   if (dirty) void flush();
 });
@@ -583,8 +711,8 @@ onUnmounted(() => {
       </div>
 
       <!--
-        标签区：已有标签是 chip（点 × 移除），末尾一个 ＋ 输入框（回车添加，
-        输入时下拉提示已用过的标签）。
+        标签区：已挂的标签是 chip（点 × 移除），末尾一个 ＋ 按钮弹出面板。
+        面板分三块 —— 常用（预设名单）/ 其他（用户自己写过的）/ 新建输入框。
 
         ⚠️ 正文为空 / 已锁定时整个区置灰，并把原因写在旁边（tagHint）——
            "为什么点不动"必须当场说清楚，否则用户只会觉得按钮坏了。
@@ -595,7 +723,7 @@ onUnmounted(() => {
           <span class="chip-name">{{ t }}</span>
           <button
             class="chip-x"
-            :disabled="!canTag || tagBusy"
+            :disabled="!canTag"
             :title="canTag ? `移除标签「${t}」` : tagHint"
             @click="removeTag(t)"
           >
@@ -603,36 +731,81 @@ onUnmounted(() => {
           </button>
         </span>
 
-        <div class="tag-add">
-          <input
-            v-model="tagInput"
-            class="tag-input"
-            type="text"
-            placeholder="＋ 标签"
-            :maxlength="TAG_MAX_CHARS"
-            :disabled="!canTag || tagBusy"
-            :title="tagHint"
-            @focus="tagOpen = true"
-            @blur="tagOpen = false"
-            @input="tagOpen = true"
-            @keydown="onTagKeydown"
-          />
-          <!--
-            下拉候选。
-            ⚠️ 候选用 @mousedown.prevent：不挡这一下，输入框会在 click
-               触发之前先 blur，下拉被关掉，用户永远点不中候选。
-          -->
-          <ul v-if="tagOpen && canTag && tagSuggestions.length" class="suggest">
-            <li v-for="s in tagSuggestions" :key="s.id">
-              <button type="button" @mousedown.prevent @click="pickSuggestion(s.name)">
-                <span class="suggest-name">{{ s.name }}</span>
-                <span class="suggest-count">{{ s.entry_count }} 篇</span>
-              </button>
-            </li>
-          </ul>
-        </div>
+        <button
+          ref="triggerRef"
+          type="button"
+          class="tag-plus"
+          :disabled="!canTag"
+          :title="canTag ? '选择或新建标签' : tagHint"
+          @click="togglePanel"
+        >
+          ＋ 标签
+        </button>
 
         <span v-if="!canTag" class="tag-note">{{ tagHint }}</span>
+
+        <!--
+          标签面板。绝对定位（不占版面高度），容器 .tag-row 是定位上下文。
+          ⚠️ 选中态以「库里 / 本次已提交的状态」为准（isSelected 读的是 tags，
+             而 tags 每次都被后端返回值覆盖），不是前端自己那条推理链。
+        -->
+        <div
+          v-if="panelOpen && canTag"
+          ref="panelRef"
+          class="tag-panel"
+          role="dialog"
+          aria-label="标签"
+        >
+          <div class="panel-group">
+            <div class="panel-label">常用</div>
+            <div class="panel-chips">
+              <button
+                v-for="name in PRESET_TAGS"
+                :key="name"
+                type="button"
+                class="panel-chip"
+                :class="{ on: isSelected(name) }"
+                @click="toggleTag(name)"
+              >
+                {{ name }}
+              </button>
+            </div>
+          </div>
+
+          <div class="panel-group">
+            <div class="panel-label">其他</div>
+            <div class="panel-chips">
+              <button
+                v-for="t in otherTags"
+                :key="t.id"
+                type="button"
+                class="panel-chip"
+                :class="{ on: isSelected(t.name) }"
+                @click="toggleTag(t.name)"
+              >
+                {{ t.name }}
+              </button>
+            </div>
+          </div>
+
+          <div class="panel-add">
+            <input
+              v-model="tagInput"
+              class="panel-input"
+              type="text"
+              placeholder="＋ 输入新标签…"
+              :maxlength="TAG_MAX_CHARS"
+              @keydown="onTagKeydown"
+            />
+            <button
+              type="button"
+              class="panel-add-btn"
+              @click="addTag(tagInput)"
+            >
+              添加
+            </button>
+          </div>
+        </div>
       </div>
 
       <p v-if="tagError" class="error">{{ tagError }}</p>
@@ -771,8 +944,9 @@ onUnmounted(() => {
   cursor: default;
 }
 
-/* 标签区：一行 chip + 一个 ＋ 输入框，可折行。 */
+/* 标签区：一行 chip + 一个 ＋ 按钮，可折行。绝对定位的面板以它为定位上下文。 */
 .tag-row {
+  position: relative;
   display: flex;
   align-items: center;
   flex-wrap: wrap;
@@ -782,7 +956,7 @@ onUnmounted(() => {
 /* 不可编辑（空日记 / 已锁定）：整体压暗，但仍看得见已挂的标签。
    旁边那行 tag-note 说明原因 —— 光置灰不解释，用户只会以为坏了。 */
 .tag-row.disabled .chip,
-.tag-row.disabled .tag-add {
+.tag-row.disabled .tag-plus {
   opacity: 0.45;
 }
 .chip {
@@ -795,6 +969,12 @@ onUnmounted(() => {
   color: var(--text-2);
   background: var(--accent-soft);
   border-radius: 999px;
+}
+.chip-name {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .chip-x {
   width: 16px;
@@ -815,83 +995,111 @@ onUnmounted(() => {
 .chip-x:disabled {
   cursor: default;
 }
-/* 输入框本身要窄：标签一般两个字，占一行宽输入框会把整行撑开。 */
-.tag-add {
-  position: relative;
-  display: flex;
-  align-items: center;
-}
-.tag-input {
-  width: 84px;
-  padding: 3px 8px;
+/* ＋ 触发按钮：虚线小药丸，和 chip 视觉同一档。 */
+.tag-plus {
+  padding: 3px 10px;
   font-size: 12px;
-  color: var(--text-1);
+  color: var(--text-3);
   background: transparent;
   border: 1px dashed var(--border);
   border-radius: 999px;
-  outline: none;
+  cursor: pointer;
 }
-.tag-input:focus {
-  width: 120px;
-  border-style: solid;
+.tag-plus:hover:not(:disabled) {
+  color: var(--accent);
   border-color: var(--accent);
 }
-.tag-input:disabled {
+.tag-plus:disabled {
   cursor: default;
-}
-.tag-input::placeholder {
-  color: var(--text-3);
 }
 .tag-note {
   font-size: 12px;
   color: var(--text-3);
 }
-/* 下拉候选：绝对定位，不占版面高度（否则正文会被推下去一下）。 */
-.suggest {
+
+/* 标签面板：绝对定位，不占版面高度（否则正文会被推下去一下）。 */
+.tag-panel {
   position: absolute;
-  top: calc(100% + 4px);
+  top: calc(100% + 6px);
   left: 0;
-  z-index: 10;
-  min-width: 140px;
-  max-height: 190px;
-  overflow-y: auto;
-  list-style: none;
-  margin: 0;
-  padding: 4px;
+  z-index: 30;
+  width: min(430px, 82vw);
+  padding: 10px 12px;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.12);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.16);
 }
-.suggest button {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  width: 100%;
-  padding: 5px 8px;
-  font-size: 12px;
-  text-align: left;
-  color: var(--text-1);
-  background: transparent;
-  border: none;
-  border-radius: 5px;
-  cursor: pointer;
+.panel-group + .panel-group {
+  margin-top: 10px;
 }
-.suggest button:hover {
-  background: var(--hover);
-}
-.suggest-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.suggest-count {
-  margin-left: auto;
-  flex-shrink: 0;
+.panel-label {
+  margin-bottom: 5px;
   font-size: 11px;
   color: var(--text-3);
-  font-variant-numeric: tabular-nums;
 }
+.panel-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.panel-chip {
+  padding: 3px 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-2);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+}
+.panel-chip:hover {
+  background: var(--hover);
+}
+/* 选中态：和编辑器顶部 chip 用同一套强调色，一眼看出"这篇挂了这个"。 */
+.panel-chip.on {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.panel-add {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.panel-input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 10px;
+  font-size: 12px;
+  color: var(--text-1);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  outline: none;
+}
+.panel-input:focus {
+  border-color: var(--accent);
+}
+.panel-input::placeholder {
+  color: var(--text-3);
+}
+.panel-add-btn {
+  flex-shrink: 0;
+  padding: 5px 14px;
+  font-size: 12px;
+  color: #fff;
+  background: var(--accent);
+  border: none;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.panel-add-btn:hover {
+  filter: brightness(1.05);
+}
+
 .content-input {
   flex: 1;
   width: 100%;
