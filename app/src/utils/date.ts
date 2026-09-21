@@ -63,14 +63,33 @@ export function monthGrid(month: string): (string | null)[] {
   return cells;
 }
 
+const WEEK = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+
+/** 'YYYY-MM-DD' -> Date（本地时区；只取年月日，不碰时分秒）。 */
+function fromDateKey(key: string): Date {
+  const [y, m, d] = key.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
 /** 'YYYY-MM-DD' -> '9月11日 周五' */
 export function humanDate(key: string): string {
-  const [y, m, d] = key.split("-").map(Number);
-  const date = new Date(y, m - 1, d);
-  const week = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"][
-    date.getDay()
-  ];
-  return `${m}月${d}日 ${week}`;
+  const d = fromDateKey(key);
+  return `${d.getMonth() + 1}月${d.getDate()}日 ${WEEK[d.getDay()]}`;
+}
+
+/**
+ * 'YYYY-MM-DD' -> '2026年9月11日 周五'
+ *
+ * 和 `humanDate` 只差一个**年份**。统计面板一律用这个：
+ * 那里画的是**跨年的区间**（"从 … 到 …"、连续天数数到哪一天），
+ * 不带年份在跨年之后会读成"从 12月30日 到 1月2日"这种看着在倒着走的数字。
+ * 编辑区 / 搜索结果上下文明确（就摆在当天那篇日记里），继续用短的那个。
+ */
+export function humanDateFull(key: string): string {
+  const d = fromDateKey(key);
+  return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日 ${
+    WEEK[d.getDay()]
+  }`;
 }
 
 /** 'YYYY-MM' -> '2026年9月' */

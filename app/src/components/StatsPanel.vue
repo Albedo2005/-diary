@@ -10,9 +10,14 @@
  * 日记的数据量很小（最多几百条），引一个图表库只会让安装包白白变大几 MB。
  *
  * 两处标注是刻意的（不是装饰）：
- *   1. 连续天数旁边写"截至 X月X日"或"含今天" —— 口径本来就是
+ *   1. 连续天数旁边写"截至 2026年9月20日 周日"或"含今天" —— 口径本来就是
  *      "从最近一篇往前数"，今天没写也照常显示到昨天；不标用户会以为断了。
  *   2. 一篇都没写过时给一句话，而不是满屏 0 加一堆空图。
+ *
+ * ⚠️ **本面板的日期一律带年份**（用 `humanDateFull`，不用 `humanDate`）：
+ *    这里显示的是"从…到…"和"数到哪一天"这类**跨年区间**，
+ *    不带年份过了年会读成"从 12月30日 到 1月2日"，看着像倒着走。
+ *    编辑区、搜索结果在当天日记的上下文里，继续用不带年份的短格式。
  *
  * ⚠️ `stats` 是 `Stats | null`（读失败时 `App.vue` 的 loadAux 会吞掉错误）。
  *    所以下面把每个要显示的数字都收成**空安全的 computed**，
@@ -21,7 +26,7 @@
 import { computed } from "vue";
 import { MOODS, type Stats } from "../api";
 import {
-  humanDate,
+  humanDateFull,
   humanMonth,
   shiftMonth,
   toMonthKey,
@@ -58,11 +63,15 @@ const daysThisMonth = pick((s) => s.days_this_month);
 const hasEntries = computed(() => (props.stats?.total_entries ?? 0) > 0);
 const hasMoods = computed(() => (props.stats?.mood_counts.length ?? 0) > 0);
 
-/** 连续天数的时间标注：今天写过就"含今天"，否则标出实际数到哪一天。 */
+/**
+ * 连续天数的时间标注：今天写过就"含今天"，否则标出实际数到哪一天。
+ *
+ * 用带年份的 `humanDateFull` —— 这个面板上的日期一律带年份（见文件头说明）。
+ */
 const streakAsOf = computed(() => {
   const last = props.stats?.last_date;
   if (!last) return "";
-  return last === today ? "含今天" : `截至 ${humanDate(last)}`;
+  return last === today ? "含今天" : `截至 ${humanDateFull(last)}`;
 });
 
 const yearMonth = computed(() => humanMonth(toMonthKey(new Date())));
@@ -72,8 +81,8 @@ const rangeText = computed(() => {
   if (!first) return "";
   const last = props.stats?.last_date ?? first;
   return first === last
-    ? `仅 ${humanDate(first)} 一天`
-    : `从 ${humanDate(first)} 到 ${humanDate(last)}`;
+    ? `仅 ${humanDateFull(first)} 一天`
+    : `从 ${humanDateFull(first)} 到 ${humanDateFull(last)}`;
 });
 
 /** 心情分布：固定按 `MOODS` 的顺序列出全部档位，没出现过的补 0。 */
