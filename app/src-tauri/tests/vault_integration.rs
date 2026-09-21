@@ -2354,3 +2354,275 @@ fn tag_input_validation_rejects_garbage() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ---------------------------------------------------------------------------
+// Markdown 导出（P1 #11 / 指令 7）
+//
+// 这一组对着四条验收标准写：
+//   1. 导出的 .md 中文 / 换行 / Markdown 语法完全原样
+//   2. 含大量符号 / emoji 的日记也能正常导出（不因文件名崩溃）
+//   3. 导出数量 == 统计里的"共 N 篇"（只导写过的）
+//   4. 锁定状态不影响导出
+// ---------------------------------------------------------------------------
+
+/// 造两份"有正文 + 有心情 + 有标签"的日记。
+fn seed_exportable(v: &Vault) {
+    v.save_entry_with_mood(
+        "2026-09-18",
+        "第一天",
+        "今天去看了雪山。\n\n风很大。",
+        Some(3),
+    )
+    .unwrap();
+    v.save_entry_with_mood("2026-09-19", "第二天", "- 早起\n- 走了 12 公里", Some(5))
+        .unwrap();
+    v.set_entry_tags("2026-09-18", &["旅行".into(), "青海".into()])
+        .unwrap();
+    v.set_entry_tags("2026-09-19", &["旅行".into()]).unwrap();
+}
+
+#[test]
+fn export_writes_one_file_per_written_entry_plus_index() {
+    let dir = temp_dir("export-basic");
+    let out = dir.join("导出");
+    {
+        let v = Vault::create(&dir, PIN, None).unwrap();
+        seed_exportable(&v);
+
+        let res = v.export_markdown(out.to_str().unwrap()).unwrap();
+
+        assert_eq!(res.entry_count, 2, "两篇写过 → 导出两篇");
+        assert_eq!(res.renamed, 0, "首次导出到空目录不该有重名");
+        assert!(
+            std::path::Path::new(&res.index_path).exists(),
+            "index.md 必须生成：{}",
+            res.index_path
+        );
+
+        // 年 / 月 两层目录
+        let f1 = out.join("2026").join("09").join("2026-09-18.md");
+        assert!(f1.exists(), "单篇应落在 年/月/日期.md：{}", f1.display());
+
+        let text = std::fs::read_to_string(&f1).unwrap();
+        assert!(text.starts_with("---\n"), "必须以 front-matter 开头");
+        assert!(text.contains("\ndate: 2026-09-18\n"), "{text}");
+        assert!(text.contains("\ntitle: 第一天\n"), "{text}");
+        assert!(text.contains("\nmood: 3\n"), "{text}");
+        // 标签按名字排序（与 tags_of_entry 同一个排序口径）
+        assert!(text.contains("\ntags: [旅行, 青海]\n"), "{text}");
+        assert!(text.contains("\nword_count: "), "{text}");
+        // ⚠️ 核心验收：正文**一字不改**，软换行与空行都在
+        assert!(
+            text.ends_with("今天去看了雪山。\n\n风很大。"),
+            "正文必须原样输出，实际：{text:?}"
+        );
+
+        // index.md：日期 + 标题 + 链接
+        let idx = std::fs::read_to_string(out.join("index.md")).unwrap();
+        assert!(idx.contains("共 2 篇"), "{idx}");
+        assert!(
+            idx.contains("- [2026-09-18](2026/09/2026-09-18.md) 第一天"),
+            "{idx}"
+        );
+        assert!(
+            idx.contains("- [2026-09-19](2026/09/2026-09-19.md) 第二天"),
+            "{idx}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn export_splits_files_into_year_and_month_folders() {
+    let dir = temp_dir("export-folders");
+    let out = dir.join("导出");
+    {
+        let v = Vault::create(&dir, PIN, None).unwrap();
+        v.save_entry("2025-12-31", "", "跨年前").unwrap();
+        v.save_entry("2026-01-01", "", "跨年后").unwrap();
+
+        let res = v.export_markdown(out.to_str().unwrap()).unwrap();
+        assert_eq!(res.entry_count, 2);
+        assert!(out.join("2025").join("12").join("2025-12-31.md").exists());
+        assert!(out.join("2026").join("01").join("2026-01-01.md").exists());
+
+        // 链接里用 `/`：Markdown 链接是给别的渲染器读的，
+        // Windows 的反斜杠在那边不是路径分隔符。
+        let idx = std::fs::read_to_string(out.join("index.md")).unwrap();
+        assert!(idx.contains("](2025/12/2025-12-31.md)"), "{idx}");
+        assert!(idx.contains("](2026/01/2026-01-01.md)"), "{idx}");
+        assert!(!idx.contains('\\'), "索引里的链接不该出现反斜杠：{idx}");
+        // 标题为空的日记：只有链接，后面不拖一个多余空格
+        assert!(idx.contains("- [2025-12-31](2025/12/2025-12-31.md)\n"), "{idx}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn export_file_names_use_the_date_so_hostile_titles_are_safe() {
+    let dir = temp_dir("export-hostile-title");
+    let out = dir.join("导出");
+    {
+        let v = Vault::create(&dir, PIN, None).unwrap();
+        // 标题里塞满 Windows 文件名非法字符 + 换行 + emoji + 目录穿越
+        let nasty = "a/b\\c:d*e?f\"g<h>i|j\n第二行 ../.. 逃跑 🥰";
+        v.save_entry("2026-09-18", nasty, "正文").unwrap();
+
+        let res = v.export_markdown(out.to_str().unwrap()).unwrap();
+        assert_eq!(res.entry_count, 1, "标题再脏也不该让导出失败");
+
+        // 文件名只来自日期 —— 一个非法字符都没混进来
+        assert!(
+            out.join("2026").join("09").join("2026-09-18.md").exists(),
+            "文件名必须只由日期构成"
+        );
+
+        let text = std::fs::read_to_string(out.join("2026").join("09").join("2026-09-18.md"))
+            .unwrap();
+        // 标题没丢，只是乖乖待在 front-matter 里、被转义成了合法的 YAML 字符串
+        assert!(text.contains("title: \""), "含特殊字符的标题必须加引号：{text}");
+        assert!(text.contains("\\\\"), "反斜杠必须转义：{text}");
+        assert!(text.contains("\\n第二行"), "标题里的换行要转义成 \\n：{text}");
+
+        // front-matter 必须**恰好 5 行**：标题里的换行若没转义，这里就会多出几行，
+        // 于是整个 front-matter 被切断、解析器读到的是一段残缺 YAML。
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some("---"));
+        let mut fm_lines = 0;
+        for l in lines.by_ref() {
+            if l == "---" {
+                break;
+            }
+            fm_lines += 1;
+        }
+        assert_eq!(fm_lines, 5, "front-matter 应恰好 5 行，实际：{text:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn export_counts_only_written_entries() {
+    let dir = temp_dir("export-written-only");
+    let out = dir.join("导出");
+    {
+        let v = Vault::create(&dir, PIN, None).unwrap();
+        v.save_entry("2026-09-18", "写了", "有正文").unwrap();
+        // 只有空白字符的行：库里存在，但按全项目唯一口径**不算写过**
+        v.save_entry("2026-09-20", "只有空白", "   \n\t ").unwrap();
+
+        let res = v.export_markdown(out.to_str().unwrap()).unwrap();
+        assert_eq!(res.entry_count, 1);
+
+        // 验收标准③：导出数量 == 统计里的"共 N 篇"
+        assert_eq!(
+            res.entry_count as i64,
+            v.stats(TEST_TODAY).unwrap().total_entries,
+            "导出数量必须与统计的「共 N 篇」严格一致"
+        );
+
+        // 没写过的日期一个文件都不该有
+        assert!(!out.join("2026").join("09").join("2026-09-20.md").exists());
+        assert!(!out.join("2026").join("09").join("2026-09-19.md").exists());
+        let idx = std::fs::read_to_string(out.join("index.md")).unwrap();
+        assert!(idx.contains("共 1 篇"), "{idx}");
+        assert!(!idx.contains("2026-09-20"), "空行不该出现在索引里：{idx}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn export_ignores_the_lock_flag() {
+    let dir = temp_dir("export-locked");
+    let out = dir.join("导出");
+    {
+        let v = Vault::create(&dir, PIN, None).unwrap();
+        v.save_entry("2026-09-18", "锁着的", "锁定是防改，不是防读")
+            .unwrap();
+        v.set_entry_locked("2026-09-18", true).unwrap();
+        assert!(v.is_locked("2026-09-18").unwrap(), "前置条件：这篇确实锁上了");
+
+        // 验收标准④：锁定不影响导出
+        let res = v.export_markdown(out.to_str().unwrap()).unwrap();
+        assert_eq!(res.entry_count, 1, "锁定不该挡住导出");
+        let text = std::fs::read_to_string(out.join("2026").join("09").join("2026-09-18.md"))
+            .unwrap();
+        assert!(text.ends_with("锁定是防改，不是防读"), "{text}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn export_never_overwrites_existing_files() {
+    let dir = temp_dir("export-no-overwrite");
+    let out = dir.join("导出");
+    {
+        let v = Vault::create(&dir, PIN, None).unwrap();
+        v.save_entry("2026-09-18", "原稿", "第一次").unwrap();
+
+        let first = v.export_markdown(out.to_str().unwrap()).unwrap();
+        assert_eq!(first.renamed, 0);
+
+        let mine = out.join("2026").join("09").join("2026-09-18.md");
+        let before = std::fs::read_to_string(&mine).unwrap();
+
+        // 再导一次到同一个目录：必须加后缀，**绝不覆盖**
+        let second = v.export_markdown(out.to_str().unwrap()).unwrap();
+        assert!(second.renamed > 0, "重名必须被计数并回报");
+
+        assert_eq!(
+            std::fs::read_to_string(&mine).unwrap(),
+            before,
+            "已存在的文件必须一字未动"
+        );
+        assert!(
+            out.join("2026")
+                .join("09")
+                .join("2026-09-18 (1).md")
+                .exists(),
+            "重名的单篇应改成「日期 (1).md」"
+        );
+        assert!(out.join("index (1).md").exists(), "index.md 同理不覆盖");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn export_entry_markdown_returns_one_entry_text() {
+    let dir = temp_dir("export-single");
+    {
+        let v = Vault::create(&dir, PIN, None).unwrap();
+        v.save_entry_with_mood("2026-09-18", "标题", "正文\n\n第二段", Some(2))
+            .unwrap();
+        v.set_entry_tags("2026-09-18", &["旅行".into()]).unwrap();
+
+        let md = v.export_entry_markdown("2026-09-18").unwrap();
+        assert!(md.starts_with("---\ndate: 2026-09-18\n"), "{md}");
+        assert!(md.contains("\ntitle: 标题\n"), "{md}");
+        assert!(md.contains("\nmood: 2\n"), "{md}");
+        assert!(md.contains("\ntags: [旅行]\n"), "{md}");
+        assert!(md.ends_with("正文\n\n第二段"), "正文必须原样：{md:?}");
+
+        // 那天没有记录 → validation 错误（不是 panic、也不是空字符串）
+        assert!(matches!(
+            v.export_entry_markdown("2026-01-01").unwrap_err(),
+            AppError::Validation(_)
+        ));
+        // 日期格式错也要挡住（与全项目其它入口同一口径）
+        assert!(v.export_entry_markdown("2026-1-1").is_err());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn export_rejects_an_empty_destination() {
+    let dir = temp_dir("export-empty-dest");
+    {
+        let v = Vault::create(&dir, PIN, None).unwrap();
+        v.save_entry("2026-09-18", "t", "c").unwrap();
+        assert!(matches!(
+            v.export_markdown("   ").unwrap_err(),
+            AppError::Validation(_)
+        ));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

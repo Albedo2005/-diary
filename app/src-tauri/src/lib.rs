@@ -54,6 +54,16 @@ pub fn run() {
     }
 
     tauri::Builder::default()
+        // 打开目录（导出完成后那个「打开文件夹」用的）。
+        //
+        // ⚠️ 这个依赖一直在 `Cargo.toml` 里，但**从来没有注册过**，
+        //    于是 `capabilities/default.json` 里的 `opener:default` 一直是
+        //    一纸空文（权限声明了却没有对应插件）。这里把它补上 ——
+        //    补的是"声明与实现对不上"这个既有缺口，不是新增能力。
+        //
+        //    `opener:default` 只放行两件事：用默认程序打开 http/https/mailto/tel
+        //    这类 URL、以及在文件管理器里定位一个条目；**不含**"打开任意本地路径"。
+        .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             // VaultState 需要被两处共享：
             //   1. Tauri 的状态管理（前端调用 command 时使用）
@@ -119,6 +129,11 @@ pub fn run() {
             commands::integrity_check,
             commands::rebuild_indexes,
             commands::crypto_info,
+            // Markdown 导出（P1 #11）—— 目的：**别把用户的日记锁死在这个软件里**。
+            // 导出全部 / 导出单篇文本 / 在文件管理器里打开导出目录。
+            commands::export_markdown,
+            commands::export_entry_markdown,
+            commands::reveal_dir,
             // 应用设置
             // 读是"通用读"（一个结构体带所有项，以后加字段不用加命令），
             // 写是"专用写"（每项一条，因为写入要校验、要有明确语义）。

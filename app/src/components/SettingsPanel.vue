@@ -11,6 +11,7 @@
  *
  * 已接线的项：
  *   - 数据与备份 三项 —— 逻辑留在 App.vue，这里只发信号
+ *   - **Markdown 导出**（指令 7）—— 报表式的项，自己调后端拿结果，见下面 doExport
  *   - **自动锁定时长**（指令 11）—— 见下面 onChangeAutoLock 的说明
  *   - **修改主密码**（指令 3）—— 见下面 submitChangePin 的说明
  *   - **免密打开**（指令 4）—— 见下面 openAutoLogin / submitAutoLogin 的说明
@@ -33,12 +34,15 @@ import {
   changePassword,
   disableAutoLogin,
   enableAutoLogin,
+  exportMarkdown,
+  revealDir,
   setAutoLockSecs,
   toAppError,
   type AppStatus,
   type BackupStatus,
   type ChangePasswordResult,
   type CryptoInfo,
+  type ExportResult,
 } from "../api";
 
 const props = defineProps<{
@@ -331,6 +335,67 @@ async function submitAutoLogin() {
     autoLoginBusy.value = false;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Markdown 导出（指令 7，已接线）
+// ---------------------------------------------------------------------------
+
+/**
+ * 目标目录。初值取后端给的默认值（数据目录同级的 `导出/`）。
+ *
+ * ⚠️ 原设计是弹系统目录选择器（`tauri-plugin-dialog`），但构建环境拉不到
+ *    那个 crate（出网被拦），所以改成**路径输入框**：UI 少一点便利，
+ *    功能一点不少，而且不多一个依赖。
+ */
+const exportDir = ref(props.status.export_default_dir);
+const exportBusy = ref(false);
+const exportError = ref("");
+const exportDone = ref<ExportResult | null>(null);
+
+/**
+ * 导出全部日记。
+ *
+ * 与备份三项（emit 给 App.vue）不同，这一项**自己调后端**：得拿到
+ * "导出了几篇""有没有重名"才知道显示什么，而 emit 是单向的、
+ * 父组件没法把结果回传进来。与自动锁定时长同一个套路。
+ *
+ * 日记多时后端会跑几秒，所以期间按钮变文案为「正在导出…」并禁用 ——
+ * 不这么做用户会以为点坏了，然后连点，然后又导一遍。
+ */
+async function doExport() {
+  if (exportBusy.value) return;
+  const dir = exportDir.value.trim();
+  if (!dir) {
+    exportError.value = "请先填一个导出目录";
+    exportDone.value = null;
+    return;
+  }
+
+  exportBusy.value = true;
+  exportError.value = "";
+  exportDone.value = null;
+  try {
+    const res = await exportMarkdown(dir);
+    exportDone.value = res;
+    // 用后端**实际写入**的目录回填输入框：用户填的可能是相对路径或带 `..`，
+    // 后端已把它归一化成绝对路径 —— 这样输入框和「打开文件夹」指向同一处。
+    exportDir.value = res.dest_dir;
+  } catch (err) {
+    exportError.value = toAppError(err).message;
+  } finally {
+    exportBusy.value = false;
+  }
+}
+
+/** 在文件管理器里打开刚导出的目录。失败只提示，不改写"导出成功"这个事实。 */
+async function openExportDir() {
+  if (!exportDone.value) return;
+  try {
+    await revealDir(exportDone.value.dest_dir);
+  } catch (err) {
+    emit("notice", toAppError(err).message);
+  }
+}
 </script>
 
 <template>
@@ -599,6 +664,60 @@ async function submitAutoLogin() {
               </div>
             </div>
 
+            <!--
+              导出全部日记（指令 7）。
+              与上面「立即备份」正好是一对：备份是**密文**副本（防丢，还得用本软件打开），
+              导出是**明文** Markdown（防被这个软件锁死，任何编辑器都能读）。
+            -->
+            <div class="row stacked">
+              <div class="label">
+                <div class="t">导出全部日记</div>
+                <div class="d">
+                  导出成 Markdown 纯文本 —— 换台电脑、换个软件也读得出来
+                </div>
+              </div>
+              <div class="ctl">
+                <input
+                  v-model="exportDir"
+                  class="path-input"
+                  type="text"
+                  spellcheck="false"
+                  placeholder="导出到哪个目录"
+                  :disabled="exportBusy"
+                  @keyup.enter="doExport"
+                />
+                <button
+                  class="btn"
+                  :disabled="exportBusy || !exportDir.trim()"
+                  @click="doExport"
+                >
+                  {{ exportBusy ? "正在导出…" : "导出" }}
+                </button>
+              </div>
+            </div>
+
+            <div v-if="exportError" class="row">
+              <div class="label">
+                <div class="t">导出失败</div>
+                <div class="d">{{ exportError }}</div>
+              </div>
+            </div>
+
+            <div v-else-if="exportDone" class="row">
+              <div class="label">
+                <div class="t">已导出 {{ exportDone.entry_count }} 篇</div>
+                <div class="d">
+                  一篇一个 .md，另有 index.md 汇总
+                  <template v-if="exportDone.renamed > 0">
+                    ；{{ exportDone.renamed }} 个重名已加后缀，原有文件没被覆盖
+                  </template>
+                </div>
+              </div>
+              <div class="ctl">
+                <button class="btn" @click="openExportDir">打开文件夹</button>
+              </div>
+            </div>
+
             <div class="row">
               <div class="label">
                 <div class="t">检查索引一致性</div>
@@ -767,6 +886,35 @@ async function submitAutoLogin() {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+/*
+ * 控件本身很宽的行（如"导出到哪个目录"的路径输入框）改成上下两段：
+ * 横着放会把左边的说明文字挤到没法读，而这个弹窗右栏本来就不宽。
+ */
+.row.stacked {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+.row.stacked .ctl {
+  width: 100%;
+}
+
+/* 路径输入框：等宽字体，便于用户核对盘符与目录层级 */
+.path-input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 9px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-1);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+.path-input:disabled {
+  color: var(--text-3);
 }
 
 .btn {

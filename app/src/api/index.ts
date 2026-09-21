@@ -48,6 +48,13 @@ export interface AppStatus {
    */
   auto_login: boolean;
   data_dir: string;
+  /**
+   * 「导出全部日记」输入框的默认值（数据目录同级的 `导出/`）。
+   *
+   * 规则住在后端（`commands::default_export_dir`），这里只拿来预填输入框 ——
+   * 前端不要自己拼一份，否则两处各算各的、迟早对不上。
+   */
+  export_default_dir: string;
 }
 
 export interface Entry {
@@ -174,6 +181,18 @@ export interface BackupResult {
   path: string;
   bytes: number;
   created_at: number;
+}
+
+/** Markdown 导出结果。 */
+export interface ExportResult {
+  /** 实际写入的目录（已归一化成绝对路径，可能带重名后缀）。 */
+  dest_dir: string;
+  /** 导出了多少篇。口径与统计的"共 N 篇"一致 —— 只数**写过**的。 */
+  entry_count: number;
+  /** 因目标文件已存在而被加后缀的次数（首次导出到空目录为 0）。 */
+  renamed: number;
+  /** `index.md` 的落盘路径（可能带后缀）。 */
+  index_path: string;
 }
 
 /** 备份相关状态，供界面展示。 */
@@ -550,6 +569,43 @@ export const listBackups = (destDir: string) =>
 export const integrityCheck = () => invoke<IntegrityReport>("integrity_check");
 
 export const rebuildIndexes = () => invoke<number>("rebuild_indexes");
+
+// ---------------------------------------------------------------------------
+// Markdown 导出（防止被这个软件锁死）
+// ---------------------------------------------------------------------------
+
+/**
+ * 把整个库导出成 Markdown 文件树。
+ *
+ * 产物：`<destDir>/index.md` + `<destDir>/YYYY/MM/YYYY-MM-DD.md`。
+ * 单篇内容是 YAML front-matter（date/title/mood/tags/word_count）+ **正文原文**，
+ * 正文一字不改（不经过 Markdown 渲染再转回来，否则软换行与缩进会被吃掉）。
+ *
+ * ⚠️ **不覆盖已有文件**：重名会在扩展名前加后缀，`renamed` 是加后缀的次数。
+ *    所以对同一个目录重复导出会产生 `xxx (1).md` 这样的副本，而不是更新原文件。
+ *    想拿到干净的一份，先清空目标目录或换一个空目录。
+ *
+ * @param destDir 目标目录，可以不存在（会自动创建）。界面用
+ *   `AppStatus.export_default_dir` 预填。
+ */
+export const exportMarkdown = (destDir: string) =>
+  invoke<ExportResult>("export_markdown", { destDir });
+
+/**
+ * 导出**单篇**日记为 Markdown 文本（不落盘）。给"复制为 Markdown"用。
+ *
+ * 与 `exportMarkdown` 共用同一套渲染，所以复制出来的和落盘导出的一定一致。
+ * 那天没有记录时后端返回 `validation` 错误。
+ */
+export const exportEntryMarkdown = (date: string) =>
+  invoke<string>("export_entry_markdown", { date });
+
+/**
+ * 在系统文件管理器里打开一个目录（导出完成后让用户点一下看到产物）。
+ *
+ * 只接受**已存在的目录**：非目录后端返回 `validation` 错误。
+ */
+export const revealDir = (path: string) => invoke<void>("reveal_dir", { path });
 
 export const cryptoInfo = () => invoke<CryptoInfo>("crypto_info");
 

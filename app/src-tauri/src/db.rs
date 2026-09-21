@@ -16,6 +16,7 @@ use crate::schema::{self, DEFAULT_NOTEBOOK_ID};
 use crate::seg::Segmenter;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// 自动备份：两次备份之间的最小间隔（秒）。默认每天一次。
@@ -148,6 +149,28 @@ pub struct BackupResult {
     pub bytes: u64,
     /// 创建时间（Unix 秒）
     pub created_at: u64,
+}
+
+/// Markdown 导出结果。
+///
+/// 只回传"发生了什么"，不回传写过哪些文件 —— 全库导出可能有几千篇，
+/// 把文件清单塞进返回值只会让 IPC 变胖，而界面上真正要显示的只有三项：
+/// 导到哪、导了几篇、有没有因为重名加过后缀。
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportResult {
+    /// 导出到的目录（可能带重名后缀，所以以实际写入的为准）。
+    pub dest_dir: String,
+    /// 导出了多少篇。
+    ///
+    /// 口径与统计里的"共 N 篇"**完全一致**（都走 `has_content_sql()`）：
+    /// 打开过但没写过的空记录不导出。这条例外关系是用户会当场核对的
+    /// —— 导出数量对不上统计，用户就有理由怀疑导出漏了东西。
+    pub entry_count: usize,
+    /// 有多少个文件名因为目标已存在而被加了后缀（` (1)`、` (2)`…）。
+    /// 首次导出到一个空目录时应为 0。
+    pub renamed: usize,
+    /// `index.md` 的落盘路径（同样可能带后缀）。
+    pub index_path: String,
 }
 
 /// SQLite 的 `trim()` **默认只去半角空格**，不去制表符和换行。
@@ -1775,6 +1798,179 @@ impl Vault {
         })
     }
 
+    // -----------------------------------------------------------------------
+    // Markdown 导出（P1 #11）
+    //
+    // 目的只有一个：**别把用户的日记锁死在这个软件里**。所以这里全部取向
+    // 都是"宁可土、也要让产物是纯文本、可直接丢进任何编辑器"。
+    //
+    // 两条铁律：
+    //   1. 正文**原样输出 `content_md`**，绝不经过 Markdown 渲染再转回来。
+    //      渲染是有损的：软换行被吃掉、行首缩进被吞、表格里的对齐空格被重排。
+    //      用户手动排的版式是他写的东西的一部分。
+    //   2. **锁定不影响导出**。锁定是"防误改"，不是"防读"
+    //      （见 schema.rs 里 `locked` 列的说明）；导出是读。
+    // -----------------------------------------------------------------------
+
+    /// 导出**一篇**日记为 Markdown 文本（front-matter + 正文原文）。
+    ///
+    /// 只返回字符串、不落盘：给"复制为 Markdown"这类需要拿到文本的调用方用。
+    /// 落盘的全库导出走 `export_markdown`，两者共用同一个渲染函数 ——
+    /// 否则"复制出来的"和"导出出来的"迟早长得不一样。
+    ///
+    /// 那一天**根本没有记录**时返回 `validation` 错误；有记录但正文是空的
+    /// （打开过没写）照常返回，因为这是一个"指名道姓要某天"的调用，
+    /// 要不要空内容由调用方决定，这里不做二次筛选。
+    pub fn export_entry_markdown(&self, date: &str) -> AppResult<String> {
+        validate_date(date)?;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT title, content_md, word_count, mood FROM entry WHERE entry_date = ?1",
+                params![date],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((title, content_md, word_count, mood)) = row else {
+            return Err(AppError::Validation(format!("{date} 这一天还没有日记")));
+        };
+        let tags = self.tags_of_entry(date)?;
+        Ok(render_entry_md(
+            date,
+            &title,
+            mood,
+            &tags,
+            word_count,
+            &content_md,
+        ))
+    }
+
+    /// 把整个库导出成 Markdown 文件树。
+    ///
+    /// 产物形状：
+    /// ```text
+    /// <dest>/
+    ///   index.md                  全部日记的日期 + 标题 + 链接
+    ///   2026/09/2026-09-18.md     单篇（front-matter + 正文原文）
+    /// ```
+    ///
+    /// 为什么按 年 / 月 分两层目录：全塞在一层里，几千篇之后连资源管理器
+    /// 打开都要卡；而 `2026/09` 这种分法用户自己也会这么整理。
+    ///
+    /// ⚠️ 文件名**只用日期**。标题可能含 `/ \ : * ? " < > |` 和换行
+    ///    （全是 Windows 文件名非法字符），拿标题当文件名轻则建不出文件、
+    ///    重则被用来做目录穿越。标题只出现在 front-matter 里。
+    ///
+    /// ⚠️ 只导"写过"的（`has_content_sql()`），数量与统计里的"共 N 篇"
+    ///    严格一致 —— 用户会当场拿这两个数字对着看。
+    pub fn export_markdown(&self, dest_dir: &str) -> AppResult<ExportResult> {
+        if dest_dir.trim().is_empty() {
+            return Err(AppError::Validation("导出目录不能为空".into()));
+        }
+        let dest = Path::new(dest_dir.trim());
+        std::fs::create_dir_all(dest)?;
+        // 归一化后再回显：用户可能填的是相对路径或带 `..`，而他下一步要去
+        // 文件管理器里找这个目录 —— 回显一个"实际生成的绝对路径"才用得上。
+        let dest = std::fs::canonicalize(dest).unwrap_or_else(|_| dest.to_path_buf());
+
+        // 一次把所有标签取齐并按 entry_id 归组。不这么做就得每篇查一次，
+        // 全库导出下就是 N+1 次查询（几千篇时会明显卡）。
+        let mut tags_by_entry: HashMap<i64, Vec<String>> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT et.entry_id, t.name
+                 FROM entry_tag et
+                 JOIN tag t ON t.id = et.tag_id
+                 ORDER BY t.name COLLATE NOCASE ASC",
+            )?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (entry_id, name) = row?;
+                tags_by_entry.entry(entry_id).or_default().push(name);
+            }
+        }
+
+        // 升序导出：index.md 读起来像一本书。日历与统计用倒序是"最近优先"，
+        // 那是给日常使用看的；导出是给存档看的，两者取向不同。
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, entry_date, title, content_md, word_count, mood
+             FROM entry
+             WHERE {}
+             ORDER BY entry_date ASC",
+            has_content_sql()
+        ))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+            ))
+        })?;
+
+        let mut renamed = 0usize;
+        // (日期, 标题, 落盘相对路径) —— index.md 就用这三样渲染。
+        let mut index_rows: Vec<(String, String, String)> = Vec::new();
+        for row in rows {
+            let (id, date, title, content_md, word_count, mood) = row?;
+            // entry_date 恒为 `YYYY-MM-DD`（写入时校验过），按字节切片安全。
+            let (year, month) = (&date[0..4], &date[5..7]);
+            let rel = Path::new(year).join(month).join(format!("{date}.md"));
+            let tags = tags_by_entry.get(&id).cloned().unwrap_or_default();
+            let body = render_entry_md(&date, &title, mood, &tags, word_count, &content_md);
+            let written = self.write_export_file(dest.join(&rel), &body)?;
+            if written != dest.join(&rel) {
+                renamed += 1;
+            }
+            // 链接里一律用 `/`：Markdown 链接是给别的编辑器/渲染器读的，
+            // Windows 的反斜杠在那边不是路径分隔符。
+            let rel_written = written
+                .strip_prefix(&dest)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| rel.to_string_lossy().replace('\\', "/"));
+            index_rows.push((date, title, rel_written));
+        }
+
+        let index_text = render_index_md(&index_rows);
+        let index_path = self.write_export_file(dest.join("index.md"), &index_text)?;
+        if index_path != dest.join("index.md") {
+            renamed += 1;
+        }
+
+        Ok(ExportResult {
+            dest_dir: dest.to_string_lossy().to_string(),
+            entry_count: index_rows.len(),
+            renamed,
+            index_path: index_path.to_string_lossy().to_string(),
+        })
+    }
+
+    /// 写一个导出文件，**绝不覆盖已有文件**（重名就在扩展名前加 ` (1)`）。
+    ///
+    /// 为什么宁可加后缀也不覆盖：导出目录是用户自己挑的，完全可能选到
+    /// "文档"这种本来就有一堆文件的地方。同名就覆盖＝悄悄毁掉用户的文件，
+    /// 这对一个"防止数据被锁死"的功能来说是最坏的结果。
+    ///
+    /// 返回**实际写入**的路径（可能带后缀）。
+    fn write_export_file(&self, path: PathBuf, content: &str) -> AppResult<PathBuf> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let target = non_conflicting_path(&path)?;
+        std::fs::write(&target, content)?;
+        Ok(target)
+    }
+
     /// 只读访问底层连接。保留给集成测试与将来的维护功能。
     #[allow(dead_code)]
     pub fn conn(&self) -> &Connection {
@@ -2136,6 +2332,137 @@ fn is_valid_month(month: &str) -> bool {
             .all(|(i, c)| if i == 4 { c == '-' } else { c.is_ascii_digit() })
 }
 
+// ---------------------------------------------------------------------------
+// Markdown 导出：渲染与文件名
+// ---------------------------------------------------------------------------
+
+/// 渲染一篇日记为 Markdown：YAML front-matter + 正文**原文**。
+///
+/// ⚠️ `content_md` 一字不改地接在 `---` 后面。不要 trim、不要补空行、
+///    不要做任何"顺手美化" —— 验收标准就是"导出的 .md 打开后，
+///    中文、换行、Markdown 语法完全原样"。
+///
+/// `mood` 用 `null` 显式写出而不是留空：留空的 `mood:` 在 YAML 里同样是
+/// null，但显式写出来，读的人（和解析器）都不必猜这是"没标"还是"忘了写"。
+fn render_entry_md(
+    date: &str,
+    title: &str,
+    mood: Option<i64>,
+    tags: &[String],
+    word_count: i64,
+    content_md: &str,
+) -> String {
+    let mut out = String::new();
+    out.push_str("---\n");
+    out.push_str("date: ");
+    out.push_str(&yaml_scalar(date));
+    out.push('\n');
+    out.push_str("title: ");
+    out.push_str(&yaml_scalar(title));
+    out.push('\n');
+    match mood {
+        Some(m) => out.push_str(&format!("mood: {m}\n")),
+        None => out.push_str("mood: null\n"),
+    }
+    let quoted: Vec<String> = tags.iter().map(|t| yaml_scalar(t)).collect();
+    out.push_str(&format!("tags: [{}]\n", quoted.join(", ")));
+    out.push_str(&format!("word_count: {word_count}\n"));
+    out.push_str("---\n");
+    out.push_str(content_md);
+    out
+}
+
+/// 渲染 `index.md`：全部日记的日期 + 标题 + 链接。
+///
+/// 标题在列表项里是**纯文本**，所以要把换行折叠成空格 —— 否则一个带换行的
+/// 标题会把 Markdown 列表切碎成好几行。链接路径用 `/` 分隔（见 export_markdown）。
+///
+/// ⚠️ 刻意**不写导出时间**：那需要用系统时钟，而本项目在"今天是哪天"上
+///    已经吃过 UTC 的亏（见 `stats(today)` 的说明）；一个只用于存档的索引
+///    不值得再引入一次时区歧义。文件自身的修改时间已经记录了导出时刻。
+fn render_index_md(entries: &[(String, String, String)]) -> String {
+    let mut out = String::new();
+    out.push_str("# 日记索引\n\n");
+    out.push_str(&format!("共 {} 篇。\n\n", entries.len()));
+    for (date, title, rel) in entries {
+        let flat = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        if flat.is_empty() {
+            out.push_str(&format!("- [{date}]({rel})\n"));
+        } else {
+            out.push_str(&format!("- [{date}]({rel}) {flat}\n"));
+        }
+    }
+    out
+}
+
+/// YAML 标量：能用裸值就用裸值，有歧义才加双引号。
+///
+/// 为什么不一律加引号：front-matter 是给人看的，`title: 标题` 比
+/// `title: "标题"` 顺眼。但**用户什么都可能往标题里打**（冒号、井号、
+/// 引号、换行、emoji），裸着写出去就不是合法 YAML 了。
+///
+/// 判据（保守）：空串、首尾有空白、以 `-` / `?` 开头，或含有 YAML 里有
+/// 特殊含义的字符，就整体包进双引号并把内部转义。
+///
+/// 用**双引号**而不是单引号：YAML 的单引号风格里换行只能折行，没法写
+/// "一个真的换行符"；双引号风格支持 `\n` 这类转义序列，正好能表达它。
+fn yaml_scalar(s: &str) -> String {
+    const SPECIAL: &str = "\n\r\t\"'\\:#[]{},&*!|>%@`";
+    let plain_safe = !s.is_empty()
+        && s.trim() == s
+        && !s.starts_with('-')
+        && !s.starts_with('?')
+        && !s.chars().any(|c| SPECIAL.contains(c) || c.is_control());
+    if plain_safe {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// 目标文件已存在时，在扩展名前追加 ` (1)`、` (2)`… —— **绝不覆盖**。
+///
+/// 上千次都撞名说明这个目录已经不是"偶尔重名"了，再往下试没有意义：
+/// 这时**报错**而不是退回原路径 —— 退回原路径就等于覆盖，
+/// 恰好是这个函数唯一要防的事。
+fn non_conflicting_path(path: &Path) -> AppResult<PathBuf> {
+    if !path.exists() {
+        return Ok(path.to_path_buf());
+    }
+    let parent = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = path.extension().map(|s| s.to_string_lossy().to_string());
+    for n in 1..1000 {
+        let name = match &ext {
+            Some(e) => format!("{stem} ({n}).{e}"),
+            None => format!("{stem} ({n})"),
+        };
+        let candidate = parent.join(name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(AppError::State(format!(
+        "同名文件太多，放弃写入：{}",
+        path.display()
+    )))
+}
+
 /// 日期加减若干天（`delta` 可负）。
 ///
 /// 用于连续天数（前一天）和"本周"的收尾（周一 + 6 天）。
@@ -2210,6 +2537,88 @@ mod tests {
         assert!(validate_date("2026-9-11").is_err());
         assert!(validate_date("2026/09/11").is_err());
         assert!(validate_date("").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Markdown 导出
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn yaml_scalar_leaves_plain_values_alone() {
+        assert_eq!(yaml_scalar("标题"), "标题");
+        assert_eq!(yaml_scalar("2026-09-18"), "2026-09-18");
+        assert_eq!(yaml_scalar("旅行"), "旅行");
+        // emoji 与汉字一样是普通字符，不需要引号
+        assert_eq!(yaml_scalar("开心🥰"), "开心🥰");
+    }
+
+    #[test]
+    fn yaml_scalar_quotes_and_escapes_anything_ambiguous() {
+        // 冒号 + 空格在 YAML 里是键值分隔，必须引起来，否则整段 front-matter 崩掉
+        assert_eq!(yaml_scalar("a: b"), "\"a: b\"");
+        // 井号是注释起点
+        assert_eq!(yaml_scalar("a #b"), "\"a #b\"");
+        // 换行 / 引号 / 反斜杠要转义成双引号风格里的转义序列
+        assert_eq!(yaml_scalar("第一行\n第二行"), "\"第一行\\n第二行\"");
+        assert_eq!(yaml_scalar("说\"话\""), "\"说\\\"话\\\"\"");
+        assert_eq!(yaml_scalar("C:\\tmp"), "\"C:\\\\tmp\"");
+        // 空串与首尾空白（裸着写会被 YAML 当成别的意思）
+        assert_eq!(yaml_scalar(""), "\"\"");
+        assert_eq!(yaml_scalar("  x  "), "\"  x  \"");
+        // 以 - 开头会被当成列表项
+        assert_eq!(yaml_scalar("- 待办"), "\"- 待办\"");
+    }
+
+    #[test]
+    fn non_conflicting_path_never_overwrites() {
+        let dir = std::env::temp_dir().join("dsh-diary-export-name");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = dir.join("2026-09-18.md");
+        // 目标不存在时原样返回，不加后缀
+        assert_eq!(non_conflicting_path(&first).unwrap(), first);
+
+        std::fs::write(&first, "x").unwrap();
+        let second = non_conflicting_path(&first).unwrap();
+        assert_eq!(second, dir.join("2026-09-18 (1).md"));
+
+        std::fs::write(&second, "x").unwrap();
+        let third = non_conflicting_path(&first).unwrap();
+        assert_eq!(third, dir.join("2026-09-18 (2).md"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_entry_md_keeps_the_body_byte_for_byte() {
+        // 正文里有软换行、行首缩进、列表与表格 —— 全部必须原样保留。
+        // 这一条就是验收标准"中文、换行、Markdown 语法完全原样"的机器版。
+        let body = "第一行\n\n  缩进两格\n\n- 列表\n\n| a | b |\n|---|---|\n| 1 | 2 |";
+        let md = render_entry_md(
+            "2026-09-18",
+            "标题",
+            Some(4),
+            &["旅行".to_string(), "美食".to_string()],
+            320,
+            body,
+        );
+        let expected = format!(
+            "---\ndate: 2026-09-18\ntitle: 标题\nmood: 4\ntags: [旅行, 美食]\nword_count: 320\n---\n{body}"
+        );
+        assert_eq!(md, expected);
+        assert!(
+            md.ends_with(body),
+            "正文必须一字不改地接在 front-matter 之后"
+        );
+    }
+
+    #[test]
+    fn render_entry_md_writes_null_mood_and_empty_tags() {
+        let md = render_entry_md("2026-01-02", "", None, &[], 0, "正文");
+        assert!(md.contains("\ntitle: \"\"\n"), "空标题应显式加引号：{md}");
+        assert!(md.contains("\nmood: null\n"), "没标心情应写 null：{md}");
+        assert!(md.contains("\ntags: []\n"), "没有标签应是空列表：{md}");
     }
 
     #[test]

@@ -12,8 +12,8 @@
 
 use crate::crypto::{self, CryptoMeta, KdfParams};
 use crate::db::{
-    derive_and_verify, AppSettings, BackupResult, DayMood, Entry, EntrySummary, IntegrityReport,
-    SearchHit, Stats, TagStat, Vault,
+    derive_and_verify, AppSettings, BackupResult, DayMood, Entry, EntrySummary, ExportResult,
+    IntegrityReport, SearchHit, Stats, TagStat, Vault,
 };
 use crate::error::{AppError, AppResult};
 use serde::Serialize;
@@ -52,6 +52,13 @@ pub struct AppStatus {
     pub auto_login: bool,
     /// 数据目录，便于设置页展示与备份选择默认位置。
     pub data_dir: String,
+    /// 「导出全部日记」输入框的默认值（数据目录同级的 `导出/`）。
+    ///
+    /// 为什么放在 status 里而不是让前端自己拼：默认目录的规则住在后端
+    ///（`default_export_dir`），前端再拼一份就成了两处各算各的。
+    /// 它只是一段路径文本、不碰加密库，所以未解锁时也能给出来，
+    /// 不违反"未解锁不读 `app_setting`"那条（见 `get_settings` 的说明）。
+    pub export_default_dir: String,
 }
 
 /// 全局可共享的应用状态。
@@ -161,6 +168,19 @@ pub fn resolve_data_dir() -> AppResult<PathBuf> {
     Err(AppError::State("无法确定数据目录".into()))
 }
 
+/// 「导出全部日记」的默认目标目录：数据目录的**同级**再拼 `导出`。
+///
+/// 为什么是这里：本应用是便携式的（`data/` 就待在程序旁边，见
+/// `resolve_data_dir`），所以默认导出到"软件旁边的导出文件夹"——
+/// 用户既找得到，又不会跟 `data/` 里的库文件、库外钥匙文件混在一起。
+/// 取不到父目录（理论上不会发生）时退回数据目录内部，至少保证可用。
+pub fn default_export_dir(data_dir: &Path) -> PathBuf {
+    match data_dir.parent() {
+        Some(p) => p.join("导出"),
+        None => data_dir.join("导出"),
+    }
+}
+
 fn with_vault<T>(state: &State<'_, VaultState>, f: impl FnOnce(&Vault) -> AppResult<T>) -> AppResult<T> {
     let guard = state
         .vault()
@@ -209,6 +229,9 @@ pub fn app_status(state: State<'_, VaultState>) -> AppResult<AppStatus> {
         // "钥匙坏了"由 unlock_with_auto_key 处理（它会顺手删掉坏文件）。
         auto_login: crypto::auto_login_path(state.data_dir()).exists(),
         data_dir: state.data_dir().to_string_lossy().to_string(),
+        export_default_dir: default_export_dir(state.data_dir())
+            .to_string_lossy()
+            .to_string(),
     })
 }
 
@@ -1066,6 +1089,54 @@ pub fn integrity_check(state: State<'_, VaultState>) -> AppResult<IntegrityRepor
 #[tauri::command]
 pub fn rebuild_indexes(state: State<'_, VaultState>) -> AppResult<usize> {
     with_vault(&state, |v| v.rebuild_indexes())
+}
+
+// ---------------------------------------------------------------------------
+// Markdown 导出（P1 #11）
+// ---------------------------------------------------------------------------
+
+/// 把整个库导出成 Markdown 文件树（`index.md` + `年/月/日期.md`）。
+///
+/// `dest_dir` 由前端传。原本的设计是用 `tauri-plugin-dialog` 弹系统目录选择器，
+/// 但本机构建环境拉不到那个 crate（出网被拦），所以改成界面上的**路径输入框**
+///（预填 `AppStatus::export_default_dir`）。后端只负责"这个目录能不能写"，
+/// 不负责"用户想选哪个目录" —— 职责反而更清楚。
+///
+/// ⚠️ **绝不覆盖已有文件**：重名会在扩展名前加后缀，并把次数回传界面，
+///    免得用户以为"导出失败"或"上次导的没了"。
+#[tauri::command]
+pub fn export_markdown(state: State<'_, VaultState>, dest_dir: String) -> AppResult<ExportResult> {
+    with_vault(&state, |v| v.export_markdown(&dest_dir))
+}
+
+/// 导出**单篇**日记为 Markdown 文本（不落盘）。给"复制为 Markdown"这类调用方用。
+#[tauri::command]
+pub fn export_entry_markdown(state: State<'_, VaultState>, date: String) -> AppResult<String> {
+    with_vault(&state, |v| v.export_entry_markdown(&date))
+}
+
+/// 在系统文件管理器里打开一个目录 —— 导出完成后让用户点一下就能看到产物。
+///
+/// 为什么用已有的 `tauri-plugin-opener` 而不是新装 dialog 插件：opener 本来
+/// 就是这个项目的依赖（`Cargo.toml` 里一直有、`opener:default` 权限也早就
+/// 声明了），只是从来没在 `lib.rs` 里注册过 —— 顺手补上注册即可，
+/// **不引入任何新依赖**。
+///
+/// ⚠️ 这个命令**不碰数据、也不需要解锁**（与 `app_status` / `lock_vault` 同类），
+///    所以不走 `with_vault`。它只做"打开一个已存在的目录"：先 `is_dir()` 卡一道，
+///    非目录直接报错 —— 不给"打开任意文件 / URL"的后门。
+#[tauri::command]
+pub fn reveal_dir(app: tauri::AppHandle, path: String) -> AppResult<()> {
+    let dir = PathBuf::from(path.trim());
+    if !dir.is_dir() {
+        return Err(AppError::Validation(format!(
+            "目录不存在：{}",
+            dir.to_string_lossy()
+        )));
+    }
+    tauri_plugin_opener::OpenerExt::opener(&app)
+        .open_path(dir.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|e| AppError::State(format!("打开目录失败: {e}")))
 }
 
 /// 加密元信息摘要，仅供设置页展示（**不含 salt 与密钥**）。
