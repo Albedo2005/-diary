@@ -237,6 +237,13 @@ export interface CryptoInfo {
 export interface AppSettings {
   /** 窗口失去焦点后多久自动锁定（秒）。`0` = 永不。 */
   auto_lock_secs: number;
+  /**
+   * 离开某一天时（切日期 / 重开软件）是否自动把日记锁上。默认 `true`。
+   *
+   * ⚠️ 与 `auto_lock_secs` **同名不同义**：那个锁的是**整个应用**
+   *    （回解锁页），这个锁的是**单篇日记**（那天的正文变只读）。
+   */
+  auto_lock_entries: boolean;
 }
 
 /**
@@ -257,6 +264,16 @@ export const AUTO_LOCK_OPTIONS = [
 
 /** 默认档位：10 分钟。与后端 `db::DEFAULT_AUTO_LOCK_SECS` 保持一致。 */
 export const DEFAULT_AUTO_LOCK_SECS = 600;
+
+/**
+ * 「离开日记时自动锁定」的默认值：**开**。
+ * 与后端 `db::DEFAULT_AUTO_LOCK_ENTRIES` 保持一致。
+ *
+ * ⚠️ 它同时是**读到设置之前的初值**：`EditorPane.load()` 首屏就跑，
+ *    而 `getSettings()` 要等解锁之后才回得来。把"还没拿到"当成 `false`，
+ *    会出现"重开软件后日记居然没锁" —— 与默认值相反，而且是**静默**的。
+ */
+export const DEFAULT_AUTO_LOCK_ENTRIES = true;
 
 // ---------------------------------------------------------------------------
 // 错误处理
@@ -641,6 +658,19 @@ export const getSettings = () => invoke<AppSettings>("get_settings");
  */
 export const setAutoLockSecs = (secs: number) =>
   invoke<void>("set_auto_lock_secs", { secs });
+
+/**
+ * 设置「离开日记时自动锁定」（指令 14）。
+ *
+ * 参数就是布尔值，没有非法值可挡 —— 校验/兜底全在后端数据层。
+ *
+ * ⚠️ 关掉它**不等于**解锁已经锁上的日记：它只影响"以后要不要自动锁"。
+ *    已经锁上的那篇仍要点 🔒 才能编辑（否则就成了"改个设置
+ *    把所有保护一次性抹掉"）。
+ * ⚠️ 写入失败时界面必须回滚成原值（见 SettingsPanel 的开关处理）。
+ */
+export const setAutoLockEntries = (on: boolean) =>
+  invoke<void>("set_auto_lock_entries", { on });
 
 // ---------------------------------------------------------------------------
 // 图片附件（P1 #10）

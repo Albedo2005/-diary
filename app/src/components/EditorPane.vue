@@ -56,6 +56,14 @@ const props = defineProps<{
    * 用来让这里的 chip 行与面板候选跟着刷新。
    */
   tagToken?: number;
+  /**
+   * 离开这一天（切日期 / 重开软件）时是否自动把日记锁上。默认 **开**。
+   *
+   * ⚠️ `undefined`（父组件还没读到设置）必须按"锁"处理，见 `load()`。
+   *    设置存在加密库里，要等解锁才读得到 —— 把"还没拿到"当成 `false`
+   *    会出现"重开软件后日记居然没锁"，与默认值相反，而且**是静默的**。
+   */
+  autoLockEntries?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -354,7 +362,14 @@ async function load() {
   try {
     // 先把所有日记锁上，再读要打开的这一篇。
     // 于是"切换日期"和"重新打开软件"都会让上一篇自动回到锁定状态。
-    await lockAllEntries();
+    //
+    // 指令 14 起这一步**受设置控制**：设置页【安全】里可以关掉它
+    // （想回头补一句时不必反复解锁）。这里只让"锁定"这一步可能不执行，
+    // ⚠️ 绝不改变"保存永远在锁定之前"的次序 —— 见下面 watch(props.date)。
+    //
+    // ⚠️ `undefined`（父组件还没拿到设置）一律按**锁**处理：
+    //    把"还没读出来"当成 false，会出现"重开软件后日记居然没锁"。
+    if (props.autoLockEntries !== false) await lockAllEntries();
     // openEntry 是纯读取：没有内容时返回空模板（id = 0），不会写库。
     // 所以"点开日历"不会把这一天变成"写过"。
     const e = await openEntry(props.date);
@@ -1125,8 +1140,9 @@ watch(
   () => void loadTags()
 );
 
-// 首屏：load() 里的 lockAllEntries() 顺带实现了
-// "关掉软件再打开，所有日记都是锁的"。
+// 首屏：load() 里那句（受设置控制的）lockAllEntries() 顺带实现了
+// "关掉软件再打开，所有日记都是锁的" —— 指令 14 把开关交给用户后，
+// 关掉的人重开软件不会再被自动锁上。
 void load();
 
 // 关窗前尽力保存，减少意外丢失。

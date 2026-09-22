@@ -16,6 +16,7 @@ import UnlockScreen from "./components/UnlockScreen.vue";
 import {
   backupNow,
   cryptoInfo,
+  DEFAULT_AUTO_LOCK_ENTRIES,
   DEFAULT_AUTO_LOCK_SECS,
   getBackupStatus,
   getSettings,
@@ -99,6 +100,17 @@ const autoLoginFailed = ref(false);
  */
 const autoLockSecs = ref(DEFAULT_AUTO_LOCK_SECS);
 
+/**
+ * 离开某一天时是否自动把日记锁上（指令 14）。默认 **开**。
+ *
+ * 与 `autoLockSecs` 同一套路：先用默认值起步，解锁后由 `loadSettings()`
+ * 换成库里的真实值 —— 设置在**加密库**里，未解锁根本读不到。
+ *
+ * ⚠️ 初值必须是 `true`：`EditorPane.load()` 首屏就会用它，而设置要等解锁。
+ *    初值取 `false` 会静默地不锁（见 DEFAULT_AUTO_LOCK_ENTRIES 的说明）。
+ */
+const autoLockEntries = ref(DEFAULT_AUTO_LOCK_ENTRIES);
+
 const toast = ref("");
 let toastTimer: number | null = null;
 
@@ -165,14 +177,17 @@ async function loadAux() {
 }
 
 /**
- * 读取应用设置（目前只有自动锁定时长）。
+ * 读取应用设置（自动锁定时长 ＋ 离开日记时自动锁定）。
  *
  * 只能在**解锁后**调 —— 设置在加密库里，未解锁读不到。
- * 读失败不阻塞主流程：留用默认值也比卡住强，何况这一项有个安全的落点。
+ * 读失败不阻塞主流程：留用默认值也比卡住强，何况这两项都有安全的落点
+ *（时长回落到 10 分钟、自动锁定回落到"开"）。
  */
 async function loadSettings() {
   try {
-    autoLockSecs.value = (await getSettings()).auto_lock_secs;
+    const s = await getSettings();
+    autoLockSecs.value = s.auto_lock_secs;
+    autoLockEntries.value = s.auto_lock_entries;
   } catch {
     // 保持默认值。不值得为这一项弹错误。
   }
@@ -484,6 +499,7 @@ onUnmounted(() => {
           <EditorPane
             :date="selected"
             :tag-token="tagToken"
+            :auto-lock-entries="autoLockEntries"
             @saved="onSaved"
             @tags-changed="onTagsChanged"
             @notice="flash"
@@ -518,11 +534,13 @@ onUnmounted(() => {
         :backup="backup"
         :crypto="crypto"
         :auto-lock-secs="autoLockSecs"
+        :auto-lock-entries="autoLockEntries"
         @close="showSettings = false"
         @backup="doBackup"
         @integrity="doIntegrity"
         @toggle-auto-backup="toggleAutoBackup"
         @auto-lock-secs="(s) => (autoLockSecs = s)"
+        @auto-lock-entries="(on) => (autoLockEntries = on)"
         @password-changed="onPasswordChanged"
         @auto-login-changed="onAutoLoginChanged"
         @refresh-status="refreshStatus"

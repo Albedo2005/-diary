@@ -158,6 +158,7 @@ pub fn run() {
             // 写是"专用写"（每项一条，因为写入要校验、要有明确语义）。
             commands::get_settings,
             commands::set_auto_lock_secs,
+            commands::set_auto_lock_entries,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");

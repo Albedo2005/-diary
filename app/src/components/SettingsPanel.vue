@@ -13,6 +13,7 @@
  *   - 数据与备份 三项 —— 逻辑留在 App.vue，这里只发信号
  *   - **Markdown 导出**（指令 7）—— 报表式的项，自己调后端拿结果，见下面 doExport
  *   - **自动锁定时长**（指令 11）—— 见下面 onChangeAutoLock 的说明
+ *   - **离开日记时自动锁定**（指令 14）—— 见下面 onToggleAutoLockEntries 的说明
  *   - **修改主密码**（指令 3）—— 见下面 submitChangePin 的说明
  *   - **免密打开**（指令 4）—— 见下面 openAutoLogin / submitAutoLogin 的说明
  * 到此【安全】分类里**没有占位项了**，全部接线完毕。
@@ -23,8 +24,8 @@
  * 唯一的项没了，分类就成了空壳，点进去什么都没有 = 界面骗人，故整组删除。
  * 将来真要做主题切换，再按需要重建这个分类。
  *
- * 组件不自己拉状态：status / backup / crypto / stats / autoLockSecs
- * 全部从 App.vue 传入，免得两份状态各走各的、切个分类就对不上。
+ * 组件不自己拉状态：status / backup / crypto / stats / autoLockSecs /
+ * autoLockEntries 全部从 App.vue 传入，免得两份状态各走各的、切个分类就对不上。
  * 例外只有一处：改密码成功后由 App.vue 用返回的新状态覆盖（见 password-changed）。
  */
 import { computed, nextTick, ref } from "vue";
@@ -37,6 +38,7 @@ import {
   exportMarkdown,
   pruneOrphanAttachments,
   revealDir,
+  setAutoLockEntries,
   setAutoLockSecs,
   toAppError,
   type AppStatus,
@@ -54,6 +56,11 @@ const props = defineProps<{
   crypto: CryptoInfo | null;
   /** 自动锁定时长（秒）。0 = 永不。由 App.vue 持有，是唯一真值源。 */
   autoLockSecs: number;
+  /**
+   * 离开日记时是否自动把单篇日记锁上（指令 14）。
+   * 同样由 App.vue 持有 —— 它还要传给 EditorPane，不能有两份。
+   */
+  autoLockEntries: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -66,6 +73,8 @@ const emit = defineEmits<{
   (e: "toggle-auto-backup"): void;
   /** 自动锁定时长已成功写入后端，通知 App.vue 更新本地值。 */
   (e: "auto-lock-secs", secs: number): void;
+  /** 「离开日记时自动锁定」已成功写入后端，通知 App.vue 更新本地值。 */
+  (e: "auto-lock-entries", on: boolean): void;
   /** 主密码已更换。带上后端返回的最新状态与收尾警告，由 App.vue 落库。 */
   (e: "password-changed", res: ChangePasswordResult): void;
   /**
@@ -146,6 +155,30 @@ async function onChangeAutoLock(e: Event) {
     emit("auto-lock-secs", next);
   } catch (err) {
     el.value = String(props.autoLockSecs); // 回滚，不留假状态
+    emit("notice", toAppError(err).message);
+  }
+}
+
+/**
+ * 切换「离开日记时自动锁定」（指令 14）。
+ * 逻辑与 onChangeAutoLock 同一套路：自己调后端、成功后 emit 新值让
+ * App.vue 更新 ref（ref 仍是唯一真值源）、失败时把界面拨回原值。
+ *
+ * ⚠️ 失败回滚这里**必须手动**写：DOM 里用户已经把勾拨过去了，
+ *    而 props 没变 —— Vue 认为"绑定的值没变化"，不会重渲染这个属性。
+ *    与上面 <select> 是同一类坑，只是控件不同。
+ *
+ * ⚠️ 不改动页面上任何已锁的日记：这个开关只管"以后要不要自动锁"。
+ */
+async function onToggleAutoLockEntries(e: Event) {
+  const el = e.target as HTMLInputElement;
+  const next = el.checked;
+  if (next === props.autoLockEntries) return;
+  try {
+    await setAutoLockEntries(next);
+    emit("auto-lock-entries", next);
+  } catch (err) {
+    el.checked = props.autoLockEntries; // 回滚，不留假状态
     emit("notice", toAppError(err).message);
   }
 }
@@ -694,6 +727,30 @@ async function doPrune() {
                     {{ o.label }}
                   </option>
                 </select>
+              </div>
+            </div>
+
+            <!--
+              ⚠️ 这一行必须**紧挨着**上面那条"自动锁定时长"：
+              两个开关都叫"自动锁定"，含义却完全不同 ——
+              上面锁的是整个应用，这一条锁的是单篇日记。
+              分开放，用户一定会以为是自己看错了。
+            -->
+            <div class="row">
+              <div class="label">
+                <div class="t">离开日记时自动锁定</div>
+                <div class="d">
+                  切到别的日子、或重开软件时，把写过的日记自动锁上，防止误删误改。关掉后可以随时回来接着写。
+                </div>
+              </div>
+              <div class="ctl">
+                <label class="toggle">
+                  <input
+                    type="checkbox"
+                    :checked="autoLockEntries"
+                    @change="onToggleAutoLockEntries"
+                  />
+                </label>
               </div>
             </div>
 

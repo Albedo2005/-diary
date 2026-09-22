@@ -31,6 +31,7 @@ pub mod setting_keys {
     pub const LAST_BACKUP_AT: &str = "last_backup_at";
     pub const KEEP_RECENT: &str = "keep_recent";
     pub const AUTO_LOCK_SECS: &str = "auto_lock_secs";
+    pub const AUTO_LOCK_ENTRIES: &str = "auto_lock_entries";
 }
 
 /// 自动锁定时长的**档位白名单**（秒）。`0` 表示"永不"。
@@ -49,6 +50,14 @@ pub const AUTO_LOCK_ALLOWED_SECS: [u32; 4] = [0, 60, 300, 600];
 ///    老库（从没设过这一项）走同一个默认值。
 pub const DEFAULT_AUTO_LOCK_SECS: u32 = 600;
 
+/// 「离开日记时自动锁定」的默认值：**开**。
+///
+/// ⚠️ 默认值只有这一个合理选择：老库（从来没有这个 key）和解析失败
+///    都走它，于是**升级上来的行为与改动前逐项一致**。
+///    反过来默认关，等于所有人一升级就发现"日记不再自动上锁了" ——
+///    而这是一次**静默**的安全倒退（没有任何提示）。
+pub const DEFAULT_AUTO_LOCK_ENTRIES: bool = true;
+
 /// 应用设置。
 ///
 /// 为什么用一个结构体返回、而不是每项一个读取命令：
@@ -58,13 +67,22 @@ pub const DEFAULT_AUTO_LOCK_SECS: u32 = 600;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     /// 窗口失去焦点后多久自动锁定（秒）。`0` = 永不。
+    ///
+    /// ⚠️ 这一项锁的是**整个应用**，与下面那一项**同名不同义**。
     pub auto_lock_secs: u32,
+    /// 离开某一天时（切日期 / 重开软件）是否自动把日记锁上。默认开。
+    ///
+    /// ⚠️ 与 `auto_lock_secs` **不是一回事**：这一项锁的是**单篇日记**
+    ///    （那天的正文变只读），防的是自己手滑改掉 / 删掉写好的日记；
+    ///    那一项防的是别人看。
+    pub auto_lock_entries: bool,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             auto_lock_secs: DEFAULT_AUTO_LOCK_SECS,
+            auto_lock_entries: DEFAULT_AUTO_LOCK_ENTRIES,
         }
     }
 }
@@ -2579,8 +2597,22 @@ impl Vault {
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|v| AUTO_LOCK_ALLOWED_SECS.contains(v))
             .unwrap_or(DEFAULT_AUTO_LOCK_SECS);
+        // 「离开日记时自动锁定」：**只有精确写着 "false" 才算关**，
+        // 其余（缺失 / 空串 / 数字 / 别的词）一律按 **开** 处理。
+        //
+        // ⚠️ 这里的兜底方向是"继续锁"，与 `auto_backup_enabled()` 的
+        //    `v == "true"` 正好相反 —— 因为两项读错方向的代价不对称：
+        //    备份读错最多是少备一份（还有"立即备份"兜底，用户也看得见），
+        //    而锁定读错是**静默地失去保护**：用户不会发现某天的日记没被
+        //    锁上，直到误删。宁可"以为关了、其实还锁着"（他看得见，
+        //    也能再关一次），也不要反过来。
+        let auto_lock_entries = self
+            .get_setting(setting_keys::AUTO_LOCK_ENTRIES)?
+            .map(|v| v.trim() != "false")
+            .unwrap_or(DEFAULT_AUTO_LOCK_ENTRIES);
         Ok(AppSettings {
             auto_lock_secs: secs,
+            auto_lock_entries,
         })
     }
 
@@ -2600,6 +2632,20 @@ impl Vault {
             )));
         }
         self.set_setting(setting_keys::AUTO_LOCK_SECS, &secs.to_string())
+    }
+
+    /// 写入「离开日记时自动锁定」（指令 14）。
+    ///
+    /// 与 `set_auto_lock_secs` 不同，这一项**没有白名单要校验** ——
+    /// 参数就是 `bool`，非法值在类型上根本进不来。
+    ///
+    /// ⚠️ 它**不会**去动任何已经锁上的日记：开关只管"以后要不要自动锁"。
+    ///    顺手把已锁的解开，就成了"改个设置把所有保护一次性抹掉"。
+    pub fn set_auto_lock_entries(&self, on: bool) -> AppResult<()> {
+        self.set_setting(
+            setting_keys::AUTO_LOCK_ENTRIES,
+            if on { "true" } else { "false" },
+        )
     }
 
     /// 到下次自动备份还差多少秒。0 表示现在就该备份。
@@ -3619,6 +3665,62 @@ mod tests {
         // 空串也一样 —— 有些工具会把"空值"存成空字符串而不是删掉这一行
         vault.set_setting(setting_keys::AUTO_LOCK_SECS, "").unwrap();
         assert_eq!(vault.get_settings().unwrap().auto_lock_secs, 600);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「离开日记时自动锁定」：默认开、两个方向都留得住、坏值一律回落到"开"。
+    ///
+    /// 兜底方向是这条测试的重点：读不出来时**宁可继续锁**，
+    /// 也不能静默地变成"不锁"。注意它与 `auto_backup_enabled()` 的
+    /// `v == "true"` 口径故意的不同（读错方向的代价不对称）。
+    #[test]
+    fn auto_lock_entries_defaults_and_falls_back() {
+        let dir = std::env::temp_dir().join("dsh-diary-auto-lock-entries");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let vault = Vault::create(&dir, "135790", None).unwrap();
+
+        // 老库：从来没有这个 key → 默认 **开**（与改动前的行为逐项一致）
+        assert!(
+            vault.get_settings().unwrap().auto_lock_entries,
+            "老库必须默认开 —— 默认关等于所有人一升级就静默地失去保护"
+        );
+
+        // 两个方向都要留得住（"关"必须真的读回 false，不能被兜底吞掉）
+        vault.set_auto_lock_entries(false).unwrap();
+        assert!(!vault.get_settings().unwrap().auto_lock_entries);
+        vault.set_auto_lock_entries(true).unwrap();
+        assert!(vault.get_settings().unwrap().auto_lock_entries);
+
+        // 库里被外部工具写坏：一律回落到"开"（保守方向）
+        for bad in ["", "abc", "0", "TRUE", "yes", " "] {
+            vault
+                .set_setting(setting_keys::AUTO_LOCK_ENTRIES, bad)
+                .unwrap();
+            assert!(
+                vault.get_settings().unwrap().auto_lock_entries,
+                "坏值 {bad:?} 必须回落到开"
+            );
+        }
+        // 但精确的 "false" 必须被认出来，否则这个开关就永远关不掉了
+        vault
+            .set_setting(setting_keys::AUTO_LOCK_ENTRIES, "false")
+            .unwrap();
+        assert!(!vault.get_settings().unwrap().auto_lock_entries);
+
+        // 两项互不干扰：读一次设置会把它们一起读出来
+        vault.set_auto_lock_secs(60).unwrap();
+        vault.set_auto_lock_entries(false).unwrap();
+        let s = vault.get_settings().unwrap();
+        assert_eq!(s.auto_lock_secs, 60);
+        assert!(!s.auto_lock_entries);
+
+        // 默认值本身也要对（两个常量各自被 Default 用着）
+        let d = AppSettings::default();
+        assert_eq!(d.auto_lock_secs, DEFAULT_AUTO_LOCK_SECS);
+        assert!(d.auto_lock_entries);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

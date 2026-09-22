@@ -961,6 +961,19 @@ pub fn set_auto_lock_secs(state: State<'_, VaultState>, secs: u32) -> AppResult<
     with_vault(&state, |v| v.set_auto_lock_secs(secs))
 }
 
+/// 设置「离开日记时自动锁定」：切日期 / 重开软件时是否把日记自动锁上。
+///
+/// ⚠️ 与上一条**同名不同义**，别合并：
+///   - `set_auto_lock_secs` 锁的是**整个应用**（回解锁页 / 遮蔽页）；
+///   - 这一条锁的是**单篇日记**（那天的正文变只读）。
+///
+/// 这里没有可校验的非法值（参数就是 `bool`），所以整条命令只剩
+/// "必须已解锁"这一件事 —— 交给 `with_vault`。
+#[tauri::command]
+pub fn set_auto_lock_entries(state: State<'_, VaultState>, on: bool) -> AppResult<()> {
+    with_vault(&state, |v| v.set_auto_lock_entries(on))
+}
+
 /// 后台自动备份的检查间隔。
 ///
 /// 为什么不直接 sleep 24 小时再备份：应用可能中途被关闭、电脑可能休眠，
