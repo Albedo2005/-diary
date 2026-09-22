@@ -7,7 +7,7 @@
  *   - 有日记的日子做标记，让用户一眼看到这个月写了哪些天
  *   - 所有日期都按**本地时区**处理（见 utils/date.ts 的说明）
  */
-import { computed, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onUnmounted, ref, watch } from "vue";
 import {
   retireTag,
   listTags,
@@ -201,6 +201,7 @@ async function removeTag(t: TagStat) {
    标题此前是「一点就回今天」：既没有视觉提示（悬停才看得到），又把
    「回今天」这件常用的事藏了起来。现在点标题弹一个面板 ——
    上面翻年 + 选月，下面三个快捷入口。
+   （年份那一行自 2026-09-22 起**点一下就能直接打字**，见下面「年份改成可直接输入」一段。）
 
    ⚠️ 面板只换 `month`，**不动 `selected`** —— 与 ‹ › 是同一套行为。
       用户只是想看看 2024 年写了什么，编辑区那篇日记不该被切走。
@@ -236,6 +237,70 @@ const yearCeil = computed(() => YEAR_MAX);
 
 function clampYear(y: number): number {
   return Math.min(Math.max(y, yearFloor.value), yearCeil.value);
+}
+
+/* ── 年份改成可直接输入（指令 16，2026-09-22）──────────────────────────
+   从"只能 ‹ › 一格一格挪"改成**点一下直接打年份**。
+   用户当场拍的板（逐条对应，别自己改口径）：
+     - **点一下才显示输入框** —— "常显"那个方案被明确否掉（原话："太丑了"）；
+     - 范围**仍是 `1949 ~ 2099`**，超出的一律**夹到边界**（打 1800 → 1949、3000 → 2099）；
+     - **只有按回车算"打完了"**；其它任何离开方式（失焦、点箭头、点月份）**一律放弃草稿**、
+       显示退回原年份 —— 所以"打了半截又去点箭头"不会既提交又步进、一下跳两年；
+     - 输完**只换面板年份**，不替你选月份、也不关面板（与 ‹ › 同一套行为）；
+     - 输入框里按 Esc **一律关掉整个面板**（与面板外按 Esc 同待遇，走的是下面那条现成的全局监听）。
+   ⚠️ 输入过程中**一律不校验、不 clamp、不弹回** —— 打 "1"、"19" 都不是合法年份，
+      边打边夹会完全没法用。只在回车那一下判断。
+   ⚠️ 中文输入法：回车提交前必须先看 `ev.isComposing`（中文输入法里 Enter 是
+      "上屏候选词"，不挡会在选词时误提交）。 */
+const yearEditing = ref(false);
+const yearDraft = ref("");
+const yearInputRef = ref<HTMLInputElement | null>(null);
+
+/** 点年份文字：换成输入框，聚焦并全选（省得先删掉旧的）。 */
+async function startYearEdit() {
+  yearDraft.value = String(pickerYear.value);
+  yearEditing.value = true;
+  await nextTick();
+  yearInputRef.value?.focus();
+  yearInputRef.value?.select();
+}
+
+/** 退出编辑态（提交与放弃都走它），显示退回 pickerYear。 */
+function endYearEdit() {
+  yearEditing.value = false;
+  yearDraft.value = "";
+}
+
+/**
+ * 只留数字。
+ * 全角数字（中文输入法下很容易打出来）先折成半角再过滤，
+ * 顺带挡掉粘贴进来的 "1998年" / "1,998" 之类。
+ */
+function onYearInput() {
+  const half = yearDraft.value.replace(/[\uff10-\uff19]/g, (c) =>
+    String.fromCharCode(c.charCodeAt(0) - 0xfee0)
+  );
+  const cleaned = half.replace(/[^0-9]/g, "").slice(0, 4);
+  if (cleaned !== yearDraft.value) yearDraft.value = cleaned;
+}
+
+/**
+ * 回车提交。
+ *
+ * 「夹到边界」＝ 只要解析得出数字就 clamp；**什么都没打（空）夹不了，退回原值**。
+ * （位数不足的如 "19" 也走同一条规则、夹到 1949 —— 与"夹到边界"这个口径一致；
+ *   不再额外加一套"位数不够就拒绝"的说法。）
+ */
+function commitYear() {
+  const raw = yearDraft.value;
+  if (raw !== "") pickerYear.value = clampYear(Number(raw));
+  endYearEdit();
+}
+
+/** 回车：中文输入法正在组合时不算（那是"上屏候选词"）。 */
+function onYearEnter(ev: KeyboardEvent) {
+  if (ev.isComposing) return;
+  commitYear();
 }
 
 /** 面板里该高亮的那个月：年份和月份都要对上。 */
@@ -296,7 +361,12 @@ function onDocKeydown(ev: KeyboardEvent) {
 
 /** 监听器跟着面板开关走，关掉就摘。 */
 watch(pickerOpen, (open, _old, onCleanup) => {
-  if (!open) return;
+  if (!open) {
+    // 面板一关就把"改年份"状态一起收掉：下次打开是干净的文本，
+    // 不会留着一个空输入框，也不会把半截草稿带过去。
+    endYearEdit();
+    return;
+  }
   document.addEventListener("pointerdown", onDocPointerDown, true);
   document.addEventListener("keydown", onDocKeydown);
   onCleanup(() => {
@@ -382,7 +452,33 @@ watch(
           >
             ‹
           </button>
-          <span class="picker-year-text">{{ pickerYear }} 年</span>
+
+          <!--
+            年份平时是**文字**（"常显输入框"被用户否掉过一次，嫌丑），
+            点一下才变成输入框。回车提交；失焦 / 点箭头 / 点月份都算放弃草稿。
+          -->
+          <input
+            v-if="yearEditing"
+            ref="yearInputRef"
+            v-model="yearDraft"
+            class="picker-year-input"
+            type="text"
+            inputmode="numeric"
+            maxlength="4"
+            :title="`输入 ${YEAR_MIN} ~ ${YEAR_MAX} 之间的年份，回车确认`"
+            @input="onYearInput"
+            @keydown.enter="onYearEnter"
+            @blur="endYearEdit"
+          />
+          <button
+            v-else
+            class="picker-year-text"
+            title="点击可直接输入年份"
+            @click="startYearEdit"
+          >
+            {{ pickerYear }} 年
+          </button>
+
           <button
             class="nav"
             :disabled="pickerYear >= yearCeil"
@@ -778,10 +874,37 @@ watch(
   justify-content: space-between;
   margin-bottom: 8px;
 }
+/* 年份平时是一段**可点的文字**，点一下才换成输入框（指令 16）。
+   cursor 用 text 而不是 pointer：暗示"点进去能打字"，不是"点一下就跳"。 */
 .picker-year-text {
+  padding: 3px 8px;
   font-size: 13px;
   font-weight: 600;
   color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: text;
+}
+.picker-year-text:hover {
+  background: var(--hover);
+  border-color: var(--border);
+}
+/* 宽度与文字态（"2026 年" ≈ 63px）对齐，切换时那一行不会左右跳一下。 */
+.picker-year-input {
+  box-sizing: border-box;
+  width: 63px;
+  padding: 3px 6px;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  text-align: center;
+  color: var(--text-1);
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  outline: none;
   font-variant-numeric: tabular-nums;
 }
 .picker-months {
