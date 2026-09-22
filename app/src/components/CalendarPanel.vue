@@ -56,7 +56,7 @@ const loading = ref(false);
 const errorText = ref("");
 
 const today = todayKey();
-/** 今年。年月面板能翻到哪一年要用它（见 yearFloor / yearCeil）。 */
+/** 今年。只用来给年月面板的年份一个初始值（可翻范围是写死的，见 yearFloor / yearCeil）。 */
 const currentYear = Number(today.slice(0, 4));
 const cells = computed(() => monthGrid(month.value));
 const weekLabels = ["一", "二", "三", "四", "五", "六", "日"];
@@ -218,15 +218,21 @@ const headRef = ref<HTMLElement | null>(null);
 const MONTH_LABELS = Array.from({ length: 12 }, (_, i) => `${i + 1}月`);
 
 /**
- * 年份能翻的范围：最早写过的那年 −1 ～ 今年 +1。
- * 一篇都没写过时两头都钉在今年 —— 那时候往前往后都是空日历，翻它没有意义。
+ * 年份能翻的范围：**写死 `1949 ~ 2099`**（2026-09-22 定）。
+ *
+ * 这里原本是「最早写过的那年 −1 ～ 今年 +1」，**坏在"日记本很新时等于没余量"**：
+ * 本子建在 2026 年 ⇒ 只能翻 2025 / 2026 / 2027 三格，用户按两下就撞墙、当成 bug 报上来。
+ * 日历本来就该能随便往前翻，不该拿"你已经写了多久"来限制。
+ *
+ * ⚠️ 放宽到 150 年**不增加任何内存 / 性能开销**：这里只是两个数字常量；
+ *    日历格子永远是 42 个（6 行 × 7 列），跟翻到哪一年无关；
+ *    翻到没写过的年份，后端只是发一条查不到行的 `entry_date BETWEEN ? AND ?`。
+ * ⚠️ 走到两头时两个箭头会自动置灰（模板里的 `:disabled`），不会"点了没反应"。
  */
-const yearFloor = computed(() =>
-  props.firstDate ? Number(props.firstDate.slice(0, 4)) - 1 : currentYear
-);
-const yearCeil = computed(() =>
-  props.firstDate ? currentYear + 1 : currentYear
-);
+const YEAR_MIN = 1949;
+const YEAR_MAX = 2099;
+const yearFloor = computed(() => YEAR_MIN);
+const yearCeil = computed(() => YEAR_MAX);
 
 function clampYear(y: number): number {
   return Math.min(Math.max(y, yearFloor.value), yearCeil.value);
@@ -364,7 +370,7 @@ watch(
 
       <!--
         年月面板。只换月份，不动选中日期（底部那三个入口除外）。
-        年份的可翻范围见 yearFloor / yearCeil，不会无限翻到 1900 年去。
+        年份的可翻范围见 yearFloor / yearCeil（写死 1949 ~ 2099）。
       -->
       <div v-if="pickerOpen" ref="pickerRef" class="picker">
         <div class="picker-year">

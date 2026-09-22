@@ -17,6 +17,16 @@ publish = false
 name = "app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# Tauri 官方模板的标准一段：打开后构建产物会**内嵌** dist（走 frontendDist），
+# 关掉则走 devUrl、去连 localhost:1420 的开发服务器。
+#
+# ⚠️ 2026-09-22 补：这份 manifest 一直缺这一段。以前每次都用 `tauri build` 构建，
+#    CLI 会在命令行上顺手把这个 feature 打开，所以从来没暴露出来。一旦绕过 CLI 直接
+#    `cargo build --release`，编出来就是个 **dev 版**——能启动、窗口也建得出来，
+#    但里面是"无法访问此页面"（它在连 localhost:1420）。排查经过见 生产日志 坑表。
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { workspace = true }
 
