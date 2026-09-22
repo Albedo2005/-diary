@@ -974,6 +974,19 @@ pub fn set_auto_lock_entries(state: State<'_, VaultState>, on: bool) -> AppResul
     with_vault(&state, |v| v.set_auto_lock_entries(on))
 }
 
+/// 设置「三击左键快速解锁」：日记锁定时，在正文里连点三下左键是否直接解锁。
+///
+/// ⚠️ 这是一个**手势开关**，不改变任何锁定的语义：
+///   - 关掉它只是关掉这个手势，手动 🔒 / 🔓 按钮照旧好用；
+///   - 它**不会**解锁已经锁上的日记，也不会替用户锁上任何一篇。
+///
+/// 与上一条同理，没有可校验的非法值（参数就是 `bool`），
+/// 整条命令只剩"必须已解锁"这一件事 —— 交给 `with_vault`。
+#[tauri::command]
+pub fn set_triple_click_unlock(state: State<'_, VaultState>, on: bool) -> AppResult<()> {
+    with_vault(&state, |v| v.set_triple_click_unlock(on))
+}
+
 /// 后台自动备份的检查间隔。
 ///
 /// 为什么不直接 sleep 24 小时再备份：应用可能中途被关闭、电脑可能休眠，

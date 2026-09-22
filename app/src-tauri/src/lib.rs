@@ -159,6 +159,7 @@ pub fn run() {
             commands::get_settings,
             commands::set_auto_lock_secs,
             commands::set_auto_lock_entries,
+            commands::set_triple_click_unlock,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");

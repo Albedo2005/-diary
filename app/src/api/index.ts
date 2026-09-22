@@ -244,6 +244,13 @@ export interface AppSettings {
    *    （回解锁页），这个锁的是**单篇日记**（那天的正文变只读）。
    */
   auto_lock_entries: boolean;
+  /**
+   * 日记锁定时，在正文里连点三下左键是否可以直接解锁（指令 15）。默认 `true`。
+   *
+   * ⚠️ 只决定"这个手势要不要开"，**不改变任何锁定语义**：
+   *    关掉后手动 🔒 / 🔓 按钮照旧好用。
+   */
+  triple_click_unlock: boolean;
 }
 
 /**
@@ -274,6 +281,15 @@ export const DEFAULT_AUTO_LOCK_SECS = 600;
  *    会出现"重开软件后日记居然没锁" —— 与默认值相反，而且是**静默**的。
  */
 export const DEFAULT_AUTO_LOCK_ENTRIES = true;
+
+/**
+ * 「三击左键快速解锁」的默认值：**开**（指令 15）。
+ * 与后端 `db::DEFAULT_TRIPLE_CLICK_UNLOCK` 保持一致。
+ *
+ * ⚠️ 它同时是**读到设置之前的初值**（与 `DEFAULT_AUTO_LOCK_ENTRIES` 同理）：
+ *    设置存在加密库里，得等解锁之后才读得到。
+ */
+export const DEFAULT_TRIPLE_CLICK_UNLOCK = true;
 
 // ---------------------------------------------------------------------------
 // 错误处理
@@ -671,6 +687,18 @@ export const setAutoLockSecs = (secs: number) =>
  */
 export const setAutoLockEntries = (on: boolean) =>
   invoke<void>("set_auto_lock_entries", { on });
+
+/**
+ * 设置「三击左键快速解锁」（指令 15）。
+ *
+ * 参数就是布尔值，没有非法值可挡 —— 校验/兜底全在后端数据层。
+ *
+ * ⚠️ 关掉它**只是关掉这个手势**：手动 🔒 / 🔓 按钮照旧好用，
+ *    也不会解锁任何已经锁上的日记。
+ * ⚠️ 写入失败时界面必须回滚成原值（见 SettingsPanel 的开关处理）。
+ */
+export const setTripleClickUnlock = (on: boolean) =>
+  invoke<void>("set_triple_click_unlock", { on });
 
 // ---------------------------------------------------------------------------
 // 图片附件（P1 #10）

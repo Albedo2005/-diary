@@ -32,6 +32,7 @@ pub mod setting_keys {
     pub const KEEP_RECENT: &str = "keep_recent";
     pub const AUTO_LOCK_SECS: &str = "auto_lock_secs";
     pub const AUTO_LOCK_ENTRIES: &str = "auto_lock_entries";
+    pub const TRIPLE_CLICK_UNLOCK: &str = "triple_click_unlock";
 }
 
 /// 自动锁定时长的**档位白名单**（秒）。`0` 表示"永不"。
@@ -58,6 +59,14 @@ pub const DEFAULT_AUTO_LOCK_SECS: u32 = 600;
 ///    而这是一次**静默**的安全倒退（没有任何提示）。
 pub const DEFAULT_AUTO_LOCK_ENTRIES: bool = true;
 
+/// 「三击左键快速解锁」的默认值：**开**（指令 15）。
+///
+/// ⚠️ 默认开：用户要的就是"一只手快速解锁"，而这条手势**只在锁定态**、
+///    只在正文输入框上生效 —— 风险面很窄（未锁定时三击仍是原生的
+///    "选中一整段"，一个字节都不改）。老库（没有这个 key）走同一个默认值。
+///    读取时沿用 `auto_lock_entries` 的口径：**只有精确 "false" 才算关**。
+pub const DEFAULT_TRIPLE_CLICK_UNLOCK: bool = true;
+
 /// 应用设置。
 ///
 /// 为什么用一个结构体返回、而不是每项一个读取命令：
@@ -76,6 +85,11 @@ pub struct AppSettings {
     ///    （那天的正文变只读），防的是自己手滑改掉 / 删掉写好的日记；
     ///    那一项防的是别人看。
     pub auto_lock_entries: bool,
+    /// 日记锁定时，在正文里连点三下左键是否可以直接解锁（指令 15）。默认开。
+    ///
+    /// ⚠️ 这一项只是"手势开关"，与 `auto_lock_entries` **不是一回事**：
+    ///    它不决定"要不要自动锁"，只决定"锁上之后怎么解开方便"。
+    pub triple_click_unlock: bool,
 }
 
 impl Default for AppSettings {
@@ -83,6 +97,7 @@ impl Default for AppSettings {
         Self {
             auto_lock_secs: DEFAULT_AUTO_LOCK_SECS,
             auto_lock_entries: DEFAULT_AUTO_LOCK_ENTRIES,
+            triple_click_unlock: DEFAULT_TRIPLE_CLICK_UNLOCK,
         }
     }
 }
@@ -2610,9 +2625,20 @@ impl Vault {
             .get_setting(setting_keys::AUTO_LOCK_ENTRIES)?
             .map(|v| v.trim() != "false")
             .unwrap_or(DEFAULT_AUTO_LOCK_ENTRIES);
+        // 「三击左键快速解锁」（指令 15）：与上一项**同一口径** ——
+        // 只有精确写着 "false" 才算关，其余（缺失 / 空串 / 数字 / 别的词）
+        // 一律按 **开** 处理；老库没有这个 key 也走同一个默认值。
+        //
+        // 口径统一是为了"少一份要记的规则"：这只是一个解锁手势，
+        // 读错方向的代价远小于 `auto_lock_entries`（不涉及保护被静默关掉）。
+        let triple_click_unlock = self
+            .get_setting(setting_keys::TRIPLE_CLICK_UNLOCK)?
+            .map(|v| v.trim() != "false")
+            .unwrap_or(DEFAULT_TRIPLE_CLICK_UNLOCK);
         Ok(AppSettings {
             auto_lock_secs: secs,
             auto_lock_entries,
+            triple_click_unlock,
         })
     }
 
@@ -2644,6 +2670,17 @@ impl Vault {
     pub fn set_auto_lock_entries(&self, on: bool) -> AppResult<()> {
         self.set_setting(
             setting_keys::AUTO_LOCK_ENTRIES,
+            if on { "true" } else { "false" },
+        )
+    }
+
+    /// 写入「三击左键快速解锁」（指令 15）。
+    ///
+    /// 与 `set_auto_lock_entries` 同一形状：无白名单可校验（参数就是 `bool`），
+    /// 也**不去动任何已经锁上的日记** —— 它只是开关一个解锁手势。
+    pub fn set_triple_click_unlock(&self, on: bool) -> AppResult<()> {
+        self.set_setting(
+            setting_keys::TRIPLE_CLICK_UNLOCK,
             if on { "true" } else { "false" },
         )
     }
@@ -3721,6 +3758,65 @@ mod tests {
         let d = AppSettings::default();
         assert_eq!(d.auto_lock_secs, DEFAULT_AUTO_LOCK_SECS);
         assert!(d.auto_lock_entries);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「三击左键快速解锁」：默认开、两个方向都留得住、坏值一律回落到"开"（指令 15）。
+    ///
+    /// 与 `auto_lock_entries` 同一套口径，重点仍是**兜底方向**：
+    /// 读不出来时按"开"处理 —— 老库升级上来时行为与改动前一致
+    /// （此前没有这个开关，手势始终可用）。
+    #[test]
+    fn triple_click_unlock_defaults_and_falls_back() {
+        let dir = std::env::temp_dir().join("dsh-diary-triple-click-unlock");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let vault = Vault::create(&dir, "135790", None).unwrap();
+
+        // 老库：从来没有这个 key → 默认 **开**
+        assert!(
+            vault.get_settings().unwrap().triple_click_unlock,
+            "老库必须默认开 —— 升级前的版本里这个手势一直可用"
+        );
+
+        // 两个方向都要留得住（"关"必须真的读回 false，不能被兜底吞掉）
+        vault.set_triple_click_unlock(false).unwrap();
+        assert!(!vault.get_settings().unwrap().triple_click_unlock);
+        vault.set_triple_click_unlock(true).unwrap();
+        assert!(vault.get_settings().unwrap().triple_click_unlock);
+
+        // 库里被外部工具写坏：一律回落到"开"
+        for bad in ["", "abc", "0", "TRUE", "yes", " "] {
+            vault
+                .set_setting(setting_keys::TRIPLE_CLICK_UNLOCK, bad)
+                .unwrap();
+            assert!(
+                vault.get_settings().unwrap().triple_click_unlock,
+                "坏值 {bad:?} 必须回落到开"
+            );
+        }
+        // 但精确的 "false" 必须被认出来，否则这个开关就永远关不掉了
+        vault
+            .set_setting(setting_keys::TRIPLE_CLICK_UNLOCK, "false")
+            .unwrap();
+        assert!(!vault.get_settings().unwrap().triple_click_unlock);
+
+        // 三项互不干扰：读一次设置会把它们一起读出来
+        vault.set_auto_lock_secs(60).unwrap();
+        vault.set_auto_lock_entries(false).unwrap();
+        vault.set_triple_click_unlock(false).unwrap();
+        let s = vault.get_settings().unwrap();
+        assert_eq!(s.auto_lock_secs, 60);
+        assert!(!s.auto_lock_entries);
+        assert!(!s.triple_click_unlock);
+
+        // 默认值本身也要对（三个常量各自被 Default 用着）
+        let d = AppSettings::default();
+        assert_eq!(d.auto_lock_secs, DEFAULT_AUTO_LOCK_SECS);
+        assert!(d.auto_lock_entries);
+        assert!(d.triple_click_unlock);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

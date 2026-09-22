@@ -14,6 +14,7 @@
  *   - **Markdown 导出**（指令 7）—— 报表式的项，自己调后端拿结果，见下面 doExport
  *   - **自动锁定时长**（指令 11）—— 见下面 onChangeAutoLock 的说明
  *   - **离开日记时自动锁定**（指令 14）—— 见下面 onToggleAutoLockEntries 的说明
+ *   - **三击左键快速解锁**（指令 15）—— 见下面 onToggleTripleClickUnlock 的说明
  *   - **修改主密码**（指令 3）—— 见下面 submitChangePin 的说明
  *   - **免密打开**（指令 4）—— 见下面 openAutoLogin / submitAutoLogin 的说明
  * 到此【安全】分类里**没有占位项了**，全部接线完毕。
@@ -25,7 +26,8 @@
  * 将来真要做主题切换，再按需要重建这个分类。
  *
  * 组件不自己拉状态：status / backup / crypto / stats / autoLockSecs /
- * autoLockEntries 全部从 App.vue 传入，免得两份状态各走各的、切个分类就对不上。
+ * autoLockEntries / tripleClickUnlock 全部从 App.vue 传入，免得两份状态
+ * 各走各的、切个分类就对不上。
  * 例外只有一处：改密码成功后由 App.vue 用返回的新状态覆盖（见 password-changed）。
  */
 import { computed, nextTick, ref } from "vue";
@@ -40,6 +42,7 @@ import {
   revealDir,
   setAutoLockEntries,
   setAutoLockSecs,
+  setTripleClickUnlock,
   toAppError,
   type AppStatus,
   type BackupStatus,
@@ -61,6 +64,11 @@ const props = defineProps<{
    * 同样由 App.vue 持有 —— 它还要传给 EditorPane，不能有两份。
    */
   autoLockEntries: boolean;
+  /**
+   * 日记锁定时，在正文里连点三下左键是否可以直接解锁（指令 15）。
+   * 同样由 App.vue 持有 —— 它还要传给 EditorPane，不能有两份。
+   */
+  tripleClickUnlock: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -75,6 +83,8 @@ const emit = defineEmits<{
   (e: "auto-lock-secs", secs: number): void;
   /** 「离开日记时自动锁定」已成功写入后端，通知 App.vue 更新本地值。 */
   (e: "auto-lock-entries", on: boolean): void;
+  /** 「三击左键快速解锁」已成功写入后端，通知 App.vue 更新本地值。 */
+  (e: "triple-click-unlock", on: boolean): void;
   /** 主密码已更换。带上后端返回的最新状态与收尾警告，由 App.vue 落库。 */
   (e: "password-changed", res: ChangePasswordResult): void;
   /**
@@ -179,6 +189,26 @@ async function onToggleAutoLockEntries(e: Event) {
     emit("auto-lock-entries", next);
   } catch (err) {
     el.checked = props.autoLockEntries; // 回滚，不留假状态
+    emit("notice", toAppError(err).message);
+  }
+}
+
+/**
+ * 切换「三击左键快速解锁」（指令 15）。
+ * 与上一条**完全同一套路**：自己调后端、成功后 emit 新值让 App.vue
+ * 更新 ref（ref 仍是唯一真值源）、失败时把勾拨回原值。
+ *
+ * ⚠️ 同样"不改动页面上任何已锁的日记"：它只是关掉一个手势。
+ */
+async function onToggleTripleClickUnlock(e: Event) {
+  const el = e.target as HTMLInputElement;
+  const next = el.checked;
+  if (next === props.tripleClickUnlock) return;
+  try {
+    await setTripleClickUnlock(next);
+    emit("triple-click-unlock", next);
+  } catch (err) {
+    el.checked = props.tripleClickUnlock; // 回滚，不留假状态
     emit("notice", toAppError(err).message);
   }
 }
@@ -749,6 +779,30 @@ async function doPrune() {
                     type="checkbox"
                     :checked="autoLockEntries"
                     @change="onToggleAutoLockEntries"
+                  />
+                </label>
+              </div>
+            </div>
+
+            <!--
+              三击左键快速解锁（指令 15）。
+              紧跟着上面两条"锁定"相关的项 —— 它们同属【安全】里
+              "日记锁上之后怎么解开"这一族，放一起用户才好找。
+              ⚠️ 这条**只管手势**：关掉它不会解锁任何已经锁上的日记。
+            -->
+            <div class="row">
+              <div class="label">
+                <div class="t">三击左键快速解锁</div>
+                <div class="d">
+                  日记锁定时，在正文里连续点三下左键即可解锁，手不用移到右上角。关掉后只能用 🔒 按钮解锁。
+                </div>
+              </div>
+              <div class="ctl">
+                <label class="toggle">
+                  <input
+                    type="checkbox"
+                    :checked="tripleClickUnlock"
+                    @change="onToggleTripleClickUnlock"
                   />
                 </label>
               </div>

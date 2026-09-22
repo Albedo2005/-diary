@@ -18,6 +18,7 @@ import {
   cryptoInfo,
   DEFAULT_AUTO_LOCK_ENTRIES,
   DEFAULT_AUTO_LOCK_SECS,
+  DEFAULT_TRIPLE_CLICK_UNLOCK,
   getBackupStatus,
   getSettings,
   getStats,
@@ -111,6 +112,14 @@ const autoLockSecs = ref(DEFAULT_AUTO_LOCK_SECS);
  */
 const autoLockEntries = ref(DEFAULT_AUTO_LOCK_ENTRIES);
 
+/**
+ * 日记锁定时，在正文里连点三下左键是否可以直接解锁（指令 15）。默认 **开**。
+ *
+ * 与 `autoLockEntries` 同一套路：先用默认值起步，解锁后由 `loadSettings()`
+ * 换成库里的真实值 —— 设置在**加密库**里，未解锁根本读不到。
+ */
+const tripleClickUnlock = ref(DEFAULT_TRIPLE_CLICK_UNLOCK);
+
 const toast = ref("");
 let toastTimer: number | null = null;
 
@@ -177,17 +186,18 @@ async function loadAux() {
 }
 
 /**
- * 读取应用设置（自动锁定时长 ＋ 离开日记时自动锁定）。
+ * 读取应用设置（自动锁定时长 ＋ 离开日记时自动锁定 ＋ 三击左键快速解锁）。
  *
  * 只能在**解锁后**调 —— 设置在加密库里，未解锁读不到。
- * 读失败不阻塞主流程：留用默认值也比卡住强，何况这两项都有安全的落点
- *（时长回落到 10 分钟、自动锁定回落到"开"）。
+ * 读失败不阻塞主流程：留用默认值也比卡住强，何况这几项都有安全的落点
+ *（时长回落到 10 分钟、两个开关都回落到"开"）。
  */
 async function loadSettings() {
   try {
     const s = await getSettings();
     autoLockSecs.value = s.auto_lock_secs;
     autoLockEntries.value = s.auto_lock_entries;
+    tripleClickUnlock.value = s.triple_click_unlock;
   } catch {
     // 保持默认值。不值得为这一项弹错误。
   }
@@ -500,6 +510,7 @@ onUnmounted(() => {
             :date="selected"
             :tag-token="tagToken"
             :auto-lock-entries="autoLockEntries"
+            :triple-click-unlock="tripleClickUnlock"
             @saved="onSaved"
             @tags-changed="onTagsChanged"
             @notice="flash"
@@ -535,12 +546,14 @@ onUnmounted(() => {
         :crypto="crypto"
         :auto-lock-secs="autoLockSecs"
         :auto-lock-entries="autoLockEntries"
+        :triple-click-unlock="tripleClickUnlock"
         @close="showSettings = false"
         @backup="doBackup"
         @integrity="doIntegrity"
         @toggle-auto-backup="toggleAutoBackup"
         @auto-lock-secs="(s) => (autoLockSecs = s)"
         @auto-lock-entries="(on) => (autoLockEntries = on)"
+        @triple-click-unlock="(on) => (tripleClickUnlock = on)"
         @password-changed="onPasswordChanged"
         @auto-login-changed="onAutoLoginChanged"
         @refresh-status="refreshStatus"

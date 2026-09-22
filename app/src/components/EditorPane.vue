@@ -64,6 +64,17 @@ const props = defineProps<{
    *    会出现"重开软件后日记居然没锁"，与默认值相反，而且**是静默的**。
    */
   autoLockEntries?: boolean;
+  /**
+   * 日记锁定时，在正文里连点三下左键是否可以直接解锁（指令 15）。默认 **开**。
+   *
+   * ⚠️ 这一项与 `autoLockEntries` 的"`undefined` 按锁处理"**方向相反**：
+   *    它是一个纯粹的可选手势，读不到设置时按**关**处理更保守 ——
+   *    无非是得多点一下 🔓；反过来按开处理，会让"设置还没读回来"
+   *    的那一小段时间里三击意外可用（而它恰恰是防别人误改的）。
+   *    真正"老库默认开"的语义落在库里的默认值上（见 db.rs 的同名常量），
+   *    这里只是"父组件还没告诉过我"时的兜底。
+   */
+  tripleClickUnlock?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -353,6 +364,39 @@ async function toggleLock() {
   } catch (e) {
     errorText.value = toAppError(e).message;
   }
+}
+
+/**
+ * 三击左键解锁（指令 15）。
+ *
+ * ⚠️ 只在**锁定态**参与，未锁定时第一行就 `return` ——
+ *    "连点三下选中一整段"是浏览器原生行为，一个字节都不能改。
+ *    挂监听可以，但要拦、要改默认行为的地方一处都没有。
+ * ⚠️ 第 3 下必须 `preventDefault()`：否则 `readonly` 的 textarea 会顺势
+ *    全选，解锁的一瞬间满屏高亮，用户会以为"解锁把内容搞乱了"。
+ * ⚠️ 监听只挂正文 `textarea`，**不挂 `.editor` 整块** ——
+ *    挂整块的话，在「🔒 已锁定」按钮 / 心情按钮 / 标签 × 上三击会**连带触发**，
+ *    与按钮自身的点击打架（等于瞬间连点两下开关）。
+ * ⚠️ 一行都不碰 `contextmenu`：正文右键菜单必须原样保留。
+ */
+let lastClick = 0;
+let streak = 0;
+
+function onContentMouseDown(e: MouseEvent) {
+  if (!props.tripleClickUnlock) return;
+  if (!locked.value) return;
+  if (e.button !== 0) return;
+  const now = Date.now();
+  // 相邻两下间隔超过 500ms 就重新计数 —— 慢速点三下不算。
+  streak = now - lastClick <= 500 ? streak + 1 : 1;
+  lastClick = now;
+  if (streak < 3) return;
+  streak = 0;
+  e.preventDefault();
+  // 复用既有路径：它内部已经处理了"先保存、后锁定"的次序，
+  // 并用**后端返回值**回填 locked —— 别另写一条解锁路径。
+  void toggleLock();
+  emit("notice", "已解锁");
 }
 
 async function load() {
@@ -1476,6 +1520,7 @@ onUnmounted(() => {
         placeholder="今天发生了什么…"
         spellcheck="false"
         :readonly="locked"
+        @mousedown="onContentMouseDown"
         @compositionstart="onCompositionStart"
         @compositionend="onCompositionEnd"
         @keydown="onKeydown"
