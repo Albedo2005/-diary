@@ -4,10 +4,94 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>日记</title>
+    <!--
+      启动底色与启动画面 —— 必须**内联在这个文件里**（P2-2）。
+
+      为什么：从"窗口被创建"到"Vue 挂载完成"之间有一段空档。在此之前三层
+      都是白的 —— 原生窗口默认白底、body 没有背景、#app 是空节点 ——
+      所以用户会看到"白闪一秒"，很刺眼。
+
+      这段样式**不依赖任何 JS**，浏览器一解析就能画出画面，因此能盖住
+      "等 bundle 下载 + 执行"的那一段。颜色必须和 src/styles/global.css 里的
+      --bg 两套值**逐字一致**（浅 #faf9f7 / 深 #1c1b1a），否则界面就绪那一刻
+      会看到明显的颜色跳变 —— 那比白屏更难受。改这里时记得同步改那边。
+    -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #faf9f7;
+      }
+      @media (prefers-color-scheme: dark) {
+        html,
+        body {
+          background: #1c1b1a;
+        }
+      }
+
+      /* 启动画面。整层固定、盖住一切，等 main.ts 把第一帧画好再淡出移除。 */
+      #boot-splash {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        background: #faf9f7;
+        transition: opacity 0.28s ease;
+        /*
+          纯粹是画面：绝不拦截鼠标事件 —— 它是最后一道视觉屏障，不是交互层，
+          万一移除失败也不能挡住底下的解锁输入。
+        */
+        pointer-events: none;
+        font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei",
+          sans-serif;
+      }
+      #boot-splash .mark {
+        font-size: 25px;
+        font-weight: 500;
+        letter-spacing: 0.34em;
+        /* 与 global.css 的 --text-2 同值：够醒目、又不刺眼。 */
+        color: #5c5955;
+      }
+      #boot-splash .hint {
+        font-size: 12px;
+        letter-spacing: 0.1em;
+        /* 与 global.css 的 --text-3 同值。 */
+        color: #938f88;
+      }
+      #boot-splash.is-gone {
+        opacity: 0;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        #boot-splash {
+          background: #1c1b1a;
+        }
+        #boot-splash .mark {
+          color: #b3aea8;
+        }
+        #boot-splash .hint {
+          color: #7d7873;
+        }
+      }
+    </style>
   </head>
 
   <body>
     <div id="app"></div>
+
+    <!--
+      纯静态节点：不依赖 JS，所以哪怕脚本还没加载完也能显示。
+      第一帧画好后由 main.ts 淡出并**真正移除**（不能留一个透明层在那儿）。
+    -->
+    <div id="boot-splash">
+      <div class="mark">日记</div>
+      <div class="hint">正在打开…</div>
+    </div>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

@@ -85,6 +85,15 @@ const showSettings = ref(false);
 const hidden = ref(false);
 
 /**
+ * 正文编辑器的句柄 —— 只用来在**锁库之前**催它把没保存的内容写下去（P2-4）。
+ *
+ * 为什么要单独拿一个 ref：正文是 1000ms 防抖保存的，而"锁定"会先把库锁上、
+ * 顺带把编辑器从主界面上卸载掉；等于说编辑器自己想保存时，门已经关了。
+ * 类型只声明用到的那一个方法，免得把整个组件的类型都拖进来。
+ */
+const editorRef = ref<{ flushNow: () => Promise<void> } | null>(null);
+
+/**
  * 上次启动时免密解锁失败过。
  *
  * 真时把解锁页的副标题改掉并加一条提示条 —— 用户本来期待"直接进去"，
@@ -272,6 +281,22 @@ async function doLock() {
     hidden.value = true;
     return;
   }
+
+  /*
+    ⚠️ 先落库、再锁库 —— 顺序不能反（P2-4）。
+
+    正文是 1000ms 防抖保存的。原先这里直接 lockVault()：库一锁，编辑器就随
+    主界面一起卸载，卸载时它那句 `if (dirty) void flush()` 必然被已锁的库拒绝
+    ⇒ "点锁定前最后一秒打的字"会静默消失（界面上只闪一下"保存失败"）。
+    所以在锁之前必须先催它一次，而且**等它写完**（await）再往下走。
+
+    免密那条分支在上面已经 return 了 —— 它只拉帘子、不真锁库，编辑器也不会卸载，
+    轮不到这里操心。
+
+    flushNow() 没脏内容时是空跑；失败由 flush() 自己写进 saveState、不往外抛，
+    所以这里不需要再包一层 catch。
+  */
+  await editorRef.value?.flushNow();
 
   try {
     status.value = await lockVault();
@@ -507,6 +532,7 @@ onUnmounted(() => {
             @notice="flash"
           />
           <EditorPane
+            ref="editorRef"
             :date="selected"
             :tag-token="tagToken"
             :auto-lock-entries="autoLockEntries"

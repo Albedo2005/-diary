@@ -7,15 +7,18 @@
 #   This script makes "produce a fresh double-clickable exe" one command.
 #
 # Usage (from anywhere):
-#   powershell -File scripts\publish-exe.ps1              # build + copy + smoke
-#   powershell -File scripts\publish-exe.ps1 -SkipBuild   # copy + smoke only
-#   powershell -File scripts\publish-exe.ps1 -SkipSmoke   # build + copy only
+#   powershell -File scripts\publish-exe.ps1              # build + copy + installer + smoke
+#   powershell -File scripts\publish-exe.ps1 -SkipBuild   # copy + installer + smoke only
+#   powershell -File scripts\publish-exe.ps1 -SkipBundle  # skip the NSIS installer
+#   powershell -File scripts\publish-exe.ps1 -SkipSmoke   # build + copy + installer only
 #
-# Result:
-#   <proj>\发布\日记.exe
-#   A standalone binary: it embeds the frontend bundle (tauri.conf.json ->
-#   build.frontendDist = ../dist), so it needs NO dev server and NO port 1420.
-#   Only `pnpm app:dev` / target\debug\app.exe need a running dev server.
+# Result (both names are built from char codes -- see the ASCII note below):
+#   1) a standalone, double-clickable exe in the delivery folder. It embeds the
+#      frontend bundle (tauri.conf.json -> build.frontendDist = ../dist), so it
+#      needs NO dev server and NO port 1420. Only `pnpm app:dev` and
+#      target\debug\app.exe need a running dev server.
+#   2) an NSIS installer for OTHER machines, named "<app>-<version>-<installer>.exe"
+#      so several builds can sit side by side without guessing which is which.
 #
 # ASCII-only on purpose: PowerShell 5.1 parses a BOM-less .ps1 as the ANSI
 # codepage (GBK here) and would mangle CJK literals. The two Chinese names are
@@ -24,6 +27,7 @@
 
 param(
     [switch]$SkipBuild,
+    [switch]$SkipBundle,
     [switch]$SkipSmoke
 )
 
@@ -132,6 +136,73 @@ Write-Output ("  size    : {0:N0} bytes" -f $size)
 Write-Output ("  written : {0}" -f $stamp)
 Write-Output ("  sha256  : {0}" -f $dstHash)
 Write-Output ("  identical to the build artifact: {0}" -f ($srcHash -eq $dstHash))
+
+# ---------------------------------------------------------------------------
+# 2.5 NSIS installer (refreshed on every version bump)
+# ---------------------------------------------------------------------------
+# Ordering matters: this MUST come after the copy above. `tauri bundle` writes
+# a bundle-type marker into target\release\app.exe (see "Patching ... app.exe"
+# in the log), so copying afterwards would ship a binary that no longer matches
+# the plain cargo output -- and "the published file is byte-identical to the
+# build artifact" is exactly the check we rely on.
+#
+# `tauri bundle` only *packages*; it does not recompile. It needs the NSIS
+# toolchain, which the Tauri CLI downloads once into
+# %LOCALAPPDATA%\tauri\NSIS. If it is missing this step fails while the
+# standalone exe is still perfectly usable, so failure here is not fatal.
+if (-not $SkipBundle) {
+    $tauriJsB = Join-Path $app 'node_modules\@tauri-apps\cli\tauri.js'
+    $nodeB = (Get-Command node -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+    if (-not $nodeB) { $nodeB = 'D:\node\nodejs\node.exe' }
+
+    if (-not (Test-Path $tauriJsB)) {
+        Write-Output 'WARN: tauri CLI not found -- installer not refreshed'
+    } else {
+        Write-Output ''
+        Write-Output 'building the NSIS installer (tauri bundle) ...'
+        $bundleLog = Join-Path $proj '_bundle-out.log'
+        Push-Location $app
+        $prevEapB = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $nodeB $tauriJsB 'bundle' '-b' 'nsis' '-f' 'custom-protocol' 2>&1 |
+                Tee-Object -FilePath $bundleLog
+            $bcode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prevEapB
+            Pop-Location
+        }
+
+        if ($bcode -ne 0) {
+            Write-Output ("  bundle FAILED (exit {0}) -- the standalone exe is still fine" -f $bcode)
+            Get-Content $bundleLog -ErrorAction SilentlyContinue |
+                Select-Object -Last 20 | ForEach-Object { Write-Output "  $_" }
+        } else {
+            # NSIS output: target\release\bundle\nsis\<productName>_<version>_x64-setup.exe
+            $bundleDir = Join-Path $proj 'target\release\bundle\nsis'
+            $setup = Get-ChildItem -Path $bundleDir -Filter ("*_{0}_x64-setup.exe" -f $version) -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if (-not $setup) {
+                Write-Output ("  WARN: no installer matching version {0} under {1}" -f $version, $bundleDir)
+            } else {
+                # Target name: <app>-<version>-<installer>.exe. Both CJK words are
+                # assembled from char codes -- never type them into this file.
+                #   日记      = U+65E5 U+8BB0
+                #   安装程序  = U+5B89 U+88C5 U+7A0B U+5E8F
+                $iName = ([string][char]0x65E5 + [char]0x8BB0) + '-' + $version + '-' +
+                    ([string][char]0x5B89 + [char]0x88C5 + [char]0x7A0B + [char]0x5E8F) + '.exe'
+                $iDst = Join-Path $publishDir $iName
+                Copy-Item -Path $setup.FullName -Destination $iDst -Force
+                Write-Output ''
+                Write-Output 'installer published:'
+                Write-Output ("  file    : {0}" -f $iDst)
+                Write-Output ("  version : {0}" -f $version)
+                Write-Output ("  size    : {0:N0} bytes" -f (Get-Item $iDst).Length)
+                Write-Output ("  sha256  : {0}" -f (Get-FileHash $iDst -Algorithm SHA256).Hash)
+            }
+        }
+    }
+}
 
 # `使用说明.md` lives in the same folder and is hand-written -- never touch it.
 

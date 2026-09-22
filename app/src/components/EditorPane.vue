@@ -786,6 +786,13 @@ async function removeAttachment(a: Attachment) {
     }
     if (url && zoomed.value?.url === url) zoomIndex.value = null;
     attachments.value = attachments.value.filter((x) => x.id !== a.id);
+    // ⚠️ 删完必须先收起、再重量（P2-1）。
+    //   内容变少了，继续停在展开态本身就没有意义；更要紧的是 measureStrip
+    //   有一道"展开态不测量"的守卫（那行是对的、不能删），不先收起就永远量不出
+    //   新结果，折叠按钮会赖着不走 —— 用户实测的"要点两下才消失"就是这么来的。
+    //   照抄 loadAttachments() 的做法，别引入新风格。
+    expanded.value = false;
+    void nextTick(measureStrip);
     emit("notice", `已删除图片「${a.file_name}」`);
   } catch (e) {
     imageError.value = toAppError(e).message;
@@ -1208,6 +1215,20 @@ onUnmounted(() => {
   // 组件卸载前把未落库的内容写下去。
   if (dirty) void flush();
 });
+
+/**
+ * 把"落库"这一个动作交给父组件调度 —— 目前只有一个调用方：App.vue 的 doLock()。
+ *
+ * 为什么需要它（P2-4）：
+ *   点「锁定」时 App.vue 会先 lockVault()，库一锁、本组件就随主界面一起卸载，
+ *   而卸载时那句 `if (dirty) void flush()` **撞在已锁的库上必然失败**。
+ *   加上正文是 1000ms 防抖保存 ⇒ "点锁定前最后 1 秒打的字"会静默消失。
+ *   ⇒ 父组件必须在**锁库之前**先调一次这里。
+ *
+ * 自己不做任何判断：没有脏内容时 flush() 内部直接 return，重复调也无害。
+ * flush() 内部已经把失败写进 saveState，不会往外抛。
+ */
+defineExpose({ flushNow: () => flush() });
 </script>
 
 <template>
