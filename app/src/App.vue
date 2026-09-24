@@ -21,6 +21,7 @@ import {
   DEFAULT_AUTO_LOCK_SECS,
   DEFAULT_TRIPLE_CLICK_UNLOCK,
   getBackupStatus,
+  getRecap,
   getSettings,
   getStats,
   getStatus,
@@ -35,6 +36,7 @@ import {
   type BackupStatus,
   type ChangePasswordResult,
   type CryptoInfo,
+  type Recap,
   type Stats,
   type TagStat,
 } from "./api";
@@ -106,6 +108,36 @@ const tags = ref<TagStat[]>([]);
  * ⚠️ 它是**派生数据**，已登记在下面 `loadAux` 那张清单里 —— 解锁后与恢复备份后都要重取。
  */
 const writtenDays = ref<string[]>([]);
+
+/**
+ * 「旧影」（回顾）那一屏的数据（P2-23）。
+ *
+ * ⚠️ **刻意不进下面那张派生数据登记处** —— 这条命令要跑三遍全表扫描，
+ *    只在用户**点开「旧影」**那一下才算（见 `loadRecap`），开机白算是浪费。
+ * ⚠️ 但也正因为不进登记处，**换库 / 恢复备份时必须手动清掉**（见 `clearDerived`）——
+ *    不清的话，恢复完切回旧影看到的会是**上一个库**的"最长的那几天"。
+ */
+const recap = ref<Recap | null>(null);
+
+/**
+ * 「年轮」页内停在哪一边（P2-23）。
+ *
+ * ⚠️ 状态放这里而不是 `StatsPanel` 内部：切走再回来那一屏会被卸载重建，
+ *    放组件里就记不住"上次停在旧影"，而用户要的正是记住。
+ * ⚠️ **只在这次运行里记**，⛔ 不落盘 —— `localStorage` 只许存界面偏好
+ *    （P2-22 立的规矩），"你写过什么"属于日记内容，落盘就是泄露。
+ */
+const recapTab = ref<"scale" | "recap">("scale");
+
+/**
+ * 从写日记屏那句「N 年前的今天写过 · 去看看」带过来的那一天（P2-23）。
+ *
+ * **一次性**：`StatsPanel` 用它把对应那一年高亮一下，**离开年轮页就清掉**
+ * （否则切走再回来它还挂着高亮）。⛔ 别把它改成对象或加字段 ——
+ * P2-17 那边只传一个日期字符串，改了会把那边也拖下水。
+ */
+const recapFocus = ref("");
+
 const crypto = ref<CryptoInfo | null>(null);
 const backup = ref<BackupStatus | null>(null);
 /** 设置弹窗。日历与编辑器不被卸载，所以这里悬着也不影响未保存的草稿。 */
@@ -280,6 +312,58 @@ async function loadTags() {
 }
 
 /**
+ * 只重读「旧影」那一屏的数据（P2-23）。
+ *
+ * ⚠️ **只在点开「旧影」时调**，⛔ 别把它塞进 `loadAux()` —— 这条要跑三遍全表扫描，
+ *    开机白算不值当（`getRecap()` 的注释里写着同一条）。
+ * ⚠️ 拉之前**不清空旧值**：重拉时界面能继续显示上一份，不会闪成"正在读取…"。
+ *    真要作废（换库 / 恢复）走 `clearDerived()`。
+ */
+async function loadRecap() {
+  try {
+    recap.value = await getRecap();
+  } catch {
+    // 读不到回顾不该干扰主流程：面板会显示"正在读取回顾…"而不是报错。
+  }
+}
+
+/**
+ * 两个触发点 —— **合起来才是完整的"什么时候该重读回顾"**：
+ *   1. 页内切到「旧影」；
+ *   2. **进入年轮页且停在旧影**（切走再回来属于这种情况：本组件被卸载重建，
+ *      第 1 条不会触发，因为 `recapTab` 的值压根没变）。
+ * ⚠️ 离开年轮页时顺手把"定位年份"清掉 —— 那条指令只用一次。
+ */
+watch(recapTab, (t) => {
+  if (t === "recap" && mode.value === "stats") void loadRecap();
+});
+
+watch(mode, (m) => {
+  if (m !== "stats") {
+    recapFocus.value = "";
+    return;
+  }
+  if (recapTab.value === "recap") void loadRecap();
+});
+
+/**
+ * 写日记屏那句「**N 年前的今天写过 · 去看看**」被点了一下（P2-23 接的线）。
+ *
+ * ⚠️ 目标**不是**"跳到那一天"，而是**切到年轮页的「旧影」并定位那一年** ——
+ *    P2-17 交付时只能先做成跳过去（当时回顾页还不存在，不跳就是"点了没反应"），
+ *    到这里改成最终形态。
+ * ⚠️ 传进来的仍然只是**一个日期字符串**（事件名 `open` 与参数形式都没动 ——
+ *    P2-17 那边就是照这个传的，改了会把它一起拖下水）。
+ * ⚠️ 顺序要紧：先摆好页内 tab 和定位年份，**最后**再切 `mode` ——
+ *    否则 `mode` 那个 watcher 跑起来时 `recapTab` 还是旧的，回顾数据不会去拉。
+ */
+function openOnThisDay(d: string) {
+  recapTab.value = "recap";
+  recapFocus.value = d;
+  mode.value = "stats";
+}
+
+/**
  * 重取**全部**派生数据（见上面那张登记表）。
  *
  * ⚠️ **三个调用点走的是同一段代码**：`boot()`（库在启动时就已解锁 —— 免密打开
@@ -306,6 +390,9 @@ function clearDerived() {
   stats.value = null;
   tags.value = [];
   writtenDays.value = [];
+  // ⚠️ 「旧影」的数据**不在登记处**（它按需拉，见 loadRecap），所以这里必须手清 ——
+  //    它是"从库里算出来的"，恢复备份后不清就会显示上一个库的纪录。
+  recap.value = null;
   crypto.value = null;
   backup.value = null;
 }
@@ -672,11 +759,13 @@ onUnmounted(() => {
             搜索
           </button>
           <!--
-            统计是**整屏视图**，与「搜索」同级：都是"看"，不是"改"。
+            年轮（原「统计」）是**整屏视图**，与「搜索」同级：都是"看"，不是"改"。
             它不在设置弹窗里 —— 一个用来鼓励坚持的数字，不该埋在配置项里。
+            ⚠️ 名字是用户 2026-09-23 定的（"树一年长一圈"）。改名只动这里两个字，
+               不碰任何数据；用着不顺口随时换回来。
           -->
           <button :class="{ on: mode === 'stats' }" @click="mode = 'stats'">
-            统计
+            年轮
           </button>
         </nav>
         <div class="right">
@@ -723,7 +812,7 @@ onUnmounted(() => {
             @saved="onSaved"
             @tags-changed="onTagsChanged"
             @notice="flash"
-            @open="(d) => (selected = d)"
+            @open="openOnThisDay"
             @goto-today="selected = todayKey()"
           />
         </template>
@@ -740,11 +829,19 @@ onUnmounted(() => {
         <div v-else class="stats-wrap">
           <!--
             热力图点格子 → 跳到那天写日记（与搜索结果的 @open 是同一套动作）。
-            标签走**第二个 prop** —— 面板自己不发命令（见 StatsPanel.vue 文件头）。
+            标签、回顾数据、写过的日期都走 **prop** —— 面板自己不发命令
+            （见 StatsPanel.vue 文件头）。
+            `tab` / `focusDate` 是 P2-23 的两条接线：页内小切换停在哪边，
+            以及从写日记屏「去看看」跳过来时要高亮的那一年。
           -->
           <StatsPanel
             :stats="stats"
             :tags="tags"
+            :recap="recap"
+            :dates="writtenDays"
+            :tab="recapTab"
+            :focus-date="recapFocus"
+            @tab="(t) => (recapTab = t)"
             @open="
               (d) => {
                 selected = d;

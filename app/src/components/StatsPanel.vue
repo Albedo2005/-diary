@@ -1,10 +1,19 @@
 <script setup lang="ts">
 /**
- * 统计面板（顶栏第三个 tab）。
+ * 「年轮」面板（顶栏第三个 tab；P2-23 起由「统计」改名）。
  *
- * 数据全部来自**两条命令**，且都由 `App.vue` 取好、**当 prop 传进来**：
+ * 页内有两个小切换：
+ *   * **刻度** —— 攒下来的数字（数字卡 / 热力图 / 心情分布 / 每月字数 / 常用标签）；
+ *   * **旧影** —— 往回看（往年今天 / 写得最长 / 照片最多 / 连续同一种心情）。
+ * ⚠️ 名字是用户 2026-09-23 定的（"树一年长一圈"）：左是"长了多少"，
+ *    右是"那一圈长什么样"。⛔ 别把 P3 那张年轮图当标题写进来（那是文档里的内部称呼）。
+ *
+ * 数据全部来自**三条命令**，且都由 `App.vue` 取好、**当 prop 传进来**：
  *   1. `getStats()` → Rust 的 `stats(today)` —— 数字卡 / 热力图 / 心情 / 每月字数
  *   2. `listTags()`（P2-19「常用标签」起）—— 那块榜
+ *   3. `getRecap()`（P2-23「旧影」）—— 之最 ＋ 所有写过的日子
+ *      ⚠️ 这一条**只在点开「旧影」那一下才算**（三遍全表扫描，开机白算不值当），
+ *      所以它可能是 `null`（还没拉 / 拉失败）。
  *
  * ⚠️ **面板自己不发任何命令。** 让面板自己去 `await listTags()` 会让"这个数字从哪来"
  *    变成两处，而"只吃 prop"正是这个文件最值钱的地方。
@@ -33,21 +42,56 @@
  *    所以下面把每个要显示的数字都收成**空安全的 computed**，
  *    模板里一次都不直接碰 `stats.xxx` —— 免得为"可能为 null"到处写判断。
  */
-import { computed, ref } from "vue";
-import { MOODS, type Stats, type TagStat } from "../api";
+import { computed, ref, watch } from "vue";
+import { MOODS, type Recap, type Stats, type TagStat } from "../api";
 import {
   humanDateFull,
   humanMonth,
+  sameDayInPastYears,
   shiftDate,
   shiftMonth,
   toMonthKey,
   todayKey,
 } from "../utils/date";
 
-const props = defineProps<{ stats: Stats | null; tags: TagStat[] }>();
+const props = defineProps<{
+  stats: Stats | null;
+  tags: TagStat[];
+  /**
+   * 「旧影」那一屏的数据（P2-23）。**由 `App.vue` 取好传进来** —— 面板自己不发命令
+   * （见文件头）。⚠️ 只在点开「旧影」时才拉，所以这里可能是 `null`。
+   */
+  recap?: Recap | null;
+  /**
+   * **所有写过的日期**（P2-17 在 `App.vue` 建立的那份缓存）。
+   *
+   * ⚠️ 「往年今天」的判定吃它，用的是 `sameDayInPastYears()` —— 与写日记屏那句
+   *    「N 年前的今天写过」**同一条实现**（"找往年同一天"只许有一份判定）。
+   * ⛔ 不要在本组件里再拉一次（两次取数会漂），也不要另写一个筛日期的循环。
+   */
+  dates?: string[];
+  /**
+   * 页内小切换当前停在哪边（P2-23）。默认「刻度」。
+   *
+   * ⚠️ 状态**放在 `App.vue`**，不是这儿 —— 切走再回来本组件会被卸载重建，
+   *    放组件内部就记不住"上次停在旧影"，而用户要的正是记住（只在这次运行里记）。
+   */
+  tab?: "scale" | "recap";
+  /**
+   * 从写日记屏那句「N 年前的今天写过 · 去看看」跳过来时带的**那一天**
+   * （`YYYY-MM-DD`）。只用来在「往年今天」里高亮对应那一年。
+   */
+  focusDate?: string;
+}>();
 
-/** 点热力图某一格 → 跳到那天写日记。照抄 `SearchPanel` 的 `@open` 模式，不另发明一套。 */
-const emit = defineEmits<{ (e: "open", date: string): void }>();
+/**
+ * `open` —— 点某一条 → 跳到那天写日记（照抄 `SearchPanel` 的 `@open` 模式，不另发明一套）。
+ * `tab`  —— 页内两个小切换（状态由 `App.vue` 持有，见上面 `tab` 的说明）。
+ */
+const emit = defineEmits<{
+  (e: "open", date: string): void;
+  (e: "tab", tab: "scale" | "recap"): void;
+}>();
 
 /** 柱状图窗口：最近 12 个月（含本月）。固定格数才好横向比较，缺的月份补 0。 */
 const MONTHS_SHOWN = 12;
@@ -293,6 +337,142 @@ const hiddenTagCount = computed(() => Math.max(0, rankedTags.value.length - TAG_
  * 给一句人话，**不许显示一片空白**。
  */
 const tagEmpty = computed(() => rankedTags.value.length === 0);
+
+/* ── 页内小切换（P2-23） ─────────────────────────────────────────────────
+   只是"同一屏里的两块"，不是第二层导航 ⇒ 两个细小的胶囊按钮。
+   ⛔ 别做成和顶栏一样的一排 —— 那会让人以为是又一个导航层。 */
+
+/** 当前停在哪边。`props.tab` 没传时按「刻度」—— ⛔ 默认值别写成"旧影"。 */
+const tab = computed<"scale" | "recap">(() => props.tab ?? "scale");
+
+const switchTab = (t: "scale" | "recap") => {
+  if (t !== tab.value) emit("tab", t);
+};
+
+/* ── 「旧影」（P2-23） ───────────────────────────────────────────────────
+   四块，顺序固定：**往年今天 → 写得最长 → 照片最多 → 连续心情**。
+   往年今天放最上：它是"今天"相关的，一进来就该看见；其余三块是"纪录"，往下看。
+
+   ⚠️ 这一屏**全是只读**：不在这里改心情 / 改标签 / 改正文。
+   ⚠️ 这里的日期一律 `humanDateFull`（带年份）—— 除「往年今天」那一行，
+      它的年份由"N 年前"表达，所以写"9月23日"就够（跨年也不会读错）。 */
+
+/**
+ * 「定位年份」：从写日记屏那句「去看看」跳过来时，把对应那一年高亮一下。
+ *
+ * ⚠️ **一次性**：`App.vue` 在离开本页时会把 `focusDate` 清掉，
+ *    所以"切走再回来"不会还挂着高亮（用户要的就是这个 —— 高亮只用那一下）。
+ * ⛔ 只高亮，**不做滚动定位动画、不把其他年份藏起来**。
+ */
+const focusYear = ref("");
+
+watch(
+  () => props.focusDate,
+  (v) => {
+    focusYear.value = v ? v.slice(0, 4) : "";
+  },
+  { immediate: true }
+);
+
+/** `recap.days` 按日期建索引 —— 「往年今天」靠它取那几天的内容。 */
+const digestByDate = computed(
+  () => new Map((props.recap?.days ?? []).map((d) => [d.date, d]))
+);
+
+/**
+ * 「往年今天」是哪几天：**逐年的都列**（1 年前、2 年前、3 年前…），不是只列最近那条
+ * —— 只列最近一年的话，第三年就只剩一条了，那不叫回顾。
+ *
+ * ⚠️ 判定走 `sameDayInPastYears()`：与写日记屏那句「N 年前的今天写过」
+ *    **同一条实现**（"找往年同一天"只许有一份）。⛔ 别在这里另写一个
+ *    `endsWith("-MM-DD")` 的循环，也**别手拼** `new Date(y - 1, m - 1, d)`
+ *    —— 那会在 2/29 造出一个并不存在的日期。
+ */
+const onThisDay = computed(() => sameDayInPastYears(props.dates ?? [], today));
+
+/** "N 年前"里的那个 N。 */
+const yearsAgo = (date: string) =>
+  Number(today.slice(0, 4)) - Number(date.slice(0, 4));
+
+/** 「9月23日」这种短写法，只给「往年今天」用（年份由"N 年前"表达）。 */
+const monthDayText = (date: string) =>
+  `${Number(date.slice(5, 7))}月${Number(date.slice(8, 10))}日`;
+
+/** 心情 → emoji / 名字。档位表全项目只有 `MOODS` 一份。 */
+const moodEmoji = (mood: number | null) =>
+  mood === null ? "" : (MOODS.find((m) => m.value === mood)?.emoji ?? "");
+
+const moodLabel = (mood: number | null) =>
+  mood === null ? "" : (MOODS.find((m) => m.value === mood)?.label ?? "");
+
+/**
+ * 「往年今天」每一行要显示的东西，**在这里一次性拼好**。
+ *
+ * 为什么先拼成普通对象再给模板：模板里反复 `digestByDate.get(d)?.xxx`
+ * 既难读、又会让类型在"可能取不到"上反复横跳。
+ *
+ * ⚠️ 取不到那天的摘要时不整行藏掉、只少显示内容 —— 藏着会让人以为"那天不算"
+ *    （正常情况下取不到不会发生：两个日期集合是同一把尺子量出来的）。
+ */
+const onThisDayRows = computed(() =>
+  onThisDay.value.map((date) => {
+    const g = digestByDate.value.get(date);
+    const words = g?.words ?? 0;
+    return {
+      date,
+      when: `${yearsAgo(date)} 年前 · ${monthDayText(date)}`,
+      mood: moodEmoji(g?.mood ?? null),
+      tail: words > 0 ? `${grouped(words)} 字` : "只有图片",
+      preview: g?.preview ?? "",
+      /** 是不是"从写日记屏跳过来那一年"—— 是就高亮一下。 */
+      hit: focusYear.value !== "" && date.slice(0, 4) === focusYear.value,
+    };
+  })
+);
+
+/* 三张"单条"卡片：一律拼成**字段齐全**的普通对象（含 `has`），
+   这样模板里一个 optional 链都不用写 —— 见上面 onThisDayRows 的说明。 */
+
+/** 「写得最长的一篇」。库里只有纯图片日记时没有这一条（它们 `word_count = 0`）。 */
+const longestCard = computed(() => {
+  const d = props.recap?.longest_entry;
+  return {
+    has: !!d,
+    date: d?.date ?? "",
+    when: d ? humanDateFull(d.date) : "",
+    mood: moodEmoji(d?.mood ?? null),
+    words: d ? `${grouped(d.words)} 字` : "",
+    preview: d?.preview ?? "",
+  };
+});
+
+/** 「照片最多的一篇」。一张图都没有时没有这一条（**不拿"0 张"占位**）。 */
+const photosCard = computed(() => {
+  const p = props.recap?.most_photos;
+  return {
+    has: !!p,
+    date: p?.date ?? "",
+    when: p ? humanDateFull(p.date) : "",
+    photos: p?.photos ?? 0,
+  };
+});
+
+/**
+ * 「最长连续同一种心情」。
+ *
+ * ⚠️ 五种心情是**并列的类型、不是刻度** ⇒ 标题里不写"心情最好的那些天"，
+ *    只写"连着 N 天"。天数并列时后端取编号小的（只为结果稳定）。
+ */
+const streakCard = computed(() => {
+  const s = props.recap?.mood_streak;
+  return {
+    has: !!s,
+    mood: moodEmoji(s?.mood ?? null),
+    label: moodLabel(s?.mood ?? null),
+    days: s?.days ?? 0,
+    range: s ? `${humanDateFull(s.from)} — ${humanDateFull(s.to)}` : "",
+  };
+});
 </script>
 
 <template>
@@ -306,6 +486,21 @@ const tagEmpty = computed(() => rankedTags.value.length === 0);
     </section>
 
     <template v-else>
+      <!--
+        页内两个小切换。⚠️ 状态由 `App.vue` 持有（见 script 里 `tab` 的说明）：
+        切走再回来本组件会被卸载重建，状态放这儿就记不住"上次停在旧影"。
+      -->
+      <nav class="subtabs">
+        <button type="button" :class="{ on: tab === 'scale' }" @click="switchTab('scale')">
+          刻度
+        </button>
+        <button type="button" :class="{ on: tab === 'recap' }" @click="switchTab('recap')">
+          旧影
+        </button>
+      </nav>
+
+      <!-- ══ 刻度：攒下来的数字 ══════════════════════════════════════ -->
+      <template v-if="tab === 'scale'">
       <!-- ── 六个数字 ───────────────────────────────────────────── -->
       <section class="cards">
         <div class="card">
@@ -459,6 +654,129 @@ const tagEmpty = computed(() => rankedTags.value.length === 0);
           </button>
         </template>
       </section>
+      </template>
+
+      <!-- ══ 旧影：往回看（P2-23） ════════════════════════════════════
+           四块顺序**固定**：往年今天 → 写得最长 → 照片最多 → 连续心情。
+           ⚠️ 全是**只读**：不在这里改心情 / 改标签 / 改正文。
+           ⚠️ 每块点一下跳到那一天（与搜索结果、热力图同一套动作）。 -->
+      <template v-else>
+        <!-- 还没拉到 / 拉失败：只说一句中性的话，不弹错误（同上面 stats 的做法）。 -->
+        <p v-if="!recap" class="hint">正在读取回顾…</p>
+
+        <template v-else>
+          <!-- ── 往年今天 ───────────────────────────────────────────
+               放最上：它是"今天"相关的，一进来就该看见；下面三块是"纪录"。
+               ⚠️ **逐年的都列**（1 年前、2 年前…），不是只列最近那条 ——
+                  只列最近一年的话，第三年就只剩一条了，那不叫回顾。
+               ⚠️ 第一年必然是空的（日记从 2026-09 才开始）⇒ 空着，
+                  ⛔ 不许退而求其次改成"上个月的今天"。 -->
+          <section class="block">
+            <h3>往年今天</h3>
+            <p class="cap">往年同一天的日记，逐年列出</p>
+
+            <div class="recap-list">
+              <p v-if="onThisDayRows.length === 0" class="empty-note">今天没有以前的日记。</p>
+              <template v-else>
+                <button
+                  v-for="r in onThisDayRows"
+                  :key="r.date"
+                  type="button"
+                  class="recap-card"
+                  :class="{ hit: r.hit }"
+                  :title="`跳到 ${humanDateFull(r.date)}`"
+                  @click="emit('open', r.date)"
+                >
+                  <div class="rv-head">
+                    <span class="rv-when">{{ r.when }}</span>
+                    <span class="rv-tail">
+                      <span v-if="r.mood" class="rv-mood">{{ r.mood }}</span>
+                      <span class="rv-words">{{ r.tail }}</span>
+                    </span>
+                  </div>
+                  <p v-if="r.preview" class="rv-preview">{{ r.preview }}</p>
+                </button>
+              </template>
+            </div>
+          </section>
+
+          <!-- ── 写得最长的一篇 ─────────────────────────────────────── -->
+          <section class="block">
+            <h3>写得最长的一篇</h3>
+            <p class="cap">只算写过正文的日记（只有图片的那天不算）</p>
+
+            <div class="recap-list">
+              <p v-if="!longestCard.has" class="empty-note">还没有写过正文。</p>
+              <button
+                v-else
+                type="button"
+                class="recap-card"
+                :title="`跳到 ${longestCard.when}`"
+                @click="emit('open', longestCard.date)"
+              >
+                <div class="rv-head">
+                  <span class="rv-when">{{ longestCard.when }}</span>
+                  <span class="rv-tail">
+                    <span v-if="longestCard.mood" class="rv-mood">{{ longestCard.mood }}</span>
+                    <span class="rv-words">{{ longestCard.words }}</span>
+                  </span>
+                </div>
+                <p v-if="longestCard.preview" class="rv-preview">{{ longestCard.preview }}</p>
+              </button>
+            </div>
+          </section>
+
+          <!-- ── 照片最多的一篇 ───────────────────────────────────────
+               ⛔ 一张图都没有时**不显示"0 张"的卡片**，只说一句"还没有图片。" -->
+          <section class="block">
+            <h3>照片最多的一篇</h3>
+            <p class="cap">附件只可能是图片，所以这里就是照片数</p>
+
+            <div class="recap-list">
+              <p v-if="!photosCard.has" class="empty-note">还没有图片。</p>
+              <button
+                v-else
+                type="button"
+                class="recap-card"
+                :title="`跳到 ${photosCard.when}`"
+                @click="emit('open', photosCard.date)"
+              >
+                <div class="rv-head">
+                  <span class="rv-when">{{ photosCard.when }}</span>
+                  <span class="rv-tail">
+                    <span class="rv-words">{{ photosCard.photos }} 张照片</span>
+                  </span>
+                </div>
+              </button>
+            </div>
+          </section>
+
+          <!-- ── 最长连续同一种心情 ───────────────────────────────────
+               整块**不可点**：它是一段区间，不是某一天。
+               ⚠️ 口径是"逐日相接 **且** 心情相同"，与数字卡那个"最长连续"
+                  （只要求逐日相接）不是一回事 —— 后者可能更长，这是对的。 -->
+          <section class="block">
+            <h3>最长连续同一种心情</h3>
+            <p class="cap">逐日相接、且心情相同（五种心情是并列的类型，不分高低）</p>
+
+            <div class="recap-list">
+              <p v-if="!streakCard.has" class="empty-note">还没有标过心情。</p>
+              <div v-else class="recap-card as-div">
+                <div class="rv-head">
+                  <span class="rv-when">
+                    <span v-if="streakCard.mood" class="rv-mood">{{ streakCard.mood }}</span>
+                    {{ streakCard.label }}
+                  </span>
+                  <span class="rv-tail">
+                    <span class="rv-words">连着 {{ streakCard.days }} 天</span>
+                  </span>
+                </div>
+                <p class="rv-preview">{{ streakCard.range }}</p>
+              </div>
+            </div>
+          </section>
+        </template>
+      </template>
     </template>
   </div>
 </template>
@@ -735,5 +1053,98 @@ const tagEmpty = computed(() => rankedTags.value.length === 0);
 .more:hover {
   background: var(--hover);
   color: var(--text-2);
+}
+
+/* ── 页内小切换（P2-23） ─────────────────────────────────────
+   只是"同一屏里的两块"，不是第二层导航 ⇒ 两颗小胶囊。
+   ⛔ 别做成与顶栏同款的一排按钮 —— 那会让人以为是又一个导航层。
+   颜色**只用现有主题变量**，一个硬编码色号都不许出现。 */
+.subtabs {
+  display: flex;
+  gap: 6px;
+}
+.subtabs button {
+  padding: 3px 12px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.subtabs button:hover {
+  background: var(--hover);
+  color: var(--text-1);
+}
+.subtabs button.on {
+  border-color: var(--accent);
+  color: var(--text-1);
+}
+
+/* ── 「旧影」四块（P2-23） ───────────────────────────────────── */
+.recap-list {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+/* 列表里的空态**不要再顶一层外边距**（列表自己已经有 margin-top）。 */
+.recap-list .empty-note {
+  margin-top: 0;
+}
+.recap-card {
+  display: block;
+  width: 100%;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+}
+button.recap-card {
+  cursor: pointer;
+}
+button.recap-card:hover {
+  background: var(--hover);
+}
+/* ⭐ 从写日记屏「去看看」跳过来时，对应那一年**高亮一下**。
+   ⛔ 只高亮，不做滚动定位动画、也不把其他年份藏起来。 */
+.recap-card.hit {
+  border-color: var(--accent);
+}
+.rv-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.rv-when {
+  font-size: 12px;
+  color: var(--text-2);
+}
+.rv-tail {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.rv-mood {
+  font-size: 13px;
+}
+/* 最多两行：卡片高度可控，「回顾」才扫得快。 */
+.rv-preview {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-2);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 </style>

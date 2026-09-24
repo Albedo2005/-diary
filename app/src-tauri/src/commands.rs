@@ -14,7 +14,7 @@ use crate::crypto::{self, CryptoMeta, KdfParams, KEY_LEN};
 use crate::db::{
     count_written_entries_readonly, derive_and_verify, non_conflicting_path, parse_backup_stamp,
     prune_backups, AppSettings, Attachment, BackupResult, DayMood, Entry, EntrySummary,
-    ExportResult, IntegrityReport, PruneReport, SearchHit, Stats, TagStat, Vault,
+    ExportResult, IntegrityReport, PruneReport, Recap, SearchHit, Stats, TagStat, Vault,
 };
 use crate::error::{AppError, AppResult};
 use serde::Serialize;
@@ -811,6 +811,19 @@ pub fn written_moods(
 #[tauri::command]
 pub fn stats(state: State<'_, VaultState>, today: String) -> AppResult<Stats> {
     with_vault(&state, |v| v.stats(&today))
+}
+
+/// 「回顾」那一屏的数据（P2-23）—— 之最 ＋ 所有写过的日子。
+///
+/// ⚠️ **单独一条命令，不并进 `stats`**：那条已经装着 8 个数字（热力图还要往里
+/// 加），再塞就成杂物间了。而且这条**只在前端点开「旧影」时才算**，
+/// 不是开机白算 —— 混进 `stats` 会让它每次都白跑三遍全表扫描。
+///
+/// `today` 由前端传（同 `stats`），本命令只用它做格式校验；
+/// 真正跟"今天"有关的「往年今天」由前端用同一条纯函数判定（见 `db::Vault::recap`）。
+#[tauri::command]
+pub fn recap(state: State<'_, VaultState>, today: String) -> AppResult<Recap> {
+    with_vault(&state, |v| v.recap(&today))
 }
 
 // ---------------------------------------------------------------------------

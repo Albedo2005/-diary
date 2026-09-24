@@ -220,6 +220,64 @@ export interface DayWords {
   words: number;
 }
 
+// ---------------------------------------------------------------------------
+// 「回顾」（P2-23）
+// ---------------------------------------------------------------------------
+
+/**
+ * 一整天的"最小信息"，给「回顾」里那些卡片用。
+ *
+ * ⚠️ 手抄 Rust 侧 `db::DayDigest` 的（同 `Stats` 的说明：漏抄不会编译报错，
+ *    只会在运行时读到 `undefined`）。加字段要两边同时改。
+ */
+export interface DayDigest {
+  /** `YYYY-MM-DD` */
+  date: string;
+  /** `null` ＝ 那天没标心情。档位对照见 `MOODS`。 */
+  mood: number | null;
+  /** 直接来自后端的 `entry.word_count` 列。⛔ 前端不自己数。 */
+  words: number;
+  /** 正文开头一小段。**由后端的 `make_preview()` 生成** —— P2-3 落地后只改那一处。 */
+  preview: string;
+}
+
+/** 「照片最多的一篇」。 */
+export interface PhotoTop {
+  date: string;
+  photos: number;
+}
+
+/** 「最长连续同一种心情」。五种心情是**并列的类型，不是刻度**。 */
+export interface MoodStreak {
+  mood: number;
+  days: number;
+  /** 起止**都是真实写过的日期**（不是按天数推算的）。 */
+  from: string;
+  to: string;
+}
+
+/**
+ * 「回顾」那一屏的全部数据（`getRecap()`）。
+ *
+ * ⚠️ 手抄 Rust 侧 `db::Recap` 的，加字段要两边同时改。
+ */
+export interface Recap {
+  /** 写得最长的一篇。库里只有纯图片日记时为 `null`。 */
+  longest_entry: DayDigest | null;
+  /** 照片最多的一篇。一张图都没有时为 `null`。 */
+  most_photos: PhotoTop | null;
+  /** 最长连续同一种心情。从没标过心情时为 `null`。 */
+  mood_streak: MoodStreak | null;
+  /**
+   * **所有写过的日子**（含纯图片日），按日期升序。
+   *
+   * ⚠️ 这里**不判"往年今天"是哪几天** —— 那句判定在 `utils/date.ts` 的
+   *    `sameDayInPastYears()`，全项目只有一份实现。前端先用它把要显示的那几天
+   *    筛出来，再回来这份名单里取内容（所以这里给的是全部，不是筛过的结果）。
+   */
+  days: DayDigest[];
+}
+
 export interface BackupResult {
   path: string;
   bytes: number;
@@ -566,6 +624,18 @@ export const writtenMoods = (from: string, to: string) =>
  * 它只影响"本周 / 本月"两项。
  */
 export const getStats = () => invoke<Stats>("stats", { today: todayKey() });
+
+/**
+ * 「回顾」那一屏的数据（P2-23）。
+ *
+ * ⚠️ **与 `getStats()` 分开**，而且**只在用户点开「旧影」时才算** —— 这条要跑
+ *    三遍全表扫描（最长的一篇 / 照片最多的一篇 / 连续心情），开机白算不值当。
+ *    所以 ⛔ 别把它塞进 `loadAux()`。
+ *
+ * `today` 同样在这里补上；后端只用它做格式校验（"往年今天"由前端判定）。
+ */
+export const getRecap = () => invoke<Recap>("recap", { today: todayKey() });
+
 
 // ---------------------------------------------------------------------------
 // 搜索

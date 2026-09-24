@@ -2260,6 +2260,147 @@ impl Vault {
         })
     }
 
+    /// 「回顾」那一屏的数据（P2-23）。**只读**，且只在前端点开「旧影」时才算一次
+    /// —— ⛔ 不并进 `stats()`（那条已经装了 8 个数字，热力图还要往里加）。
+    ///
+    /// 三条查询 ＋ 一份名单：
+    ///   ① 写得最长的一篇；② 照片最多的一篇；③ 最长连续同一种心情；
+    ///   ④ `days` ＝ 所有写过的日子（给「往年今天」取内容用）。
+    ///
+    /// ⚠️ `today` **只用来校验**（与 `stats` 同款，前端传、后端不自己取系统时间）。
+    ///    本函数的返回值与"今天"无关 —— 真正跟今天有关的那一块（往年今天）
+    ///    由前端用 `sameDayInPastYears()` 算，判定只有这样才只有一份。
+    ///
+    /// ⚠️ 全套走 `has_content_sql()`：口径与"共 N 篇"天生一致。
+    pub fn recap(&self, today: &str) -> AppResult<Recap> {
+        validate_date(today)?;
+
+        // ① 写得最长的一篇（并列时取**更近**的那天 —— 近期的事更值得翻出来）。
+        //
+        // `word_count > 0`：只有图片、一个字没写的日记**不该叫"写得最长"**。
+        // 不写这半句的话，库里若全是纯图片日记，这块会显示"写得最长的一篇 · 0 字"。
+        let longest_entry = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT entry_date, word_count, mood, content_md FROM entry
+                     WHERE {} AND word_count > 0
+                     ORDER BY word_count DESC, entry_date DESC LIMIT 1",
+                    has_content_sql()
+                ),
+                [],
+                |r| {
+                    Ok(DayDigest {
+                        date: r.get(0)?,
+                        words: r.get(1)?,
+                        mood: r.get(2)?,
+                        preview: make_preview(&r.get::<_, String>(3)?),
+                    })
+                },
+            )
+            .optional()?;
+
+        // ② 照片最多的一篇（并列时取更近的那天）。
+        //
+        // ⚠️ **不按 mime 过滤**：附件只可能是图片（`ATTACHMENT_TYPES` 只收
+        //    png/jpg/jpeg/gif/webp，而且是扩展名＋MIME＋文件头三重校验）。
+        // ⚠️ `JOIN` 本身就保证了"至少有一张图" ⇒ 一张图都没有时这块自然是 `None`，
+        //    不需要（也不许）用"0 张"的日子来占位。
+        let most_photos = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT e.entry_date, count(*) AS photos
+                     FROM entry e JOIN attachment a ON a.entry_id = e.id
+                     WHERE {}
+                     GROUP BY e.id
+                     ORDER BY photos DESC, e.entry_date DESC LIMIT 1",
+                    has_content_sql_for("e")
+                ),
+                [],
+                |r| {
+                    Ok(PhotoTop {
+                        date: r.get(0)?,
+                        photos: r.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
+
+        // ③ 连续同一种心情。
+        //
+        // 先把"有心情**且**有正文"的日子按升序取出来，再**按心情分组**，
+        // 每组各自跑一遍那个公用零件 —— 判定循环全项目仍然只有一份。
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT entry_date, mood FROM entry
+             WHERE mood IS NOT NULL AND {}
+             ORDER BY entry_date ASC",
+            has_content_sql()
+        ))?;
+        let moods: Vec<(String, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+
+        // `BTreeMap` 而不是 `HashMap`：键升序 ⇒ 天数并列时**编号小的赢**，
+        // 结果稳定、可复现。（这不代表 1 比 5 好 —— 五种心情是并列的。）
+        let mut by_mood: std::collections::BTreeMap<i64, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (date, mood) in moods {
+            by_mood.entry(mood).or_default().push(date);
+        }
+
+        let mut mood_streak: Option<MoodStreak> = None;
+        for (mood, dates) in &by_mood {
+            let run = longest_run(dates, |d, p| Ok(previous_date(d)? == p))?;
+            if run.longest == 0 {
+                continue;
+            }
+            // 天数没有更长就留着当前这个（严格大于才换）⇒ 并列时保住编号小的那个。
+            if mood_streak.as_ref().is_some_and(|b| b.days >= run.longest) {
+                continue;
+            }
+            // ⭐ 起止日**直接从真实写过的日期里取下标**，⛔ 绝不按天数往前推算 ——
+            //    推算会撞上闰日，而且算出来那天未必真写过。
+            let from = dates[run.longest_start].clone();
+            let to = dates[run.longest_start + run.longest as usize - 1].clone();
+            mood_streak = Some(MoodStreak {
+                mood: *mood,
+                days: run.longest,
+                from,
+                to,
+            });
+        }
+
+        // ④ 所有写过的日子（含纯图片日），按日期升序。
+        //
+        // ⚠️ 正文只取前 300 个字符：`make_preview` 最多要 60 个字，多取没用。
+        //    这**不是**第二套"取开头"的实现，只是限制传输量 ——
+        //    真正的取开头逻辑仍然只有 `make_preview` 一处。
+        // ⚠️ `coalesce(content_md, '')`：这一列历史上可以为 NULL。
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT entry_date, mood, word_count, substr(coalesce(content_md, ''), 1, 300)
+             FROM entry WHERE {} ORDER BY entry_date ASC",
+            has_content_sql()
+        ))?;
+        let days: Vec<DayDigest> = stmt
+            .query_map([], |r| {
+                Ok(DayDigest {
+                    date: r.get(0)?,
+                    mood: r.get(1)?,
+                    words: r.get(2)?,
+                    preview: make_preview(&r.get::<_, String>(3)?),
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+
+        Ok(Recap {
+            longest_entry,
+            most_photos,
+            mood_streak,
+            days,
+        })
+    }
+
     /// 中文全文搜索：双索引合并。
     ///
     /// 策略：
@@ -3014,6 +3155,69 @@ pub struct MonthWords {
     pub words: i64,
 }
 
+// ---------------------------------------------------------------------------
+// 「回顾」（P2-23）—— 统计页里那一屏「旧影」
+// ---------------------------------------------------------------------------
+
+/// 一天的"最小信息"：日期 ＋ 心情 ＋ 字数 ＋ 一句开头。
+///
+/// 两个用途共用这一个形状，因为它们在界面上长得完全一样：
+///   * 「往年今天」的每一条；
+///   * 「写得最长的一篇」那一张卡（它就是"某一天"而已）。
+///
+/// ⚠️ `preview` 由 `make_preview()` 生成 —— 那是**取正文开头的唯一实现**，
+///    P2-3（正文富文本）落地后只改它一个（见该函数的说明）。
+#[derive(Debug, Clone, Serialize)]
+pub struct DayDigest {
+    pub date: String,
+    pub mood: Option<i64>,
+    /// 直接读 `entry.word_count` 列（保存时算好的）。
+    /// ⛔ **不许**拿 `content_md` 在这里重数一遍 —— 那会变成第二套"数字数"。
+    pub words: i64,
+    pub preview: String,
+}
+
+/// 「照片最多的一篇」。
+#[derive(Debug, Clone, Serialize)]
+pub struct PhotoTop {
+    pub date: String,
+    pub photos: i64,
+}
+
+/// 「最长连续同一种心情」。
+///
+/// ⚠️ `mood` 是**并列的类型、不是刻度**（见 `api/index.ts` 的 `MOODS`）：
+///    "连续 5 天开心"与"连续 5 天emo"都是 5 天，不存在"哪种更好"。
+#[derive(Debug, Clone, Serialize)]
+pub struct MoodStreak {
+    pub mood: i64,
+    pub days: i64,
+    /// 起止**都是真实写过的日期**（从日期列表里取，不是按天数推算的）。
+    pub from: String,
+    pub to: String,
+}
+
+/// 「回顾」那一屏要的全部数据（`getRecap()` → 后端 `recap()`）。
+///
+/// ⚠️ 加字段要**同时改前端**：`api/index.ts` 里那份 `Recap` interface 是手抄的，
+///    不会自动跟着变（同 `Stats` 的说明）。
+#[derive(Debug, Clone, Serialize)]
+pub struct Recap {
+    /// 写得最长的一篇。库里只有纯图片日记时为 `None`（那些日记 `word_count = 0`）。
+    pub longest_entry: Option<DayDigest>,
+    /// 照片最多的一篇。一张图都没有时为 `None`。
+    pub most_photos: Option<PhotoTop>,
+    /// 最长连续同一种心情。从没标过心情时为 `None`。
+    pub mood_streak: Option<MoodStreak>,
+    /// **所有写过的日子**（含纯图片日），按日期升序。
+    ///
+    /// ⚠️ 这里**不判"往年今天"是哪几天** —— 那句判定在 `utils/date.ts` 的
+    ///    `sameDayInPastYears()`，全项目只有一份实现（同"连续判定"那条铁律）。
+    ///    前端先用它把要显示的那几天筛出来，再回来这份名单里取内容，
+    ///    所以这里给的是**全部**，不是筛过的结果。
+    pub days: Vec<DayDigest>,
+}
+
 /// 热力图窗口内**写过**的某一天（统计页的 371 个格子里，有颜色的那些）。
 #[derive(Debug, Clone, Serialize)]
 pub struct DayWords {
@@ -3104,6 +3308,29 @@ fn make_snippet(content: &str, query: &str) -> String {
         snippet.push('…');
     }
     snippet
+}
+
+/// 正文**开头**的一小段，给「回顾」里每一条下面那一行用（P2-23）。
+///
+/// ⚠️ **这是"取正文开头"的唯一实现。**
+///    P2-3（正文富文本）落地后正文里会多出**看不见的格式标记**，届时
+///    **只改这一个函数**：先取可见文字、再截。⛔ 别在 `StatsPanel.vue` 里
+///    自己 `slice()` —— 那就是第二套实现，P2-3 落地时必然只改一处。
+///
+/// 与 `make_snippet` 的分工（两者用途不同，**别合并**）：
+///   * `make_snippet` 是**搜索命中**用的，窗口要**围绕命中词**；
+///   * 这个是**开头**那一小段，永远从第 0 个字起。
+///
+/// 换行与连续空白一律压成一个空格：摘要是单行的，留着换行会让卡片高度忽高忽低。
+/// 全是空白（纯图片日记）时返回空串，由前端决定显示什么。
+fn make_preview(content: &str) -> String {
+    const MAX: usize = 60;
+    let text = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = text.chars().take(MAX).collect();
+    if text.chars().count() > MAX {
+        out.push('…');
+    }
+    out
 }
 
 fn validate_date(date: &str) -> AppResult<()> {
@@ -3337,24 +3564,59 @@ fn previous_date(date: &str) -> AppResult<String> {
 ///    回顾页的"连续同一种心情" ＝ **逐日相接 且 心情相同**。
 ///   ⚠️ 返回类型带 `AppResult` 而不是光秃秃一个元组：判定本身要算日期
 ///      （`previous_date` 会失败），错误必须照旧往外传，不能吞掉。
+/// ⚠️ **真正的循环在 `longest_run` 里**，这里只是一层"只要两个数"的薄包装
+///    （`stats()` 用）。P2-23 的「连续同一种心情」还要知道最长那一段**起止在哪**，
+///    所以它调 `longest_run`。**判定仍然只有一份实现** —— 包装不算第二份。
 fn longest_and_current_run<F>(dates: &[String], is_connected: F) -> AppResult<(i64, i64)>
+where
+    F: Fn(&str, &str) -> AppResult<bool>,
+{
+    let r = longest_run(dates, is_connected)?;
+    Ok((r.current, r.longest))
+}
+
+/// 同一条"连续"判定的**唯一实现**，比上面那个多给**最长那一段的起始下标**。
+///
+/// 为什么需要下标：P2-23 的「连续同一种心情」要在界面上写出起止日期，而那两个
+/// 日期**必须取自真实写过的日期**（`dates[start]` / `dates[start + longest - 1]`）
+/// —— ⛔ 绝不按天数往前推算，那会撞上闰日，而且算出来那天未必真写过。
+struct RunStats {
+    /// 以**最后一个元素收尾**的那一段长度（一个元素都没有时为 0）。
+    current: i64,
+    /// 历史最长的那一段长度。
+    longest: i64,
+    /// 最长那一段在入参切片里的**起始下标**（`longest == 0` 时无意义）。
+    longest_start: usize,
+}
+
+fn longest_run<F>(dates: &[String], is_connected: F) -> AppResult<RunStats>
 where
     F: Fn(&str, &str) -> AppResult<bool>,
 {
     let mut run = 0i64;
     let mut longest = 0i64;
+    let mut run_start = 0usize;
+    let mut longest_start = 0usize;
     let mut prev: Option<&str> = None;
-    for d in dates {
+    for (i, d) in dates.iter().enumerate() {
         match prev {
             Some(p) if is_connected(d, p)? => run += 1,
-            _ => run = 1,
+            _ => {
+                run = 1;
+                run_start = i;
+            }
         }
         if run > longest {
             longest = run;
+            longest_start = run_start;
         }
         prev = Some(d);
     }
-    Ok((run, longest))
+    Ok(RunStats {
+        current: run,
+        longest,
+        longest_start,
+    })
 }
 
 /// 该日期所在周的**周一**（`YYYY-MM-DD`）。
@@ -4505,6 +4767,233 @@ mod tests {
         let report = vault.prune_orphan_attachments().unwrap();
         assert_eq!(report.rows_removed, 1, "文件没了的记录应被清掉");
         assert!(vault.list_attachments("2026-09-22").unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // 「回顾」（P2-23）
+    // -----------------------------------------------------------------------
+    //
+    // ⚠️ 断言里找结果**一律按 `entry_date` 找**，别用固定下标 ——
+    //    `COLLATE NOCASE` 下 ASCII 排在汉字前面，下标是脆的。
+
+    /// 空库：三项都是 `None` ＋ 名单为空，而且**不许报错**
+    /// （回顾页在"第一年"就是这种状态，见 §6.3）。
+    #[test]
+    fn recap_on_empty_vault_returns_all_none() {
+        let (dir, vault) = temp_vault("dsh-diary-recap-empty");
+
+        let r = vault.recap("2026-09-24").unwrap();
+        assert!(r.longest_entry.is_none(), "空库不该有「写得最长」");
+        assert!(r.most_photos.is_none(), "空库不该有「照片最多」");
+        assert!(r.mood_streak.is_none(), "空库不该有「连续心情」");
+        assert!(r.days.is_empty(), "空库不该有「写过的日子」");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一篇：它同时是「写得最长」和（带图时）「照片最多」。
+    #[test]
+    fn recap_single_entry_is_both_longest_and_most_photos() {
+        let (dir, vault) = temp_vault("dsh-diary-recap-single");
+
+        vault
+            .save_entry_with_mood("2026-09-20", "", "只有这一篇，带了图。", Some(5))
+            .unwrap();
+        vault
+            .save_attachment("2026-09-20", "图.png", "image/png", &png_bytes(1))
+            .unwrap();
+
+        let r = vault.recap("2026-09-24").unwrap();
+
+        let longest = r.longest_entry.expect("应有一条「写得最长」");
+        assert_eq!(longest.date, "2026-09-20");
+        assert_eq!(longest.mood, Some(5), "心情要跟着带出来");
+        assert!(longest.words > 0, "有正文就该有字数，实际 {}", longest.words);
+        assert!(
+            longest.preview.contains("带了图"),
+            "开头应取自正文，实际 {:?}",
+            longest.preview
+        );
+
+        let photos = r.most_photos.expect("应有一条「照片最多」");
+        assert_eq!(photos.date, "2026-09-20");
+        assert_eq!(photos.photos, 1);
+
+        assert_eq!(r.days.len(), 1, "写过的日子应只有这一天");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 并列时取**更近**的那天（两篇同为 100 字 ⇒ 取日期更晚的）。
+    #[test]
+    fn recap_longest_prefers_the_more_recent_of_a_tie() {
+        let (dir, vault) = temp_vault("dsh-diary-recap-tie");
+
+        let hundred = "字".repeat(100);
+        vault.save_entry("2026-09-10", "", &hundred).unwrap();
+        vault.save_entry("2026-09-18", "", &hundred).unwrap();
+
+        let r = vault.recap("2026-09-24").unwrap();
+        let longest = r.longest_entry.expect("应有一条");
+        assert_eq!(longest.date, "2026-09-18", "并列应取更近的那天");
+        assert_eq!(longest.words, 100);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 纯图片日记：出现在「照片最多」里，**不出现**在「写得最长」里。
+    ///
+    /// 它算写过（`has_content_sql()` 含"有附件"那半句），但一个字都没写
+    /// ⇒ 不该被叫「写得最长」。库里**只有**纯图片日记时那一块应当是空的，
+    /// 而不是显示「0 字」。
+    #[test]
+    fn recap_image_only_day_is_never_the_longest() {
+        let (dir, vault) = temp_vault("dsh-diary-recap-image-only");
+
+        vault
+            .save_attachment("2026-09-19", "图.png", "image/png", &png_bytes(2))
+            .unwrap();
+        vault
+            .save_attachment("2026-09-19", "图二.png", "image/png", &png_bytes(3))
+            .unwrap();
+
+        let r = vault.recap("2026-09-24").unwrap();
+
+        assert!(
+            r.longest_entry.is_none(),
+            "全是纯图片日记时不该有「写得最长」，实际 {:?}",
+            r.longest_entry
+        );
+        let photos = r.most_photos.expect("应有一条「照片最多」");
+        assert_eq!(photos.date, "2026-09-19");
+        assert_eq!(photos.photos, 2);
+
+        assert_eq!(r.days.len(), 1, "纯图片日也算「写过的日子」");
+        assert!(r.days[0].preview.is_empty(), "它没有正文，开头应是空串");
+        assert_eq!(r.days[0].words, 0, "纯图片日记的字数是 0");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `days` 给的是**所有**写过的日子（升序、含纯图片日）。
+    ///
+    /// 这一份是给「往年今天」取内容用的 —— **哪几天要显示由前端那条纯函数判定**
+    /// （"找往年同一天"只许有一份实现），所以后端必须给全，不能替前端筛。
+    #[test]
+    fn recap_days_lists_every_written_day_in_order() {
+        let (dir, vault) = temp_vault("dsh-diary-recap-days");
+
+        vault
+            .save_entry_with_mood("2026-09-05", "", "第一篇。", Some(1))
+            .unwrap();
+        // 纯图片日也要在名单里，否则「往年今天」会漏掉它
+        vault
+            .save_attachment("2026-09-06", "图.png", "image/png", &png_bytes(7))
+            .unwrap();
+        vault.save_entry("2026-09-07", "", "第三篇。").unwrap();
+        // 打开过、但一个字没写：**不在**名单里（与「共 N 篇」同一把尺子）
+        vault.open_entry("2026-09-08").unwrap();
+
+        let r = vault.recap("2026-09-24").unwrap();
+        let dates: Vec<&str> = r.days.iter().map(|d| d.date.as_str()).collect();
+        assert_eq!(
+            dates,
+            ["2026-09-05", "2026-09-06", "2026-09-07"],
+            "应只有真正写过的那三天，且按日期升序"
+        );
+        assert_eq!(r.days[0].mood, Some(1), "心情要带出来");
+        assert_eq!(r.days[1].mood, None, "纯图片日没有心情");
+
+        assert_eq!(
+            vault.written_entry_count().unwrap(),
+            3,
+            "名单与「共 N 篇」必须是同一把尺子"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 连续心情：**逐日相接**才算。连着 3 天同一心情 ⇒ 3 天；
+    /// 中间断一天的两次**不成一段**，不该被接起来。
+    #[test]
+    fn mood_streak_requires_consecutive_days() {
+        let (dir, vault) = temp_vault("dsh-diary-recap-mood-streak");
+
+        // 9/10 ~ 9/12 连着三天都是「开心」(5)
+        for d in ["2026-09-10", "2026-09-11", "2026-09-12"] {
+            vault
+                .save_entry_with_mood(d, "", "连着写了。", Some(5))
+                .unwrap();
+        }
+        // 9/20 与 9/22 也是同一种心情，但**中间缺了 9/21** ⇒ 只有 1 天一段
+        for d in ["2026-09-20", "2026-09-22"] {
+            vault
+                .save_entry_with_mood(d, "", "断了。", Some(5))
+                .unwrap();
+        }
+
+        let r = vault.recap("2026-09-24").unwrap();
+        let s = r.mood_streak.expect("应有一条「连续心情」");
+        assert_eq!(s.mood, 5);
+        assert_eq!(s.days, 3, "只有 9/10~9/12 是逐日相接的三天");
+        assert_eq!(s.from, "2026-09-10", "起止必须是真实写过的日期");
+        assert_eq!(s.to, "2026-09-12");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⭐ 「连续同一种心情」**不等于**「连续天数」—— 专防把两个口径混起来。
+    ///
+    /// 连着 3 天都写过，但只有前两天标了同一种心情 ⇒ 连续心情是 **2**，不是 3。
+    /// 顺手把统计页那个「最长连续」拿来对照：它**是** 3。两个都对。
+    #[test]
+    fn mood_streak_is_not_the_same_as_streak_days() {
+        let (dir, vault) = temp_vault("dsh-diary-recap-two-clocks");
+
+        vault
+            .save_entry_with_mood("2026-09-10", "", "标了心情。", Some(3))
+            .unwrap();
+        vault
+            .save_entry_with_mood("2026-09-11", "", "也标了。", Some(3))
+            .unwrap();
+        // 第三天照样写了，只是没标心情
+        vault.save_entry("2026-09-12", "", "没标心情。").unwrap();
+
+        let r = vault.recap("2026-09-24").unwrap();
+        let s = r.mood_streak.expect("应有一条「连续心情」");
+        assert_eq!(s.days, 2, "只有两天标了同一种心情 ⇒ 不能算 3");
+        assert_eq!(s.to, "2026-09-11");
+
+        assert_eq!(
+            vault.stats("2026-09-12").unwrap().longest_streak,
+            3,
+            "对照：连续**天数**确实是 3（两个口径不同，各自都对）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 五种心情**各自独立**算，取天数最多的那一种 —— 绝不把 4 和 5 混成
+    /// 「心情好的连续」（心情是并列的类型，不是刻度）。
+    #[test]
+    fn mood_streak_treats_each_mood_separately() {
+        let (dir, vault) = temp_vault("dsh-diary-recap-mood-separate");
+
+        // 连着两天 4，再连着三天 5 —— 4 与 5 相邻但**不是同一种**
+        for d in ["2026-09-10", "2026-09-11"] {
+            vault.save_entry_with_mood(d, "", "有点生气。", Some(4)).unwrap();
+        }
+        for d in ["2026-09-12", "2026-09-13", "2026-09-14"] {
+            vault.save_entry_with_mood(d, "", "开心。", Some(5)).unwrap();
+        }
+
+        let r = vault.recap("2026-09-24").unwrap();
+        let s = r.mood_streak.expect("应有一条「连续心情」");
+        assert_eq!(s.mood, 5, "应取天数最多的那一种");
+        assert_eq!(s.days, 3, "4 与 5 必须分开算，不能接成 5 天");
+        assert_eq!(s.from, "2026-09-12");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

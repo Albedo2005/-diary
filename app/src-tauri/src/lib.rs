@@ -120,6 +120,9 @@ pub fn run() {
             // 日历上的心情标记（第三种标记：只在有心情的日子显示）
             commands::written_moods,
             commands::stats,
+            // 「回顾」：之最 ＋ 所有写过的日子（P2-23）。
+            // 与 stats 分开：这条只在前端点开「旧影」时才算，不是开机白算。
+            commands::recap,
             // 搜索
             commands::search_entries,
             // 标签
