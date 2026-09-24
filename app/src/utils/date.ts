@@ -35,6 +35,19 @@ export function shiftMonth(month: string, delta: number): string {
   return toMonthKey(d);
 }
 
+/**
+ * 'YYYY-MM-DD' 加减天数（本地时区）。热力图逐日铺那 371 个格子用它。
+ *
+ * ⚠️ 结果必须由 `toDateKey()` 拼装，**不要**自己写模板字符串 ——
+ *    本地时区取年月日与补零只有一处实现（就是这个文件顶部那两个函数）。
+ *    走 `new Date(y, m - 1, d + delta)` 而不是 `setDate()` 也一样安全：
+ *    构造时多出来的天数会由 `Date` 自动进位跨月跨年。
+ */
+export function shiftDate(key: string, delta: number): string {
+  const [y, m, d] = key.split("-").map(Number);
+  return toDateKey(new Date(y, m - 1, d + delta));
+}
+
 /** 该月的天数。 */
 export function daysInMonth(month: string): number {
   const d = monthStart(month);

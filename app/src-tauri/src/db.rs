@@ -2214,6 +2214,34 @@ impl Vault {
             })?
             .collect::<Result<_, _>>()?;
 
+        // 热力图：窗口内**写过**的每一天。窗口口径见 `heatmap_window`。
+        //
+        // 三个要点：
+        //   1. `has_content_sql()` 用 `format!` 拼进去 —— 既有的写法（上面 5 处同款），
+        //      这段 SQL 是常量，不是注入。**绝不许自己写 `content_md <> ''`**：
+        //      那就是第二套"算不算写过"的判定，而且它会漏掉"纯图片日"。
+        //   2. 上限用 `heatmap_end` 而不是 `today` —— 让"未来日期"的记录也能显示。
+        //   3. `sum` ＋ `GROUP BY` 是防御性的：当前 `UNIQUE(entry_date)` 保证一天一行，
+        //      直接取 `word_count` 也对；但 V2 多日记本会把唯一约束改成
+        //      `UNIQUE(notebook_id, entry_date)`，那时这里就会多行。现在加零成本。
+        let (heatmap_start, heatmap_end) = heatmap_window(today)?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT entry_date, coalesce(sum(word_count), 0) FROM entry
+             WHERE {}
+               AND entry_date >= ?1 AND entry_date <= ?2
+             GROUP BY entry_date
+             ORDER BY entry_date ASC",
+            has_content_sql()
+        ))?;
+        let daily_words: Vec<DayWords> = stmt
+            .query_map([&heatmap_start, &heatmap_end], |r| {
+                Ok(DayWords {
+                    date: r.get(0)?,
+                    words: r.get(1)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+
         Ok(Stats {
             total_entries,
             total_words,
@@ -2226,6 +2254,9 @@ impl Vault {
             days_this_month,
             mood_counts,
             monthly_words,
+            heatmap_start,
+            heatmap_end,
+            daily_words,
         })
     }
 
@@ -2954,6 +2985,17 @@ pub struct Stats {
     pub mood_counts: Vec<MoodCount>,
     /// 每月字数趋势，按月份升序。没有内容的月份不会出现（前端会补 0 格）。
     pub monthly_words: Vec<MonthWords>,
+    /// 热力图窗口的第一天。**一定是周一**。
+    pub heatmap_start: String,
+    /// 热力图窗口的最后一天（含）。**一定是周日**，且 ≥ today。
+    pub heatmap_end: String,
+    /// 窗口内"写过"的每一天，按日期升序。
+    ///
+    /// ⚠️ **没写过的日子不会出现在这里** —— 前端正是据此区分"没写"与"写了 0 字"：
+    ///    在窗口内但没有出现在这份名单里的，才是"没写"。
+    ///    （"写了 0 字"＝ 只有图片没有文字的日记，它**算写过**，档位是最浅那一档。）
+    /// ⚠️ 窗口之外的历史数据**不返回** —— 热力图画的是"这一年"，不是"这辈子"。
+    pub daily_words: Vec<DayWords>,
 }
 
 /// 一个心情档位的出现次数。
@@ -2969,6 +3011,16 @@ pub struct MoodCount {
 pub struct MonthWords {
     /// `YYYY-MM`
     pub month: String,
+    pub words: i64,
+}
+
+/// 热力图窗口内**写过**的某一天（统计页的 371 个格子里，有颜色的那些）。
+#[derive(Debug, Clone, Serialize)]
+pub struct DayWords {
+    /// `YYYY-MM-DD`
+    pub date: String,
+    /// 这一天的字数。⚠️ **可能是 0** —— 只有图片、没有文字的日记也算"写过"
+    /// （口径同 `has_content_sql()`），它落在**最浅那一档**，不是"没写"。
     pub words: i64,
 }
 
@@ -3321,6 +3373,32 @@ fn week_start(date: &str) -> AppResult<String> {
     let monday_index = ((days % 7) + 10) % 7; // 0 = 周一 … 6 = 周日
     let (ny, nm, nd) = civil_from_days(days - monday_index);
     Ok(format!("{ny:04}-{nm:02}-{nd:02}"))
+}
+
+/// 热力图窗口：返回 `(起始周一, 结束周日)`，共 **371 天 ＝ 53 列 × 7 行**。
+///
+/// 口径（**全项目只此一处**）：
+/// ```text
+/// week_start(today)              = 本周周一
+/// heatmap_end   = shift_date(week_start, +6)    = 本周周日
+/// heatmap_start = shift_date(week_start, -364)  = 53 周前那一周的周一
+/// ```
+/// `-364` ＝ 52 个整周，所以起点与 `week_start(today)` 落在同一个星期几（都是周一），
+/// 加上结束那一整周（7 天）正好 53 周。
+///
+/// **为什么窗口在后端算、"今天"却由前端传**：两件事方向相反、道理相同 ——
+/// 「今天」只有前端知道（本地时区），所以前端给（见 `stats` 的档注）；
+/// 而「窗口有多长、从哪个周一开始」是一条**业务口径**，全项目只应有一处定义。
+/// 前端自己再算一遍，哪天改口径就两处不一致 —— 这正是"判定只实现一次"那条铁律。
+///
+/// ⚠️ 结束日**是本周周日、不是 today**：库里若存在"未来日期"的记录
+///    （日历选择范围若含未来），它应该正常显示成一个格子，而不是被窗口悄悄切掉。
+///    前端对"未来且没数据"的格子另有样式（留空占位）。
+fn heatmap_window(today: &str) -> AppResult<(String, String)> {
+    let monday = week_start(today)?;
+    let end = shift_date(&monday, 6)?;
+    let start = shift_date(&monday, -364)?;
+    Ok((start, end))
 }
 
 /// Howard Hinnant 的 days_from_civil 算法（公有领域）。
@@ -4126,6 +4204,133 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let vault = Vault::create(&dir, "135790", None).unwrap();
         (dir, vault)
+    }
+
+    // -----------------------------------------------------------------------
+    // 热力图窗口与逐日数据（P2-18）
+    // -----------------------------------------------------------------------
+
+    /// 两个日期相差多少天（`b - a`）。测试自己算差值，不依赖被测代码的换算。
+    fn heat_days_between(a: &str, b: &str) -> i64 {
+        let to_days = |s: &str| {
+            days_from_civil(
+                s[0..4].parse().unwrap(),
+                s[5..7].parse().unwrap(),
+                s[8..10].parse().unwrap(),
+            )
+        };
+        to_days(b) - to_days(a)
+    }
+
+    /// 该日期是星期几（0＝周一 … 6＝周日），与 `week_start` 同一套口径。
+    fn heat_weekday(date: &str) -> i64 {
+        let days = days_from_civil(
+            date[0..4].parse().unwrap(),
+            date[5..7].parse().unwrap(),
+            date[8..10].parse().unwrap(),
+        );
+        ((days % 7) + 10) % 7
+    }
+
+    #[test]
+    fn heatmap_window_is_53_whole_weeks_ending_after_today() {
+        // 特意挑一个窗口**跨年**的 today：热力图年年都会跨一次，这条顺手覆盖它。
+        let today = "2026-01-03"; // 周六
+        let (start, end) = heatmap_window(today).unwrap();
+
+        assert_eq!(heat_weekday(&start), 0, "起点必须是周一，实际 {start}");
+        assert_eq!(heat_weekday(&end), 6, "终点必须是周日，实际 {end}");
+        assert_eq!(
+            heat_days_between(&start, &end),
+            370,
+            "371 天窗口 ⇒ 首尾相差 370 天"
+        );
+        assert!(
+            end.as_str() >= today,
+            "终点（本周周日）必须不早于 today：{end} < {today}"
+        );
+        assert_eq!(end, "2026-01-04", "01-03 是周六，本周周日应是 01-04");
+    }
+
+    #[test]
+    fn heatmap_lists_only_days_that_were_written() {
+        let (dir, vault) = temp_vault("dsh-diary-heatmap-written");
+        let today = "2026-09-24"; // 周四
+
+        vault.save_entry("2026-09-22", "", "写了").unwrap();
+        vault.save_entry("2026-09-24", "", "也写了").unwrap();
+        // 只填了标题、正文空 ⇒ 不算"写过"（口径同 has_content_sql）。
+        // 它同样落在窗口内，所以"不出现"是真的被判定排除了，不是被窗口切掉。
+        vault.save_entry("2026-09-21", "只有标题", "").unwrap();
+
+        let stats = vault.stats(today).unwrap();
+        let dates: Vec<&str> = stats.daily_words.iter().map(|d| d.date.as_str()).collect();
+
+        assert!(dates.contains(&"2026-09-22"), "写过的天必须在名单里");
+        assert!(dates.contains(&"2026-09-24"), "写过的天必须在名单里");
+        assert!(
+            !dates.contains(&"2026-09-21"),
+            "只有标题、没有正文的那天不算写过，不该出现在名单里"
+        );
+        // 升序 —— 前端正是按这个顺序平铺那 371 个格子，顺序错了整张图就错位。
+        let mut sorted = dates.clone();
+        sorted.sort_unstable();
+        assert_eq!(dates, sorted, "必须按日期升序");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heatmap_counts_an_image_only_day_as_written() {
+        // ⭐ 本件最重要的一条。
+        // 纯图片日记**算"写过"**（`has_content_sql()` 含有附件那半句），
+        // 但它的 `word_count` 是 0 ⇒ 必须出现在名单里、且 `words == 0`。
+        // 前端据此把它画成**最浅那一档绿色**，而不是"没写的灰"。
+        // 若这条退化，用户那张只有照片的日记会变成灰格 —— 违反已拍板第 ⑥ 条。
+        let (dir, vault) = temp_vault("dsh-diary-heatmap-image-only");
+        let today = "2026-09-24";
+
+        vault.save_entry("2026-09-23", "", "").unwrap();
+        vault
+            .save_attachment("2026-09-23", "猫.png", "image/png", &png_bytes(7))
+            .unwrap();
+
+        let stats = vault.stats(today).unwrap();
+        let day = stats
+            .daily_words
+            .iter()
+            .find(|d| d.date == "2026-09-23")
+            .expect("只有图片的那天必须算「写过」，否则会被画成灰格");
+        assert_eq!(day.words, 0, "纯图片日没有文字，字数应为 0");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heatmap_ignores_history_outside_the_window() {
+        let (dir, vault) = temp_vault("dsh-diary-heatmap-window-edge");
+        let today = "2026-09-24";
+
+        let (start, _end) = heatmap_window(today).unwrap();
+        let before = shift_date(&start, -1).unwrap(); // 窗口起点**前一天**，差一天就出界
+        vault.save_entry(&before, "", "窗口外").unwrap();
+        vault.save_entry(&start, "", "窗口第一天").unwrap();
+
+        let stats = vault.stats(today).unwrap();
+        let dates: Vec<&str> = stats.daily_words.iter().map(|d| d.date.as_str()).collect();
+
+        assert!(
+            !dates.contains(&before.as_str()),
+            "窗口前一天的数据不该返回（{before}）"
+        );
+        assert!(
+            dates.contains(&start.as_str()),
+            "窗口第一天必须包含（{start}）"
+        );
+        // 窗口本身也要如实报出来，前端拿它当铺格子的起点。
+        assert_eq!(stats.heatmap_start, start);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

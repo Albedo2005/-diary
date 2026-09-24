@@ -680,6 +680,11 @@ async function uploadOne(file: File) {
       if (overflowing.value) expanded.value = true;
     });
     emit("notice", `已插入图片「${saved.file_name}」`);
+    // ⚠️ 图片会改变"这一天算不算写过"（`has_content_sql()` 含附件那半句），
+    //    所以**必须**通知父组件重取派生数据 —— 否则日历的"写过"标记和统计页
+    //    （含热力图）都还停在旧值上：一张只有照片的日记会一直被画成"没写"的灰格。
+    //    症状很隐蔽：插入本身完全正常、图片也看得见，只有别处的数字没跟上。
+    emit("saved");
   } catch (e) {
     imageError.value = toAppError(e).message;
   } finally {
@@ -819,6 +824,9 @@ async function removeAttachment(a: Attachment) {
     expanded.value = false;
     void nextTick(measureStrip);
     emit("notice", `已删除图片「${a.file_name}」`);
+    // 同上（插入那边）的反方向：删掉**最后一张**图片会让这一天从"写过"变回"没写"，
+    // 日历标记与统计同样得跟着变。（正文里还有字时这次通知是空跑，无所谓。）
+    emit("saved");
   } catch (e) {
     imageError.value = toAppError(e).message;
   }

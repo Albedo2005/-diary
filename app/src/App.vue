@@ -666,7 +666,16 @@ onUnmounted(() => {
           />
         </div>
         <div v-else class="stats-wrap">
-          <StatsPanel :stats="stats" />
+          <!-- 热力图点格子 → 跳到那天写日记（与搜索结果的 @open 是同一套动作）。 -->
+          <StatsPanel
+            :stats="stats"
+            @open="
+              (d) => {
+                selected = d;
+                mode = 'write';
+              }
+            "
+          />
         </div>
       </main>
 

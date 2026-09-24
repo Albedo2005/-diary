@@ -28,12 +28,16 @@ import { MOODS, type Stats } from "../api";
 import {
   humanDateFull,
   humanMonth,
+  shiftDate,
   shiftMonth,
   toMonthKey,
   todayKey,
 } from "../utils/date";
 
 const props = defineProps<{ stats: Stats | null }>();
+
+/** 点热力图某一格 → 跳到那天写日记。照抄 `SearchPanel` 的 `@open` 模式，不另发明一套。 */
+const emit = defineEmits<{ (e: "open", date: string): void }>();
 
 /** 柱状图窗口：最近 12 个月（含本月）。固定格数才好横向比较，缺的月份补 0。 */
 const MONTHS_SHOWN = 12;
@@ -109,6 +113,121 @@ const monthBars = computed(() => {
 const maxMonthWords = computed(() => Math.max(1, ...monthBars.value.map((m) => m.words)));
 const monthHeight = (words: number) => `${(words / maxMonthWords.value) * 100}%`;
 const monthLabel = (key: string) => `${Number(key.slice(5, 7))}月`;
+
+/* ── 写作热力图 ──────────────────────────────────────────────────────────
+   窗口（53 周 × 7 天 ＝ 371 天）**由后端给**：`heatmap_start` 是周一、
+   `heatmap_end` 是本周周日。前端**不自己算窗口** —— 那是业务口径，只应有一处定义。
+
+   铺格子靠 CSS Grid 的 `grid-auto-flow: column` ＋ 7 行：数据按"窗口内第 i 天"
+   的顺序平铺，天然形成"列＝周、行＝星期"，**不用自己算行列**。
+
+   ⚠️ 本图是**照镜子，不是打分**（用户原话："每天都不一样，心情好多写点，
+      不开心或者忙的时候就少写点"）。所以：不用红/橙表示少、不写"你写得不够"、
+      颜色只说明"那天写了多少"，并且**悬停一定给绝对数字**（下面 `heatTitle`）。
+      —— 分位数分档的代价就是"深浅只说明相对多少"，绝对数字必须另给。 */
+
+/** 一天在热力图里的样子。`words === null` ＝ 没写（画灰格）。 */
+interface HeatDay {
+  date: string;
+  words: number | null;
+  /** 本周还没到的那几天：**留空占位**，不画格子也不可点。 */
+  future: boolean;
+}
+
+/**
+ * 窗口内的每一天（含没写的），按日期升序。
+ *
+ * ⚠️ "没写"与"写了 0 字"的区别**全靠 `daily_words` 名单**：
+ *    在名单里 → 写过（哪怕 0 字，纯图片日记）；不在名单里且在今天之前 → 没写。
+ */
+const heatDays = computed<HeatDay[]>(() => {
+  const s = props.stats;
+  if (!s || !s.heatmap_start || !s.heatmap_end) return [];
+  const written = new Map(s.daily_words.map((d) => [d.date, d.words]));
+  const out: HeatDay[] = [];
+  const end = s.heatmap_end;
+  let cur = s.heatmap_start;
+  // 上限 400 天（正常 371）：窗口数据万一坏掉，不至于在这里空转把界面卡住。
+  // 日期是定长 ISO，字典序＝时间序，可以直接比字符串。
+  for (let i = 0; i < 400 && cur <= end; i++) {
+    const has = written.has(cur);
+    out.push({
+      date: cur,
+      words: has ? (written.get(cur) as number) : null,
+      future: !has && cur > today,
+    });
+    cur = shiftDate(cur, 1);
+  }
+  return out;
+});
+
+/**
+ * 分档切点（升序，最多 3 个）。
+ *
+ * **为什么用分位数，而不是固定阈值（100 / 300 / 600 字）**：固定阈值会让
+ * "每天写 2000 字的人"永远顶格、"每天写 50 字的人"永远最低 —— 热力图变成一片纯色，
+ * 彻底失去分辨力。分位数保证颜色的分布**永远是均匀的**，始终有层次。
+ *
+ * 两个刻意的边界：
+ *   1. **数据太少（< 8 天）不分档** —— 那时候"相对"毫无意义，而且会给出
+ *      "你今天是最低档"这种不该有的暗示。全部算第 1 档。
+ *   2. **切点必须去重** —— 很多天字数相同时（比如一大片 0 字）会出现
+ *      `q1 == q2`，不去重就会有某一档**永远为空**、图例上两个一模一样的颜色。
+ */
+const heatCuts = computed(() => {
+  const words = (props.stats?.daily_words ?? []).map((d) => d.words).sort((a, b) => a - b);
+  if (words.length < 8) return [];
+  const at = (p: number) => words[Math.floor(words.length * p)];
+  return [...new Set([at(0.25), at(0.5), at(0.75)])].sort((a, b) => a - b);
+});
+
+/** 某天落到第几档：0 ＝ 没写（主题灰），1~4 ＝ 写了多少（浅→深）。 */
+const heatLevel = (words: number | null): number => {
+  if (words === null) return 0;
+  // 0 字（纯图片日记）永远是第 1 档 —— 它算"写过"，只是没有文字。
+  // 用 `>` 比较时这一点自动成立（没有一个切点会被 0 超过）。
+  let level = 1;
+  for (const cut of heatCuts.value) {
+    if (words > cut) level += 1;
+  }
+  return Math.min(level, 4);
+};
+
+/** 悬停文案。**绝对数字必须出现在这里**（理由见上面分位数那段）。 */
+const heatTitle = (d: HeatDay) => {
+  if (d.future) return `${humanDateFull(d.date)} · 还没到`;
+  return `${humanDateFull(d.date)} · ${d.words === null ? "没写" : `${grouped(d.words)} 字`}`;
+};
+
+/** 月份标签：每列看该列**第一天**的月份，与前一列不同才标一个。 */
+const heatMonths = computed(() => {
+  const days = heatDays.value;
+  const out: { col: number; label: string }[] = [];
+  let prev = "";
+  for (let i = 0; i < days.length; i += 7) {
+    const m = days[i].date.slice(0, 7);
+    if (m !== prev) {
+      out.push({ col: i / 7 + 1, label: `${Number(m.slice(5, 7))}月` });
+      prev = m;
+    }
+  }
+  return out;
+});
+
+/** 窗口内"写过"的天数 —— 图例右侧那句"有记录 N 天"。 */
+const heatWrittenDays = computed(() => props.stats?.daily_words.length ?? 0);
+
+/**
+ * 有日记、但近一年一篇都没写 ⇒ 会看到**一整块灰**。
+ * 这时必须给一句话，否则用户会以为是没加载出来（而不是真的没写）。
+ */
+const heatEmpty = computed(() => hasEntries.value && heatWrittenDays.value === 0);
+
+/** 点格子 → 跳到那天。**未来的格子点不动**（那天还没到，没法写）。 */
+const openDay = (d: HeatDay) => {
+  if (d.future) return;
+  emit("open", d.date);
+};
 </script>
 
 <template>
@@ -155,6 +274,54 @@ const monthLabel = (key: string) => `${Number(key.slice(5, 7))}月`;
       </section>
 
       <p v-if="rangeText" class="range">{{ rangeText }}</p>
+
+      <!-- ── 写作热力图 ─────────────────────────────────────────── -->
+      <section class="block">
+        <h3>写作热力图</h3>
+        <p class="cap">最近 53 周。颜色只表示那天写了多少</p>
+        <div class="heat">
+          <!-- 行标签只标 一 三 五 日 四行 —— 隔行标注省地方，也是用户给的参考图里的做法。 -->
+          <div class="heat-days" aria-hidden="true">
+            <span>一</span><span></span><span>三</span><span></span>
+            <span>五</span><span></span><span>日</span>
+          </div>
+          <div class="heat-main">
+            <div class="heat-months" aria-hidden="true">
+              <span v-for="m in heatMonths" :key="m.col" :style="{ gridColumnStart: m.col }">{{
+                m.label
+              }}</span>
+            </div>
+            <!--
+              371 个格子**不参与 Tab 顺序**（否则 Tab 键会疯掉），所以用 div ＋ @click，
+              靠原生 title 保证鼠标用户能读到那个绝对数字。
+              ⛔ 不为此实现 role="grid" ＋ 方向键导航 —— 那是给"热力图是主功能"的网站准备的。
+            -->
+            <div class="heat-grid">
+              <div
+                v-for="d in heatDays"
+                :key="d.date"
+                class="cell"
+                :class="{ future: d.future }"
+                :title="heatTitle(d)"
+                :style="d.future ? undefined : { background: `var(--heat-${heatLevel(d.words)})` }"
+                @click="openDay(d)"
+              ></div>
+            </div>
+          </div>
+        </div>
+        <p class="heat-legend">
+          <span>少</span>
+          <i class="lg" style="background: var(--heat-0)"></i>
+          <i class="lg" style="background: var(--heat-1)"></i>
+          <i class="lg" style="background: var(--heat-2)"></i>
+          <i class="lg" style="background: var(--heat-3)"></i>
+          <i class="lg" style="background: var(--heat-4)"></i>
+          <span>多</span>
+          <span class="lg-note">{{
+            heatEmpty ? "近一年没有记录" : `有记录 ${heatWrittenDays} 天`
+          }}</span>
+        </p>
+      </section>
 
       <!-- ── 心情分布 ───────────────────────────────────────────── -->
       <section class="block">
@@ -354,5 +521,90 @@ const monthLabel = (key: string) => `${Number(key.slice(5, 7))}月`;
 .col .lab {
   font-size: 10px;
   color: var(--text-3);
+}
+
+/* ── 写作热力图（P2-18） ─────────────────────────────────────
+   53 列 × 7 行 ＝ 371 个格子的纯 CSS Grid，不引任何图表库。
+   铺格子**不用自己算行列**：`grid-auto-flow: column` ＋ 7 行 ⇒
+   数据按"窗口内第 i 天"的顺序平铺，天然就是"列＝周、行＝星期"。 */
+.heat {
+  /* 月份标签那一行占的总高度（12 ＋ 4 的外边距）。
+     `.heat-days` 靠它把行标签压到与格子同高 —— 改这一处，两边一起变，不会错位。 */
+  --heat-months-h: 16px;
+  display: flex;
+  gap: 5px;
+  margin-top: 10px;
+}
+.heat-days {
+  display: grid;
+  grid-template-rows: repeat(7, 1fr);
+  align-items: center;
+  padding-top: var(--heat-months-h);
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-3);
+}
+.heat-main {
+  flex: 1;
+  min-width: 0; /* 让 53 列的网格自己缩，而不是把父级撑破（否则会出横向滚动条） */
+}
+.heat-months {
+  display: grid;
+  /* ⚠️ 这里的 53 与后端窗口的 53 周一一对应（`heatmap_start` 到 `heatmap_end`）。
+     月份标签必须落在**某一列**上，所以列数得写死；后端窗口一旦改周数，
+     这个数字要跟着改，否则标签会整体错位。 */
+  grid-template-columns: repeat(53, 1fr);
+  gap: 3px;
+  height: 12px;
+  margin-bottom: 4px;
+}
+.heat-months span {
+  grid-row: 1;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-3);
+  white-space: nowrap;
+  /* 允许向右溢出：窗口首尾可能出现"某月只占 1~2 列"，标签会挤。
+     ⛔ 不为此引入测量 / 折行逻辑 —— 最多首尾各挤一次，可接受。 */
+  justify-self: start;
+}
+.heat-grid {
+  display: grid;
+  grid-template-rows: repeat(7, 1fr);
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: 3px;
+}
+.heat-grid .cell {
+  aspect-ratio: 1; /* 正方 —— 窗口拉大时也不会变成扁条 */
+  border-radius: 2px;
+  background: var(--heat-0);
+  cursor: pointer;
+}
+/* 本周还没到的那几天：**留空占位**、不画格子、点不动。
+   与"没写"的灰刻意做成两种样子 —— 否则用户分不清"那天没写"和"那天还没到"。 */
+.heat-grid .cell.future {
+  background: transparent;
+  cursor: default;
+}
+.heat-grid .cell:not(.future):hover {
+  outline: 1px solid var(--text-3);
+  outline-offset: 1px;
+}
+.heat-legend {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.heat-legend .lg {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+.heat-legend .lg-note {
+  margin-left: 6px;
 }
 </style>

@@ -192,6 +192,32 @@ export interface Stats {
   mood_counts: MoodCount[];
   /** 每月字数，按月份升序。没有内容的月份不出现，画图时自己补空位。 */
   monthly_words: MonthWords[];
+  /** 热力图窗口的第一天。**一定是周一**。 */
+  heatmap_start: string;
+  /** 热力图窗口的最后一天（含）。**一定是周日**，且 ≥ today。 */
+  heatmap_end: string;
+  /**
+   * 窗口内"写过"的每一天，按日期升序。
+   *
+   * ⚠️ **没写过的日子不在里面** —— 正是靠这一点区分"没写"与"写了 0 字"：
+   *    窗口内、但不在这份名单里 ＝ 没写（画灰格）。
+   *    "写了 0 字"（只有图片的日记）**在名单里**、`words === 0`，画最浅那一档绿。
+   * ⚠️ 窗口之外的历史不返回 —— 热力图画的是"这一年"。
+   */
+  daily_words: DayWords[];
+}
+
+/**
+ * 热力图窗口内**写过**的某一天。
+ *
+ * ⚠️ 这份 interface 是**手抄** Rust 侧 `db.rs` 的 `DayWords`（本文件上面有说明：
+ *    漏抄不会编译报错，只会在运行时读到 `undefined`）。加字段要两边同时改。
+ */
+export interface DayWords {
+  /** `YYYY-MM-DD` */
+  date: string;
+  /** 这一天写了多少字。**可能是 0** —— 只有图片、没有文字的日记也算"写过"。 */
+  words: number;
 }
 
 export interface BackupResult {
