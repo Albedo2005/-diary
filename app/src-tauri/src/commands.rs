@@ -1102,13 +1102,52 @@ fn try_auto_backup(state: &VaultState) -> AppResult<Option<BackupResult>> {
     Ok(Some(result))
 }
 
-/// 当前时间戳，格式 `YYYYMMDD-HHMMSS`（UTC）。
-pub fn now_stamp() -> String {
-    let secs = std::time::SystemTime::now()
+/// 当前 Unix 秒（UTC）。
+///
+/// 单独抽出来是为了让"挑一个没被占用的备份戳"能拿到**秒的整数**、
+/// 自己 +1 秒往后试；`now_stamp()` 只负责把它格式化。
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format_unix_compact(secs)
+        .unwrap_or(0)
+}
+
+/// 当前时间戳，格式 `YYYYMMDD-HHMMSS`（UTC）。
+pub fn now_stamp() -> String {
+    format_unix_compact(now_secs())
+}
+
+/// 从 `base_secs` 起，在 `dir` 里挑一个**还没被占用**的备份时间戳。
+///
+/// ⚠️ **为什么非要自己挑名字**（⛔ 别把这段当成多余的防御性代码删掉）：
+///    `backup_to()` 内部走 `VACUUM INTO`，而它要求目标文件**不存在** ⇒
+///    `backup_to()` **会先 `remove_file` 掉同名文件**（见 `db.rs` 里那一段注释）。
+///    两次备份若落在**同一秒**，第二份就会把第一份**顶掉**；万一被顶掉的正是
+///    "这次要恢复的那一份"（从后悔药恢复、而那份后悔药恰好是这一秒生成的），
+///    恢复就变成**一次空操作** —— 界面报「恢复成功」，日记却一个字节没变。
+///
+/// ✅ 换出来的名字**仍然是合法的 `YYYYMMDD-HHMMSS`** ⇒ 下游四条（备份列表排序、
+///    旧备份清理、`.db` ＋ `.meta.json` 配对、列表 UI）**一条都不用改**。
+/// ⭐ 名字没被占用时**原样返回** ⇒ 日常行为一个字节都不变。
+///
+/// 上限 `MAX_BACKUP_STAMP_TRIES`（＝1 小时）：不是可配参数，也不写成可能死循环的
+/// `loop` —— 走到上限说明环境已不正常，要报一句人话错误，而不是空转。
+pub fn free_backup_stamp(dir: &Path, base_secs: u64) -> AppResult<String> {
+    const MAX_BACKUP_STAMP_TRIES: u64 = 3600;
+    for offset in 0..MAX_BACKUP_STAMP_TRIES {
+        let stamp = format_unix_compact(base_secs + offset);
+        // 只看 `.db` 就够：`.db` 与 `.meta.json` 永远用同一个戳成组出现、且 `.db` 先写。
+        // 万一只存在半组（历史遗留），换个名字重来反而更安全。
+        if !dir.join(format!("diary-{stamp}.db")).exists() {
+            return Ok(stamp);
+        }
+    }
+    Err(AppError::State(format!(
+        "备份目录里连续 {MAX_BACKUP_STAMP_TRIES} 秒的时间戳都被占用了，\
+         没法给这次备份挑一个安全的文件名：{}",
+        dir.to_string_lossy()
+    )))
 }
 
 /// 把 `crypto_meta.json` 复制到备份目录，命名与备份主文件配对。
@@ -1371,7 +1410,12 @@ pub fn restore_core(
     if let Some(v) = slot.as_ref() {
         let pre = default_backup_dir(data_dir).join("pre-restore");
         std::fs::create_dir_all(&pre)?;
-        let stamp = now_stamp();
+        // ⚠️ 名字必须**自己挑**，不能用 `now_stamp()` 直接拼：
+        //    `backup_to()` 会先删掉同名文件，而这一次要留的"后悔药"有可能
+        //    正是上一秒刚生成的那一份（用户从后悔药恢复）。两次操作落进同一秒，
+        //    它就会被自己删掉 ⇒ 恢复变成空操作（界面报成功、日记没变）。
+        //    见 `free_backup_stamp` 的注释。
+        let stamp = free_backup_stamp(&pre, now_secs())?;
         // 复用现成的备份实现（`backup_to` 内部走 VACUUM INTO），**不新写一套**。
         v.backup_to(&pre.join(format!("diary-{stamp}.db")))?;
         // ⚠️ 当时的 crypto_meta.json 必须一起留：只留 .db 的后悔药同样打不开。

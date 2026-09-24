@@ -2754,6 +2754,75 @@ fn restore_leaves_a_usable_pre_restore_snapshot() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ---------------------------------------------------------------------------
+// 【P2-5 · 补丁 A】后悔药文件名撞车（记 `3.4`）
+// ---------------------------------------------------------------------------
+
+/// 名字没被占 ⇒ **原样返回**；被占 ⇒ 顺延到下一秒，且**原文件一个字节都不动**。
+///
+/// ⚠️ 这条测试是**确定性的**，与 `restore_leaves_a_usable_pre_restore_snapshot`
+/// 恰恰相反 —— 后者要靠"两次操作正好落在同一秒"来撞运气（修前 8 轮 4 红）。
+/// 这里直接在目录里摆出"已被占用"的名字，把那个偶发场景变成必然而非偶然。
+///
+/// 它同时钉住整条修法的立足点：**顺延出来的名字仍是合法备份戳** ⇒
+/// 备份列表排序、旧备份清理、`.db` ＋ `.meta.json` 配对四条下游一条都不用改。
+#[test]
+fn free_backup_stamp_skips_names_already_taken() {
+    let dir = temp_dir("free-stamp");
+    let base = "20260924-130000";
+
+    // 基准秒从文件名里读回来，保证与生成端用的是同一套换算（不手算）。
+    let secs = app_lib::db::parse_backup_stamp(&format!("diary-{base}.db"))
+        .expect("基准名字必须是一枚合法备份戳");
+
+    // ── ① 空目录 ⇒ 原样返回（这就是 99.99…% 的日常路径：一个字节不变）──
+    assert_eq!(
+        app_lib::commands::free_backup_stamp(&dir, secs).unwrap(),
+        base,
+        "名字没被占用时必须原样返回"
+    );
+
+    // ── ② 占住这一秒 ⇒ 顺延 1 秒，且那份已存在的文件**一个字节都不许动** ──
+    let taken = dir.join(format!("diary-{base}.db"));
+    std::fs::write(&taken, b"sentinel-not-a-real-db").unwrap();
+    let before = std::fs::read(&taken).unwrap();
+
+    let next = app_lib::commands::free_backup_stamp(&dir, secs).unwrap();
+    assert_eq!(next, "20260924-130001", "撞上了就该顺延到下一秒");
+    assert_eq!(
+        std::fs::read(&taken).unwrap(),
+        before,
+        "被占用的那份必须原封不动 —— 它可能就是这次要恢复的那份后悔药"
+    );
+
+    // ── ③ 连着的两秒都被占 ⇒ 继续往后顺延（不是"只试一次"）──
+    std::fs::write(dir.join("diary-20260924-130001.db"), b"x").unwrap();
+    assert_eq!(
+        app_lib::commands::free_backup_stamp(&dir, secs).unwrap(),
+        "20260924-130002",
+        "连着两秒被占时要继续往后找"
+    );
+
+    // ── ④ ⭐ 新名字必须仍是**合法**的备份戳，且指向**真实存在的下一秒** ──
+    for name in [
+        "diary-20260924-130000.db",
+        "diary-20260924-130001.db",
+        "diary-20260924-130002.db",
+    ] {
+        assert!(
+            app_lib::db::parse_backup_stamp(name).is_some(),
+            "{name} 必须是合法备份戳（否则清理与排序会把它当陌生文件跳过）"
+        );
+    }
+    assert_eq!(
+        app_lib::db::parse_backup_stamp("diary-20260924-130002.db").unwrap(),
+        secs + 2,
+        "顺延出来的必须是真实的下一秒，而不是随便造的字符串"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn restore_refuses_a_backup_without_its_meta_and_changes_nothing() {
     let dir = temp_dir("restore-no-meta");
