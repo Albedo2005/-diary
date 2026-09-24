@@ -8,6 +8,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import CalendarPanel from "./components/CalendarPanel.vue";
 import EditorPane from "./components/EditorPane.vue";
+import FilterPanel from "./components/FilterPanel.vue";
 import HiddenScreen from "./components/HiddenScreen.vue";
 import RestoreDialog from "./components/RestoreDialog.vue";
 import SearchPanel from "./components/SearchPanel.vue";
@@ -48,17 +49,20 @@ const fatal = ref("");
 
 const selected = ref(todayKey());
 /**
- * 当前主视图：写日记 / 搜索 / 统计。
+ * 当前主视图：写日记 / 搜索 / 统计（年轮）/ 筛选。
  *
- * ⚠️ 默认**永远是写日记** —— 三个 tab 里它是"家"。别把这个选择持久化：
+ * ⚠️ 默认**永远是写日记** —— 四个 tab 里它是"家"。别把这个选择持久化：
  *    用户下次打开软件看到一屏统计，会以为软件坏了。
  *
  * ⚠️ 切走时正文区会**卸载**（`v-if` / `v-else-if`）。`EditorPane` 的
  *    `onUnmounted` 里有 `if (dirty) void flush()`，没落盘的字会先被存掉，
  *    所以**不丢内容**；代价是切回来属于重挂，光标与滚动位置归零。
  *    这与「搜索」的行为完全一致（它也是这么切的）。
+ * ⚠️ **筛选页的条件不留**（用户 2026-09-23 拍板）正是靠这条：条件住在
+ *    `FilterPanel` 内部的 `ref` 里，一卸载就没了 ⇒ 什么都不用做。
+ *    ⛔ 别为了"顺手保住它"把它提到这里来。
  */
-const mode = ref<"write" | "search" | "stats">("write");
+const mode = ref<"write" | "search" | "stats" | "filter">("write");
 /** 递增以要求日历刷新标记。**每次保存都会递增** —— 所以别拿它去驱动整篇重载。 */
 const refreshToken = ref(0);
 
@@ -73,10 +77,16 @@ const libraryToken = ref(0);
 /**
  * 递增以要求两处标签界面刷新。
  *
- * 标签同时出现在**侧栏列表**（CalendarPanel）与**编辑器 chip 行 + 下拉候选**
- * （EditorPane）里，而改标签的入口也在两处（编辑器的 ＋/×、侧栏的 ✎/✕）。
- * 用一个共享的令牌让两边互相同步，比"谁改了谁挨个去通知对方"少一半接线，
- * 也避免出现"侧栏删了标签、编辑器还挂着它"这种半新半旧的状态。
+ * 标签同时出现在**筛选页的筛选条 + 标签管理**（FilterPanel）与**编辑器 chip 行
+ * + 下拉候选**（EditorPane）里，改标签的入口也在这两处（编辑器的 ＋/×、
+ * 筛选页的 ✎/✕）。用一个共享的令牌让两边互相同步，比"谁改了谁挨个去通知对方"
+ * 少一半接线，也避免出现"筛选页删了标签、编辑器还挂着它"这种半新半旧的状态。
+ *
+ * ⚠️ **消费者在 P2-7 换过一次**：以前是**日历侧栏**（它的标签块已整块搬去筛选页），
+ *    现在这条线接到 FilterPanel 上。⚠️ **新页面 ＋ 编辑器两个消费者缺一不可** ——
+ *    只搬一处就会出现"一半新、一半旧"。
+ * ⚠️ 唯一还没接上的消费者是统计页的「常用标签」榜 —— 它吃的是 `tags` 那份 prop
+ *    （由 `loadAux` 拉），**刻意不跟这个令牌走**，理由见 `StatsPanel.vue` 文件头。
  *
  * 与自己无关的改动也会触发一次重读 —— 多查一次换来的是
  * "界面上的标签永远来自数据库"，这个买卖划算。
@@ -767,6 +777,16 @@ onUnmounted(() => {
           <button :class="{ on: mode === 'stats' }" @click="mode = 'stats'">
             年轮
           </button>
+          <!--
+            筛选是**第四个整屏视图**（P2-7）—— 与「搜索」同族（都是"按条件捞"），
+            区别是搜索吃一个查询词、它吃条件。
+            ⚠️ 代价是顶栏又宽了一点 ⇒ 窗口拖到最窄（720px）时会挤，
+            所以样式那边补了 `@media (max-width: 880px)` 把那行数字藏掉
+            （"共 N 篇 · 连续 N 天"在年轮页里本来就有，一点信息都不丢）。
+          -->
+          <button :class="{ on: mode === 'filter' }" @click="mode = 'filter'">
+            筛选
+          </button>
         </nav>
         <div class="right">
           <!--
@@ -794,11 +814,9 @@ onUnmounted(() => {
           <CalendarPanel
             :selected="selected"
             :refresh-token="refreshToken"
-            :tag-token="tagToken"
             :first-date="stats?.first_date ?? null"
             :last-date="stats?.last_date ?? null"
             @select="(d) => (selected = d)"
-            @tags-changed="onTagsChanged"
             @notice="flash"
           />
           <EditorPane
@@ -824,6 +842,26 @@ onUnmounted(() => {
                 mode = 'write';
               }
             "
+          />
+        </div>
+        <div v-else-if="mode === 'filter'" class="filter-wrap">
+          <!--
+            筛选页（P2-7）。
+            ⚠️ `@tags-changed` 是**从日历挪过来的**：标签改名 / 退役的入口这次
+               也跟着搬到了本页，所以"改了标签 ⇒ 编辑器与各处跟着刷新"这条线
+               必须接到这里（日历那边已经不带 `tagToken` 了）。
+            ⚠️ 筛选条件**不住在这里** —— 它在组件内部，切走即清空（用户拍板"不留"）。
+          -->
+          <FilterPanel
+            :tag-token="tagToken"
+            @open="
+              (d) => {
+                selected = d;
+                mode = 'write';
+              }
+            "
+            @tags-changed="onTagsChanged"
+            @notice="flash"
           />
         </div>
         <div v-else class="stats-wrap">
@@ -987,11 +1025,12 @@ onUnmounted(() => {
   min-height: 0;
 }
 /*
-  搜索与统计都是"整屏视图"，共用同一套留白与滚动。
-  统计图表比搜索结果宽一些，所以各给自己的 max-width。
+  搜索 / 年轮 / 筛选都是"整屏视图"，共用同一套留白与滚动。
+  宽度各不相同：搜索最窄（一行查询词），年轮图表次之，筛选是三行药丸 ＋ 结果列表。
 */
 .search-wrap,
-.stats-wrap {
+.stats-wrap,
+.filter-wrap {
   flex: 1;
   min-width: 0;
   padding: 20px 24px;
@@ -1002,6 +1041,28 @@ onUnmounted(() => {
 }
 .stats-wrap {
   max-width: 820px;
+}
+.filter-wrap {
+  max-width: 760px;
+}
+
+/*
+  窄屏退让（P2-7）。
+  顶栏现在装着：日记 ＋ **四个** tab ＋「共 N 篇 · 连续 N 天」＋ 设置 ＋ 锁定。
+  窗口最窄是 720px（`tauri.conf.json` 的 `minWidth`）⇒ 到 880px 就把那行数字收起来，
+  保证顶栏**不换行、不溢出、按钮都点得到**。
+  ⚠️ 那行数字在年轮页里本来就有 ⇒ **一点信息都不丢**。
+  ⚠️ 这条**只做一次**：P2-22（折叠日历）也要占顶栏，它届时**只复查、别再加一份** ——
+     加两份会出现"一处生效、一处不生效"。
+*/
+@media (max-width: 880px) {
+  .topbar {
+    gap: 12px;
+    padding: 0 14px;
+  }
+  .stat {
+    display: none;
+  }
 }
 .toast {
   position: fixed;

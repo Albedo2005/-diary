@@ -150,6 +150,44 @@ export interface SearchHit {
   matched_by: "word" | "char";
 }
 
+/**
+ * 筛选页的一条结果（P2-7）。
+ *
+ * ⚠️ 这份是**手抄 Rust 侧 `db::FilterHit`** 的，加字段必须**两边同时改** ——
+ *    漏了不会编译报错，只会在运行时读到 `undefined`。
+ */
+export interface FilterHit {
+  entry_date: string;
+  /**
+   * 1~5。没标心情时是 `null`。
+   * ⚠️ 五个值是**并列的编号，不是刻度** ⇒ 界面上**不许**按"好坏"排序或写"更好的心情"。
+   */
+  mood: number | null;
+  /**
+   * 第二行要显示的那段字，**后端已经拼好了**：
+   *   * 有正文 → 正文开头约 60 字
+   *   * 纯图片日记 → `〔这一篇有 N 张图片〕`
+   * ⛔ 前端**直接显示**，别再自己判断"预览为空意味着纯图片" ——
+   *    那个判断在后端一处（P2-3 富文本落地时只改那边）。
+   */
+  line: string;
+  /** 这一篇上挂的标签名（已按名字排序，**含已退休的**）。空数组＝什么都不显示。 */
+  tags: string[];
+}
+
+/** 筛选的完整结果（P2-7）。 */
+export interface FilterResult {
+  hits: FilterHit[];
+  /**
+   * **符合条件的一共有多少篇**（不受 `limit` 影响）。
+   * ⚠️ 界面那句"只显示前 N 条"要不要出现，看它 —— 别拿 `hits.length === limit` 去猜：
+   *    恰好等于上限时那句话就成了谎话。
+   */
+  total: number;
+  /** 这次生效的上限（后端 clamp 过，1~500）。那句话里的数字从这里来，⛔ 别写死 200。 */
+  limit: number;
+}
+
 /** 一个心情档位的出现次数。后端只返回**出现过**的档位。 */
 export interface MoodCount {
   mood: number;
@@ -650,6 +688,48 @@ export const getRecap = () => invoke<Recap>("recap", { today: todayKey() });
  */
 export const searchEntries = (query: string, limit = 50) =>
   invoke<SearchHit[]>("search_entries", { query, limit });
+
+// ---------------------------------------------------------------------------
+// 筛选（P2-7）
+// ---------------------------------------------------------------------------
+
+/**
+ * 筛选条件的形状。
+ *
+ * ⚠️ **空＝不限**：不传 `tags` 是"不按标签筛"，不是"筛没有标签的"。
+ *    `tags` 与 `moods` 各自内部是**并集**，两组之间是**交集**。
+ */
+export interface FilterQuery {
+  /** 标签 id（**不是名字** —— 名字能改，id 不会）。 */
+  tags?: number[];
+  /** 1~5。 */
+  moods?: number[];
+  /** `YYYY-MM-DD`，**含两端**。只给一个也能用（＝从某天起 / 到某天止）。 */
+  from?: string | null;
+  to?: string | null;
+  /** 默认 `true`＝最近优先；`false`＝最早优先。只影响 `DESC` / `ASC`。 */
+  recentFirst?: boolean;
+  /** 默认 200（后端会夹进 1~500）。 */
+  limit?: number;
+}
+
+/**
+ * 按标签 / 心情 / 时间捞日记（**纯读**）。
+ *
+ * ⚠️ 与 `searchEntries` 是两件事，别混：
+ *    搜索吃的是**一个查询词**、走全文索引；这里吃的是**条件**、走普通查询。
+ * ⚠️ 锁定过的日记**照常返回**、摘要也照常给 —— 与搜索一致
+ *    （"锁定"一直是只读的意思，不是隐藏）。
+ */
+export const filterEntries = (q: FilterQuery = {}) =>
+  invoke<FilterResult>("filter_entries", {
+    tags: q.tags ?? [],
+    moods: q.moods ?? [],
+    from: q.from ?? null,
+    to: q.to ?? null,
+    recentFirst: q.recentFirst ?? true,
+    limit: q.limit ?? null,
+  });
 
 // ---------------------------------------------------------------------------
 // 标签

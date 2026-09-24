@@ -175,6 +175,40 @@ pub struct TagStat {
     pub entry_count: i64,
 }
 
+/// 筛选页的一条结果（P2-7）。
+#[derive(Debug, Clone, Serialize)]
+pub struct FilterHit {
+    pub entry_date: String,
+    /// 1~5。没标心情时是 `None` ⇒ 界面上**什么都不显示**（不占位、不写"无"）。
+    /// ⚠️ 五个值是**并列的编号，不是刻度**，别按"好坏"排序。
+    pub mood: Option<i64>,
+    /// 第二行要显示的那段字，**已经拼好了**（后端拼的，前端直接显示）：
+    ///   * 有正文 → 正文开头约 60 字（`make_preview()`）
+    ///   * 纯图片日记 → `〔这一篇有 N 张图片〕`
+    /// ⚠️ 为什么不让前端自己判：见 `make_preview_line()` 的说明。
+    pub line: String,
+    /// 这一篇上挂的标签名（按名字排序，**含已退休的**）。
+    /// 空数组 ⇒ 界面上什么都不显示（这一条能出现说明它是按时间或心情筛出来的）。
+    pub tags: Vec<String>,
+}
+
+/// 筛选页的完整结果。
+///
+/// 为什么不直接回一个 `Vec<FilterHit>`：界面上有一句
+/// 「只显示前 200 条（按当前排序）」—— 要不要显示它，取决于
+/// **符合条件的一共有多少篇**，而不只是"这次拿到了多少条"。
+/// 让前端拿 `hits.len() == limit` 去猜，恰好 200 篇时那句话就成了谎话。
+#[derive(Debug, Clone, Serialize)]
+pub struct FilterResult {
+    /// 这次实际返回的那部分（最多 `limit` 条）。
+    pub hits: Vec<FilterHit>,
+    /// **符合条件的一共有多少篇**（不受 `limit` 影响）。
+    pub total: i64,
+    /// 这次生效的上限（`clamp(1, 500)`，默认 200）。
+    /// 那句话里的数字从这里来，⛔ 别在前端写死 200。
+    pub limit: i64,
+}
+
 /// 备份结果。
 #[derive(Debug, Clone, Serialize)]
 pub struct BackupResult {
@@ -2401,6 +2435,148 @@ impl Vault {
         })
     }
 
+    /// 按 **标签 / 心情 / 时间** 捞日记（P2-7）。
+    ///
+    /// 这是**纯读**的，永远不写库。也是 P2 里第一条真正新增的查询命令 ——
+    /// 此前后端只有"搜正文 / 按月列 / 列标签 / 查某天的标签"，**没有"按条件筛"**。
+    ///
+    /// 口径（每一条都对应界面上一处行为）：
+    ///   * 走 `has_content_sql_for("e")` —— **"算不算写过"仍然只有那一处定义**。
+    ///     所以**纯图片日记算一篇**，而"只点开过、一个字没写"的某天不算。
+    ///     漏了这半句就会出现"标签上写着 3 篇、点进去只有 2 条"。
+    ///   * **多个标签之间是"任意一个"（并集）**：`EXISTS(... IN ...)`。
+    ///     写成"全都得含"的话，随手多选一个就一篇都搜不出来，看着像坏了。
+    ///   * **标签与心情之间是"且"（交集）**：两组各成一个条件，用 AND 连。
+    ///   * `from` / `to` **含两端**；只给其中一个也照常能用（那是"从某天起"）。
+    ///   * `from > to` 自然返回空结果、**不报错** —— 用户正在输日期，中间态就是这样。
+    ///   * 锁定过的日记**照常出现在结果里**，摘要也照常给 —— 与 `search()` 完全一致
+    ///     （那条 SQL 里同样一个 locked 条件都没有）。否则会出现"搜得到、筛不到"这种
+    ///     自相矛盾，而"锁定"一直是**只读**的意思，不是隐藏。
+    ///
+    /// 排序方向只换 `DESC` / `ASC` 这一个词 —— ⛔ 别为此写两条 SQL（迟早改一条忘一条）。
+    /// 而拼进 SQL 的**只允许这两个常量字符串**；用户传进来的任何字符串都不许拼进来，
+    /// 值一律走参数绑定。
+    pub fn filter_entries(
+        &self,
+        tags: &[i64],
+        moods: &[i64],
+        from: Option<&str>,
+        to: Option<&str>,
+        recent_first: bool,
+        limit: Option<i64>,
+    ) -> AppResult<FilterResult> {
+        if let Some(d) = from {
+            validate_date(d)?;
+        }
+        if let Some(d) = to {
+            validate_date(d)?;
+        }
+        // 不在 1~5 的心情编号**直接忽略**，绝不静默当成某个有效值 ——
+        // 悄悄当成 0 或凑成 1 的话，"结果里混进了没标心情的日记"这种事永远查不出来。
+        let moods: Vec<i64> = moods
+            .iter()
+            .copied()
+            .filter(|m| (1..=5).contains(m))
+            .collect();
+
+        let limit = limit.unwrap_or(200).clamp(1, 500);
+        let dir = if recent_first { "DESC" } else { "ASC" };
+
+        // ⚠️ WHERE 里的条件与 `vals` **必须同序往下长** —— 下面用的是位置参数 `?`。
+        let mut where_parts: Vec<String> = vec![has_content_sql_for("e")];
+        let mut vals: Vec<rusqlite::types::Value> = Vec::new();
+
+        if let Some(f) = from {
+            where_parts.push("e.entry_date >= ?".into());
+            vals.push(rusqlite::types::Value::Text(f.to_string()));
+        }
+        if let Some(t) = to {
+            where_parts.push("e.entry_date <= ?".into());
+            vals.push(rusqlite::types::Value::Text(t.to_string()));
+        }
+        if !moods.is_empty() {
+            where_parts.push(format!("e.mood IN ({})", placeholders(moods.len())));
+            vals.extend(moods.iter().map(|m| rusqlite::types::Value::Integer(*m)));
+        }
+        if !tags.is_empty() {
+            where_parts.push(format!(
+                "EXISTS (SELECT 1 FROM entry_tag et \
+                 WHERE et.entry_id = e.id AND et.tag_id IN ({}))",
+                placeholders(tags.len())
+            ));
+            vals.extend(tags.iter().map(|t| rusqlite::types::Value::Integer(*t)));
+        }
+        let where_sql = where_parts.join(" AND ");
+
+        // 先数总数（**不受 limit 影响**）：界面那句"只显示前 200 条"要不要出现，
+        // 取决于符合条件的一共有多少篇，而不是"这次拿到了多少条"。
+        let total: i64 = self.conn.query_row(
+            &format!("SELECT count(*) FROM entry e WHERE {where_sql}"),
+            rusqlite::params_from_iter(vals.iter()),
+            |r| r.get(0),
+        )?;
+
+        // 主查询。⛔ 不顺带用 `group_concat` 捎标签：它的顺序不保证，而标签是有
+        //    约定顺序的（照抄 `list_tags` 那条 ORDER BY）⇒ 见下面第二次查询。
+        let mut with_limit = vals.clone();
+        with_limit.push(rusqlite::types::Value::Integer(limit));
+        let sql = format!(
+            "SELECT e.entry_date, e.mood, e.content_md,
+                    (SELECT count(*) FROM attachment a WHERE a.entry_id = e.id)
+             FROM entry e
+             WHERE {where_sql}
+             ORDER BY e.entry_date {dir}
+             LIMIT ?"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(with_limit.iter()), |r| {
+            let content: String = r.get(2)?;
+            let photos: i64 = r.get(3)?;
+            Ok(FilterHit {
+                entry_date: r.get(0)?,
+                mood: r.get(1)?,
+                line: make_preview_line(&content, photos),
+                tags: Vec::new(),
+            })
+        })?;
+        let mut hits = rows.collect::<Result<Vec<_>, _>>()?;
+
+        // 标签**一次查完再组装**（不是每行查一次，避免 N+1）。
+        // ⚠️ **不过滤 `t.retired`** —— 结果行要如实显示"这一篇上挂着什么"，
+        //    与 `tags_of_entry`（它刻意也不过滤）保持一致。
+        if !hits.is_empty() {
+            let sql = format!(
+                "SELECT e.entry_date, t.name
+                 FROM entry_tag et
+                 JOIN tag t ON t.id = et.tag_id
+                 JOIN entry e ON e.id = et.entry_id
+                 WHERE e.entry_date IN ({})
+                 ORDER BY t.name COLLATE NOCASE ASC",
+                placeholders(hits.len())
+            );
+            let args: Vec<rusqlite::types::Value> = hits
+                .iter()
+                .map(|h| rusqlite::types::Value::Text(h.entry_date.clone()))
+                .collect();
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            let mut by_date: HashMap<String, Vec<String>> = HashMap::new();
+            for row in rows {
+                let (date, name) = row?;
+                by_date.entry(date).or_default().push(name);
+            }
+            for h in &mut hits {
+                if let Some(names) = by_date.remove(&h.entry_date) {
+                    h.tags = names;
+                }
+            }
+        }
+
+        Ok(FilterResult { hits, total, limit })
+    }
+
     /// 中文全文搜索：双索引合并。
     ///
     /// 策略：
@@ -3331,6 +3507,49 @@ fn make_preview(content: &str) -> String {
         out.push('…');
     }
     out
+}
+
+/// 筛选页结果行**第二行**要显示的那段字（P2-7）。
+///
+/// 三种情形：
+///   * 有正文            → `make_preview()` 的结果（正文开头约 60 字）
+///   * 没正文但有图片    → `〔这一篇有 N 张图片〕`
+///   * 都没有            → 空串（正常到不了这里："一个字没有也没图"的日子
+///                         不算"写过"，`has_content_sql` 已经把它挡在结果之外）
+///
+/// ⚠️ **为什么这句判断放在后端**（P2-7 指令 §9-① 点名的地方）：
+///    它其实是"从正文生成摘要"这件事的最后一小步 —— 取开头仍然只有
+///    `make_preview()` 一份实现，这里只是把它的结果和"有几张图"合成一句话。
+///    P2-3（正文富文本）落地后正文里会多出**看不见的格式标记**，要改的仍然
+///    只是 `make_preview()`（先取可见文字再截），**本函数一行都不用动**。
+///    反过来，如果让前端去判断"preview 是空的 ⇒ 大概是纯图片日记"，
+///    P2-3 一改摘要语义，前端那句判断就悄悄失效了 —— 两个地方各理解一次
+///    "什么叫没有正文"，必然只改一处。
+fn make_preview_line(content: &str, photos: i64) -> String {
+    let preview = make_preview(content);
+    if !preview.is_empty() {
+        return preview;
+    }
+    if photos > 0 {
+        return format!("〔这一篇有 {photos} 张图片〕");
+    }
+    String::new()
+}
+
+/// `n` 个位置参数：`?, ?, ?`（`n = 0` 时是空串）。
+///
+/// 存在的理由只有一个：`IN (…)` 里问号的个数随用户选了几个标签而变，写不死。
+/// ⛔ **它只生成问号本身，绝不把值拼进 SQL** —— 值一律走参数绑定
+/// （`filter_entries` 里那个 `vals`）。
+fn placeholders(n: usize) -> String {
+    let mut s = String::with_capacity(n * 3);
+    for i in 0..n {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        s.push('?');
+    }
+    s
 }
 
 fn validate_date(date: &str) -> AppResult<()> {
@@ -4994,6 +5213,357 @@ mod tests {
         assert_eq!(s.mood, 5, "应取天数最多的那一种");
         assert_eq!(s.days, 3, "4 与 5 必须分开算，不能接成 5 天");
         assert_eq!(s.from, "2026-09-12");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // 筛选（P2-7）
+    // -----------------------------------------------------------------------
+    //
+    // ⚠️ 同样**按 `entry_date` 找结果**，不用固定下标。
+
+    /// 从结果里按日期找一条。
+    fn filter_find_hit<'a>(r: &'a FilterResult, date: &str) -> Option<&'a FilterHit> {
+        r.hits.iter().find(|h| h.entry_date == date)
+    }
+
+    /// 按 `list_tags` 的名字取 id（标签 id 是自增的，测试里不该硬写数字）。
+    fn filter_tag_id(vault: &Vault, name: &str) -> i64 {
+        vault
+            .list_tags()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("库里应该有标签「{name}」"))
+            .id
+    }
+
+    /// 什么条件都不给 ⇒ **所有"写过"的日记**，默认**最近优先**，上限 200。
+    #[test]
+    fn filter_without_conditions_returns_all_written_newest_first() {
+        let (dir, vault) = temp_vault("dsh-diary-filter-all");
+
+        vault.save_entry("2026-09-10", "", "第一篇。").unwrap();
+        vault.save_entry("2026-09-20", "", "第二篇。").unwrap();
+        vault.save_entry("2026-09-15", "", "第三篇。").unwrap();
+
+        // 故意乱序写入，确认顺序来自 SQL 而不是插入顺序。
+        let r = vault
+            .filter_entries(&[], &[], None, None, true, None)
+            .unwrap();
+
+        assert_eq!(r.total, 3);
+        assert_eq!(r.limit, 200, "缺省上限必须是 200");
+        assert_eq!(
+            r.hits.iter().map(|h| h.entry_date.as_str()).collect::<Vec<_>>(),
+            vec!["2026-09-20", "2026-09-15", "2026-09-10"],
+            "默认按日期倒序（最近优先）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⭐ **纯图片日记算一篇**（走 `has_content_sql`），而且第二行不是空白 ——
+    /// 是 `〔这一篇有 N 张图片〕`。
+    #[test]
+    fn filter_image_only_day_counts_and_gets_the_photo_note() {
+        let (dir, vault) = temp_vault("dsh-diary-filter-image-only");
+
+        vault.save_entry("2026-09-10", "", "有正文。").unwrap();
+        // 正文一个字没写，只挂两张图
+        vault
+            .save_attachment("2026-09-11", "图一.png", "image/png", &png_bytes(1))
+            .unwrap();
+        vault
+            .save_attachment("2026-09-11", "图二.png", "image/png", &png_bytes(2))
+            .unwrap();
+
+        let r = vault
+            .filter_entries(&[], &[], None, None, true, None)
+            .unwrap();
+        assert_eq!(r.total, 2, "只有图片的那天必须算一篇");
+
+        let img = filter_find_hit(&r, "2026-09-11").expect("纯图片那天要在结果里");
+        assert_eq!(img.line, "〔这一篇有 2 张图片〕");
+        assert_eq!(img.mood, None, "没标心情就该是 None，界面靠它决定不显示");
+        assert!(img.tags.is_empty());
+
+        assert_eq!(filter_find_hit(&r, "2026-09-10").unwrap().line, "有正文。");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 只点开过、一个字没写的那天**不出现** —— 与日历标记、统计篇数同一条口径。
+    #[test]
+    fn filter_skips_opened_but_empty_days() {
+        let (dir, vault) = temp_vault("dsh-diary-filter-empty");
+
+        vault.save_entry("2026-09-10", "", "写过。").unwrap();
+        // 空正文 + 空标题：库里会留一行，但不算"写过"（"打开 ≠ 写过"）
+        vault.save_entry("2026-09-11", "", "").unwrap();
+
+        let r = vault
+            .filter_entries(&[], &[], None, None, true, None)
+            .unwrap();
+        assert_eq!(r.total, 1);
+        assert!(
+            filter_find_hit(&r, "2026-09-11").is_none(),
+            "打开过但没写的日子不该出现在筛选结果里"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 两个标签 ⇒ **并集**（命中任意一个即可），⛔ 不是"全都得含"。
+    #[test]
+    fn filter_multiple_tags_is_union_not_intersection() {
+        let (dir, vault) = temp_vault("dsh-diary-filter-union");
+
+        vault.save_entry("2026-09-10", "", "只有工作。").unwrap();
+        vault
+            .set_entry_tags("2026-09-10", &["工作".into()])
+            .unwrap();
+        vault.save_entry("2026-09-11", "", "只有旅行。").unwrap();
+        vault
+            .set_entry_tags("2026-09-11", &["旅行".into()])
+            .unwrap();
+        vault.save_entry("2026-09-12", "", "两个都有。").unwrap();
+        vault
+            .set_entry_tags("2026-09-12", &["工作".into(), "旅行".into()])
+            .unwrap();
+        vault.save_entry("2026-09-13", "", "一个都没有。").unwrap();
+
+        let work = filter_tag_id(&vault, "工作");
+        let trip = filter_tag_id(&vault, "旅行");
+
+        let r = vault
+            .filter_entries(&[work, trip], &[], None, None, true, None)
+            .unwrap();
+        assert_eq!(r.total, 3, "10 / 11 / 12 都在（并集），13 不在");
+        assert!(filter_find_hit(&r, "2026-09-13").is_none());
+
+        // 单个标签时只命中它自己
+        let only_work = vault
+            .filter_entries(&[work], &[], None, None, true, None)
+            .unwrap();
+        assert_eq!(only_work.total, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 标签 ＋ 心情 ⇒ **交集**（标签命中但心情不对的不出现）。
+    #[test]
+    fn filter_tags_and_moods_intersect() {
+        let (dir, vault) = temp_vault("dsh-diary-filter-intersect");
+
+        vault
+            .save_entry_with_mood("2026-09-10", "", "工作且开心。", Some(5))
+            .unwrap();
+        vault
+            .set_entry_tags("2026-09-10", &["工作".into()])
+            .unwrap();
+        vault
+            .save_entry_with_mood("2026-09-11", "", "工作但难过。", Some(1))
+            .unwrap();
+        vault
+            .set_entry_tags("2026-09-11", &["工作".into()])
+            .unwrap();
+        // 开心但没标签 —— 两边各差一个条件，都不该出现
+        vault
+            .save_entry_with_mood("2026-09-12", "", "开心但没标签。", Some(5))
+            .unwrap();
+
+        let work = filter_tag_id(&vault, "工作");
+        let r = vault
+            .filter_entries(&[work], &[5], None, None, true, None)
+            .unwrap();
+
+        assert_eq!(r.total, 1, "两组之间是『且』");
+        assert_eq!(filter_find_hit(&r, "2026-09-10").unwrap().mood, Some(5));
+        assert!(filter_find_hit(&r, "2026-09-11").is_none());
+        assert!(filter_find_hit(&r, "2026-09-12").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 时间条件**含两端**；只给一头也能用；`from > to` 返回空、**不报错**。
+    #[test]
+    fn filter_date_range_includes_both_ends_and_one_sided_works() {
+        let (dir, vault) = temp_vault("dsh-diary-filter-range");
+
+        for d in ["2026-09-10", "2026-09-15", "2026-09-20"] {
+            vault.save_entry(d, "", "写了一点。").unwrap();
+        }
+
+        // 两端就是那一天 ⇒ 必须包含在内
+        let same = vault
+            .filter_entries(&[], &[], Some("2026-09-15"), Some("2026-09-15"), true, None)
+            .unwrap();
+        assert_eq!(
+            same.hits.iter().map(|h| h.entry_date.as_str()).collect::<Vec<_>>(),
+            vec!["2026-09-15"],
+            "from / to 必须含两端"
+        );
+
+        // 只给 from
+        let since = vault
+            .filter_entries(&[], &[], Some("2026-09-16"), None, true, None)
+            .unwrap();
+        assert_eq!(since.total, 1);
+
+        // 只给 to
+        let until = vault
+            .filter_entries(&[], &[], None, Some("2026-09-14"), true, None)
+            .unwrap();
+        assert_eq!(until.total, 1);
+
+        // from > to：用户正在输日期，中间态就是这样 ⇒ 空结果，不报错
+        let backwards = vault
+            .filter_entries(&[], &[], Some("2026-09-20"), Some("2026-09-10"), true, None)
+            .unwrap();
+        assert_eq!(backwards.total, 0);
+        assert!(backwards.hits.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 排序方向只换 `DESC`/`ASC` ⇒ **条数一样、顺序正好相反**。
+    #[test]
+    fn filter_sort_direction_flips_order_without_changing_count() {
+        let (dir, vault) = temp_vault("dsh-diary-filter-order");
+
+        for d in ["2026-09-10", "2026-09-15", "2026-09-20"] {
+            vault.save_entry(d, "", "写了一点。").unwrap();
+        }
+
+        let newest = vault
+            .filter_entries(&[], &[], None, None, true, None)
+            .unwrap();
+        let oldest = vault
+            .filter_entries(&[], &[], None, None, false, None)
+            .unwrap();
+
+        assert_eq!(newest.total, oldest.total, "只换排序方向，条数必须一样");
+        let mut flipped = oldest
+            .hits
+            .iter()
+            .map(|h| h.entry_date.clone())
+            .collect::<Vec<_>>();
+        flipped.reverse();
+        assert_eq!(
+            newest.hits.iter().map(|h| h.entry_date.clone()).collect::<Vec<_>>(),
+            flipped,
+            "两个方向的结果正好相反"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `total` 是"**符合条件的一共多少篇**"（不受 `limit` 影响）；
+    /// `limit` 会被夹进 1~500；缺省 200。
+    #[test]
+    fn filter_total_ignores_limit_and_limit_is_clamped() {
+        let (dir, vault) = temp_vault("dsh-diary-filter-limit");
+
+        for d in [
+            "2026-09-10", "2026-09-11", "2026-09-12", "2026-09-13", "2026-09-14",
+        ] {
+            vault.save_entry(d, "", "写了一点。").unwrap();
+        }
+
+        let cut = vault
+            .filter_entries(&[], &[], None, None, true, Some(2))
+            .unwrap();
+        assert_eq!(cut.hits.len(), 2, "只回 2 条");
+        assert_eq!(
+            cut.total, 5,
+            "总数必须是 5 —— 界面靠它决定要不要说『只显示前 N 条』"
+        );
+        assert_eq!(cut.limit, 2, "上限跟随调用方传的值");
+
+        assert_eq!(
+            vault
+                .filter_entries(&[], &[], None, None, true, Some(0))
+                .unwrap()
+                .limit,
+            1,
+            "0 被夹到 1"
+        );
+        assert_eq!(
+            vault
+                .filter_entries(&[], &[], None, None, true, Some(99_999))
+                .unwrap()
+                .limit,
+            500,
+            "太大被夹到 500"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 不在 1~5 的心情编号**被忽略**，⛔ 不静默当成某个有效值。
+    #[test]
+    fn filter_ignores_out_of_range_moods() {
+        let (dir, vault) = temp_vault("dsh-diary-filter-bad-mood");
+
+        vault.save_entry("2026-09-10", "", "没标心情。").unwrap();
+        vault
+            .save_entry_with_mood("2026-09-11", "", "茫然。", Some(3))
+            .unwrap();
+        vault
+            .save_entry_with_mood("2026-09-12", "", "开心。", Some(5))
+            .unwrap();
+
+        // 混进一个 99 ⇒ 只有合法的 5 生效，绝不是"99 匹配不到任何东西"
+        let mixed = vault
+            .filter_entries(&[], &[99, 5], None, None, true, None)
+            .unwrap();
+        assert_eq!(mixed.total, 1);
+        assert_eq!(filter_find_hit(&mixed, "2026-09-12").unwrap().mood, Some(5));
+
+        // 全是非法值 ⇒ 全部忽略 ⇒ 等于"不限心情"（**不是**报错、也不是按 0 匹配）
+        let bogus = vault
+            .filter_entries(&[], &[0], None, None, true, None)
+            .unwrap();
+        assert_eq!(bogus.total, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 结果行上的标签**按名字排序**；而且**已退休的标签照常显示** ——
+    /// 历史原样保留，与 `tags_of_entry` 一致。
+    #[test]
+    fn filter_lists_tags_per_entry_including_retired() {
+        let (dir, vault) = temp_vault("dsh-diary-filter-tags");
+
+        vault.save_entry("2026-09-10", "", "贴了三个标签。").unwrap();
+        vault
+            .set_entry_tags("2026-09-10", &["b".into(), "a".into(), "c".into()])
+            .unwrap();
+
+        let r = vault
+            .filter_entries(&[], &[], None, None, true, None)
+            .unwrap();
+        let hit = filter_find_hit(&r, "2026-09-10").unwrap();
+        assert_eq!(hit.tags, vec!["a", "b", "c"], "标签要按名字排序给出来");
+
+        // 让 "a" 退休：它从可选列表里消失，但**已经贴过它的那篇照旧显示**
+        let a_id = filter_tag_id(&vault, "a");
+        vault.retire_tag(a_id).unwrap();
+        assert!(
+            vault.list_tags().unwrap().iter().all(|t| t.name != "a"),
+            "退休之后不该再出现在可选标签列表里"
+        );
+
+        let after = vault
+            .filter_entries(&[], &[], None, None, true, None)
+            .unwrap();
+        assert_eq!(
+            filter_find_hit(&after, "2026-09-10").unwrap().tags,
+            vec!["a", "b", "c"],
+            "退休不影响『这一篇上挂着什么』"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -14,7 +14,8 @@ use crate::crypto::{self, CryptoMeta, KdfParams, KEY_LEN};
 use crate::db::{
     count_written_entries_readonly, derive_and_verify, non_conflicting_path, parse_backup_stamp,
     prune_backups, AppSettings, Attachment, BackupResult, DayMood, Entry, EntrySummary,
-    ExportResult, IntegrityReport, PruneReport, Recap, SearchHit, Stats, TagStat, Vault,
+    ExportResult, FilterResult, IntegrityReport, PruneReport, Recap, SearchHit, Stats, TagStat,
+    Vault,
 };
 use crate::error::{AppError, AppResult};
 use serde::Serialize;
@@ -837,6 +838,43 @@ pub fn search_entries(
     limit: Option<i64>,
 ) -> AppResult<Vec<SearchHit>> {
     with_vault(&state, |v| v.search(&query, limit.unwrap_or(50)))
+}
+
+// ---------------------------------------------------------------------------
+// 筛选（P2-7）
+// ---------------------------------------------------------------------------
+
+/// 按 **标签 / 心情 / 时间** 捞日记。**纯读**，永远不写库。
+///
+/// 参数全部"空＝不限"：
+///   * `tags`   标签 id（**不是名字** —— 名字能改，id 不会）
+///   * `moods`  1~5；不在这个范围的会被忽略
+///   * `from` / `to`  `'YYYY-MM-DD'`，含两端，只给一个也能用
+///   * `recent_first` 缺省 `true`＝最近优先；`false`＝最早优先
+///   * `limit`  缺省 200，`clamp(1, 500)`
+///
+/// ⚠️ 一律走 `with_vault` ⇒ 没解锁时统一被拒，这里一行都不用写。
+/// ⚠️ **持锁期间绝不能再调一次 `with_vault`**（自死锁，本项目踩过）。
+#[tauri::command]
+pub fn filter_entries(
+    state: State<'_, VaultState>,
+    tags: Vec<i64>,
+    moods: Vec<i64>,
+    from: Option<String>,
+    to: Option<String>,
+    recent_first: Option<bool>,
+    limit: Option<i64>,
+) -> AppResult<FilterResult> {
+    with_vault(&state, |v| {
+        v.filter_entries(
+            &tags,
+            &moods,
+            from.as_deref(),
+            to.as_deref(),
+            recent_first.unwrap_or(true),
+            limit,
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -133,6 +133,10 @@ pub fn run() {
             commands::set_entry_tags,
             commands::rename_tag,
             commands::retire_tag,
+            // 筛选（P2-7）：按标签 / 心情 / 时间捞日记。**纯读**。
+            // ⚠️ 登记在这里是照指令的位置；它同时吃标签与心情两组条件，
+            //    所以既不属于"搜索"也不属于"标签"，单独一条。
+            commands::filter_entries,
             // 维护与备份
             commands::backup_now,
             commands::backup_status,
