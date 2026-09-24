@@ -2153,31 +2153,10 @@ impl Vault {
             .collect::<Result<_, _>>()?;
 
         // 连续天数：**一次遍历同时算出「当前连续」与「最长连续」**。
-        //
-        // 为什么必须一次算完：这两项用的是同一条"相接"判定（`previous_date`）。
-        // 写成两段循环（一段从最近往前、一段从头到尾）就是把同一条规则抄了两份，
-        // 哪天要调"断"的口径，必然只改其中一处 —— 于是两个数字开始互相矛盾，
-        // 而且几乎不会被发现。这就是本项目"判定只实现一次"那条铁律。
-        //
-        // 升序遍历，`run` = 当前这一段连续了多少天：
-        //   - 与上一篇**逐日相接** → run += 1
-        //   - 否则（第一段，或中间断了）→ run 从 1 重新起算
-        // 循环结束时 `run` 就是以**最新一篇收尾**的那一段长度，即"当前连续"；
-        // `longest` 是历史最大值。从未写过时两者都是 0。
-        let mut run = 0i64;
-        let mut longest = 0i64;
-        let mut prev: Option<&str> = None;
-        for d in &dates {
-            match prev {
-                Some(p) if previous_date(d)? == p => run += 1,
-                _ => run = 1,
-            }
-            if run > longest {
-                longest = run;
-            }
-            prev = Some(d);
-        }
-        let streak = run;
+        // 规则本身（以及"为什么必须一次算完"）都收在 `longest_and_current_run` 里，
+        // 这里只负责把"相接"的判定传进去 —— 统计页的口径就是**逐日相接**。
+        let (streak, longest) =
+            longest_and_current_run(&dates, |d, p| Ok(previous_date(d)? == p))?;
 
         // 本周 / 本月写作天数：直接在**已经取出来的日期**上过滤，不再多跑两条 SQL。
         // 日期是定长 ISO 字符串，字典序即时间序，所以能直接比字符串。
@@ -3275,6 +3254,47 @@ fn shift_date(date: &str, delta: i64) -> AppResult<String> {
 /// 前一天的日期字符串。用于连续天数统计。
 fn previous_date(date: &str) -> AppResult<String> {
     shift_date(date, -1)
+}
+
+/// 一次遍历同时算出「当前连续」与「最长连续」。
+///
+/// **为什么两件事必须在同一趟里算**：它们用的是同一条"相接"判定。
+/// 写成两段循环（一段从最近往前、一段从头到尾）就是把同一条规则抄了两份，
+/// 哪天要调"断"的口径，必然只改其中一处 —— 于是两个数字开始互相矛盾，
+/// 而且几乎不会被发现。这就是本项目"判定只实现一次"那条铁律。
+///
+/// `dates` 必须**升序**，元素是定长 ISO 日期串。升序遍历，
+/// `run` = 当前这一段连续了多少天：
+///   - 与上一篇**相接**（由 `is_connected` 判定）→ run += 1
+///   - 否则（第一段，或中间断了）→ run 从 1 重新起算
+/// 循环结束时 `run` 就是以**最新一篇收尾**的那一段长度，即"当前连续"；
+/// `longest` 是历史最大值。从未写过时两者都是 0。
+///
+/// 返回 `(当前连续, 历史最长)`。
+///
+/// ⭐ **"相接"怎么判定由调用方传进来，这里不写死** —— 两处用法不同：
+///    统计页的"连续" ＝ 相邻两天**逐日相接**；
+///    回顾页的"连续同一种心情" ＝ **逐日相接 且 心情相同**。
+///   ⚠️ 返回类型带 `AppResult` 而不是光秃秃一个元组：判定本身要算日期
+///      （`previous_date` 会失败），错误必须照旧往外传，不能吞掉。
+fn longest_and_current_run<F>(dates: &[String], is_connected: F) -> AppResult<(i64, i64)>
+where
+    F: Fn(&str, &str) -> AppResult<bool>,
+{
+    let mut run = 0i64;
+    let mut longest = 0i64;
+    let mut prev: Option<&str> = None;
+    for d in dates {
+        match prev {
+            Some(p) if is_connected(d, p)? => run += 1,
+            _ => run = 1,
+        }
+        if run > longest {
+            longest = run;
+        }
+        prev = Some(d);
+    }
+    Ok((run, longest))
 }
 
 /// 该日期所在周的**周一**（`YYYY-MM-DD`）。
