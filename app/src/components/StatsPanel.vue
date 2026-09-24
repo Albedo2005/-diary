@@ -538,7 +538,8 @@ const streakCard = computed(() => {
       <!-- ── 写作热力图 ─────────────────────────────────────────── -->
       <section class="block">
         <h3>写作热力图</h3>
-        <p class="cap">最近 53 周。颜色只表示那天写了多少</p>
+        <!-- ⛔ 正文（各页面）不写解释性小字 —— 用户 2026-09-24 的规矩：
+             界面上只留数据本身，解释要么不写、要么放设置里。 -->
         <div class="heat">
           <!-- 行标签只标 一 三 五 日 四行 —— 隔行标注省地方，也是用户给的参考图里的做法。 -->
           <div class="heat-days" aria-hidden="true">
@@ -586,9 +587,6 @@ const streakCard = computed(() => {
       <!-- ── 心情分布 ───────────────────────────────────────────── -->
       <section class="block">
         <h3>心情分布</h3>
-        <p class="cap">
-          只有写过正文、并且标了心情的日子才计入（五种心情是并列的类型，不分高低）
-        </p>
         <div class="moods">
           <div v-for="m in moodRows" :key="m.value" class="mood-row">
             <span class="emoji">{{ m.emoji }}</span>
@@ -605,7 +603,6 @@ const streakCard = computed(() => {
       <!-- ── 每月字数 ───────────────────────────────────────────── -->
       <section class="block">
         <h3>每月字数</h3>
-        <p class="cap">最近 {{ MONTHS_SHOWN }} 个月（空月份补 0）</p>
         <div class="months">
           <div
             v-for="m in monthBars"
@@ -627,8 +624,6 @@ const streakCard = computed(() => {
            统计页几块长得像一家人，比多写一套样式值。 -->
       <section class="block">
         <h3>常用标签</h3>
-        <!-- 这句必须写在界面上：用户才敢信两个地方的数字是一回事。 -->
-        <p class="cap">按篇数排序，只算写过的日记（口径与上面"共 N 篇"一致）</p>
 
         <p v-if="tagEmpty" class="empty-note">
           还没有用过标签 —— 写日记时可以在正文下面加标签。
@@ -787,8 +782,7 @@ const streakCard = computed(() => {
   margin: 6px 0 0;
   color: var(--text-2);
 }
-.hint .sub,
-.cap {
+.hint .sub {
   color: var(--text-3);
   font-size: 12px;
   margin: 4px 0 0;
