@@ -2626,3 +2626,272 @@ fn export_rejects_an_empty_destination() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ---------------------------------------------------------------------------
+// 备份恢复（P2-5）
+// ---------------------------------------------------------------------------
+//
+// 恢复是本项目**唯一会覆盖整库**的操作，所以这些用例都按"真造一份备份、
+// 真换一次库"来写。只拼几个假文件是不够的 —— 这个功能出错的形式恰恰是
+// "文件换了一半"或"换完打不开了"，那两种失败只有真开库才看得见。
+
+/// 打一份**完整**的备份（`.db` ＋ 配对的 `.meta.json`），返回 `.db` 路径。
+///
+/// ⚠️ 两个文件必须一起造：只拿 `.db` 的备份**永远打不开**
+///（meta 里存着 salt 与 KDF 参数）。而"用户只拷过来一个文件"正是这个功能
+/// 要防的头号事故，所以后面那个用例会专门验它会被拒绝。
+fn make_backup(
+    data_dir: &std::path::Path,
+    vault: &Vault,
+    backups: &std::path::Path,
+    stamp: &str,
+) -> std::path::PathBuf {
+    std::fs::create_dir_all(backups).unwrap();
+    let db = backups.join(format!("diary-{stamp}.db"));
+    vault.backup_to(&db).expect("备份应成功");
+    std::fs::copy(
+        app_lib::crypto::crypto_meta_path(data_dir),
+        backups.join(format!("diary-{stamp}.meta.json")),
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn restore_puts_the_database_back_to_the_backup() {
+    let dir = temp_dir("restore-basic");
+    let backups = dir.join("backups");
+
+    // ── 造 A 库：3 篇 ──
+    let mut slot: Option<Vault> = Some(Vault::create(&dir, PIN, None).unwrap());
+    {
+        let v = slot.as_ref().unwrap();
+        v.save_entry("2026-09-01", "一", "第一篇").unwrap();
+        v.save_entry("2026-09-02", "二", "第二篇").unwrap();
+        v.save_entry("2026-09-03", "三", "第三篇").unwrap();
+    }
+
+    // ── 打一份备份（这一份代表"那个时刻"）──
+    let backup = make_backup(&dir, slot.as_ref().unwrap(), &backups, "20260903-101010");
+
+    // ── 备份之后继续改 A 库：删一篇、加一篇 ──
+    {
+        let v = slot.as_ref().unwrap();
+        v.delete_entry("2026-09-02").unwrap();
+        v.save_entry("2026-09-04", "四", "第四篇").unwrap();
+        assert_eq!(v.written_entry_count().unwrap(), 3);
+    }
+
+    // ── 恢复 ──
+    // 用**当前密码派生出来的那把钥匙**，正是恢复流程在真实运行时会拿到的东西。
+    let key = app_lib::db::derive_and_verify(&dir, PIN).unwrap();
+    app_lib::commands::restore_core(&dir, &backup, &mut slot, Some(&key)).expect("恢复应成功");
+
+    // ── 篇数与内容都必须回到备份当时 ──
+    let v = slot
+        .as_ref()
+        .expect("用当前密码加密的备份，恢复后应当**仍然解锁**（决定 ②：能开就继续用）");
+    assert_eq!(
+        v.written_dates("0001-01-01", "9999-12-31").unwrap(),
+        vec!["2026-09-01", "2026-09-02", "2026-09-03"],
+        "被删的那篇要回来、备份之后新加的那篇要消失"
+    );
+    assert_eq!(v.open_entry("2026-09-02").unwrap().content_md, "第二篇");
+    assert!(v
+        .written_dates("2026-09-04", "2026-09-04")
+        .unwrap()
+        .is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn restore_leaves_a_usable_pre_restore_snapshot() {
+    let dir = temp_dir("restore-undo");
+    let backups = dir.join("backups");
+
+    let mut slot: Option<Vault> = Some(Vault::create(&dir, PIN, None).unwrap());
+    slot.as_ref()
+        .unwrap()
+        .save_entry("2026-09-01", "一", "旧内容")
+        .unwrap();
+
+    let backup = make_backup(&dir, slot.as_ref().unwrap(), &backups, "20260903-101010");
+
+    // 备份之后又写了点东西 —— 这一篇只存在于"后悔药"里
+    slot.as_ref()
+        .unwrap()
+        .save_entry("2026-09-05", "五", "后来写的")
+        .unwrap();
+
+    let key = app_lib::db::derive_and_verify(&dir, PIN).unwrap();
+    app_lib::commands::restore_core(&dir, &backup, &mut slot, Some(&key)).unwrap();
+
+    // ── 后悔药必须**成组**出现 ──
+    let pre = backups.join("pre-restore");
+    let dbs: Vec<String> = std::fs::read_dir(&pre)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".db"))
+        .collect();
+    assert_eq!(dbs.len(), 1, "应恰好留下这一份后悔药：{dbs:?}");
+
+    let undo_db = pre.join(&dbs[0]);
+    let undo_meta = pre.join(dbs[0].replace(".db", ".meta.json"));
+    assert!(
+        undo_meta.is_file(),
+        "后悔药必须连同 .meta.json 一起留 —— 只留 .db 的后悔药同样打不开"
+    );
+
+    // ── ⭐ 最重要的一条：后悔药本身必须能用 ──
+    // 恢复完之后，库里只有备份当时那一篇；把它再恢复一次，就该把"后来写的那篇"找回来。
+    app_lib::commands::restore_core(&dir, &undo_db, &mut slot, Some(&key))
+        .expect("后悔药本身必须是一份可用的备份");
+    let v = slot.as_ref().unwrap();
+    assert_eq!(v.written_entry_count().unwrap(), 2);
+    assert_eq!(v.open_entry("2026-09-05").unwrap().content_md, "后来写的");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn restore_refuses_a_backup_without_its_meta_and_changes_nothing() {
+    let dir = temp_dir("restore-no-meta");
+    let backups = dir.join("backups");
+
+    let mut slot: Option<Vault> = Some(Vault::create(&dir, PIN, None).unwrap());
+    slot.as_ref()
+        .unwrap()
+        .save_entry("2026-09-01", "一", "原样")
+        .unwrap();
+
+    let backup = make_backup(&dir, slot.as_ref().unwrap(), &backups, "20260903-101010");
+    // 把配对的 meta 改名 —— 模拟"用户只把 .db 拷了过来"
+    std::fs::rename(
+        backups.join("diary-20260903-101010.meta.json"),
+        backups.join("diary-20260903-101010.meta.json.bak"),
+    )
+    .unwrap();
+
+    let live = dir.join("diary.db");
+    let before = std::fs::read(&live).unwrap();
+
+    let key = app_lib::db::derive_and_verify(&dir, PIN).unwrap();
+    let err = app_lib::commands::restore_core(&dir, &backup, &mut slot, Some(&key))
+        .expect_err("缺配对的 meta 必须被拒绝");
+    assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+
+    // ⭐ 被拒绝时**当前库一个字节都不能动**（逐字节比，不用哈希 —— 库就几十 KB）
+    assert_eq!(
+        std::fs::read(&live).unwrap(),
+        before,
+        "校验失败时当前库必须原封不动"
+    );
+    // 而且连接不能因为一次失败的恢复就被丢掉
+    assert_eq!(
+        slot.as_ref().expect("被拒绝不该把连接丢掉")
+            .open_entry("2026-09-01")
+            .unwrap()
+            .content_md,
+        "原样"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn restore_of_a_foreign_backup_keeps_the_vault_locked() {
+    let dir = temp_dir("restore-foreign");
+    let other = temp_dir("restore-foreign-src");
+    let backups = dir.join("backups");
+
+    // ── 另造一份"别人的库"：密码不一样 ──
+    let other_slot: Option<Vault> = Some(Vault::create(&other, "246810", None).unwrap());
+    other_slot
+        .as_ref()
+        .unwrap()
+        .save_entry("2026-08-08", "他", "别人写的")
+        .unwrap();
+    let foreign = make_backup(
+        &other,
+        other_slot.as_ref().unwrap(),
+        &backups,
+        "20260808-080808",
+    );
+
+    // ── 本地库，并且免密打开是**开着**的 ──
+    let mut slot: Option<Vault> = Some(Vault::create(&dir, PIN, None).unwrap());
+    slot.as_ref()
+        .unwrap()
+        .save_entry("2026-09-01", "一", "本地的")
+        .unwrap();
+    let auto_path = app_lib::crypto::auto_login_path(&dir);
+    app_lib::crypto::AutoLogin::new(&app_lib::db::derive_and_verify(&dir, PIN).unwrap())
+        .save(&auto_path)
+        .unwrap();
+    assert!(auto_path.exists());
+
+    // ── 用**本地密码**的钥匙去恢复"别人的备份" —— 当然打不开 ──
+    let key = app_lib::db::derive_and_verify(&dir, PIN).unwrap();
+    app_lib::commands::restore_core(&dir, &foreign, &mut slot, Some(&key))
+        .expect("恢复本身应当成功（文件换得动），只是恢复后打不开");
+
+    // ⭐ 打不开就绝不能装着打开
+    assert!(slot.is_none(), "打不开的库绝不能留在解锁态");
+    // ⭐ 那把已经配不上的免密钥匙必须清掉 —— 留着会让下次启动白失败一次，
+    //    而用户的第一个念头永远是"我密码被改了 / 软件坏了"
+    assert!(!auto_path.exists(), "配不上的免密钥匙必须删掉");
+
+    // ── 但用**它自己的密码**必须能打开恢复过来的库 ──
+    let v = Vault::unlock(&dir, "246810").expect("恢复后的库应能用它当时那个密码打开");
+    assert_eq!(v.open_entry("2026-08-08").unwrap().content_md, "别人写的");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&other);
+}
+
+#[test]
+fn copy_tree_never_overwrites_and_walks_subdirectories() {
+    let dir = temp_dir("copy-tree");
+    let src = dir.join("backups");
+    let dst = dir.join("elsewhere").join("backups");
+    std::fs::create_dir_all(src.join("pre-restore")).unwrap();
+    std::fs::write(src.join("diary-20260903-101010.db"), b"AAA").unwrap();
+    std::fs::write(src.join("diary-20260903-101010.meta.json"), b"{}").unwrap();
+    std::fs::write(
+        src.join("pre-restore").join("diary-20260801-000000.db"),
+        b"OLD",
+    )
+    .unwrap();
+
+    // 目标里先放一个**同名**文件 —— 它必须原封不动（"复制"不是"同步"）
+    std::fs::create_dir_all(&dst).unwrap();
+    std::fs::write(dst.join("diary-20260903-101010.db"), b"KEEP").unwrap();
+
+    let mut copied = 0usize;
+    let mut bytes = 0u64;
+    app_lib::commands::copy_tree(&src, &dst, &mut copied, &mut bytes).unwrap();
+
+    assert_eq!(
+        std::fs::read(dst.join("diary-20260903-101010.db")).unwrap(),
+        b"KEEP",
+        "目标里已有的同名文件绝不能被覆盖"
+    );
+    assert!(
+        dst.join("diary-20260903-101010 (1).db").exists(),
+        "重名要加「 (1)」后缀（与导出同一口径）"
+    );
+    assert!(
+        dst.join("pre-restore")
+            .join("diary-20260801-000000.db")
+            .exists(),
+        "pre-restore 子目录也要跟着搬 —— 漏了它等于「后悔药没备份出去」"
+    );
+    assert_eq!(copied, 3, "三个源文件都要有落点");
+    // 源一个都不能少（这是复制，不是搬家）
+    assert!(src.join("diary-20260903-101010.db").exists());
+    assert!(src.join("pre-restore").join("diary-20260801-000000.db").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+

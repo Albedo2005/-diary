@@ -10,9 +10,10 @@
 //! 未解锁时是 None，此时任何数据操作都返回 `State` 错误 ——
 //! 这样即使前端被绕过，也拿不到数据，因为密钥只在解锁后的连接里。
 
-use crate::crypto::{self, CryptoMeta, KdfParams};
+use crate::crypto::{self, CryptoMeta, KdfParams, KEY_LEN};
 use crate::db::{
-    derive_and_verify, AppSettings, Attachment, BackupResult, DayMood, Entry, EntrySummary,
+    count_written_entries_readonly, derive_and_verify, non_conflicting_path, parse_backup_stamp,
+    prune_backups, AppSettings, Attachment, BackupResult, DayMood, Entry, EntrySummary,
     ExportResult, IntegrityReport, PruneReport, SearchHit, Stats, TagStat, Vault,
 };
 use crate::error::{AppError, AppResult};
@@ -70,6 +71,15 @@ pub struct AppStatus {
     ///    应用启动时就会把这个目录建好（见 lib.rs 的 setup），
     ///    所以"打开文件夹"在任何时候都点得动。
     pub attachments_dir: String,
+    /// 「后悔药」目录（`<数据目录>/backups/pre-restore/`）。
+    ///
+    /// 每次恢复备份前，软件会把**当前这份库**连 meta 一起快照到这里
+    /// （见 `restore_core` 的第 ② 步）。恢复确认弹窗要把它**原样写出来**
+    /// 并给一个「打开文件夹」—— 那是用户按下"替换"之前最后一件想知道的事。
+    ///
+    /// 和 `export_default_dir` 同一个理由放在这里：目录规则住在后端，
+    /// 前端再拼一份就成了两处各算各的。它同样只是一段路径文本。
+    pub pre_restore_dir: String,
 }
 
 /// 全局可共享的应用状态。
@@ -192,6 +202,25 @@ pub fn default_export_dir(data_dir: &Path) -> PathBuf {
     }
 }
 
+/// ⭐ **不走 `with_vault` 的例外清单**（改代码前先看这张表）。
+///
+/// 绝大多数命令都必须走 `with_vault` —— 它把"未解锁就拒绝"这件事收在一处，
+/// 免得某条命令漏判、被绕过前端直接调用时读到了数据。**例外必须逐条有理由**，
+/// 而且理由永远是下面三类之一：
+///
+/// | 命令 | 为什么可以不持锁 |
+/// |---|---|
+/// | `app_status` | 它要回答的正是"现在锁着没有"，未解锁是它的正常输入 |
+/// | `estimate_kdf_ms` | 纯常量：报一个 KDF 参数，不碰库 |
+/// | `initialize_vault` | 此刻库**本来**就不存在，不存在"已解锁"这回事 |
+/// | `unlock_vault` | 它就是来解锁的，持锁判断在它内部自己做 |
+/// | `lock_vault` | 它就是来上锁的，且必须能把连接置成 `None` |
+/// | `unlock_with_auto_key` / `enable_auto_login` / `disable_auto_login` | 三条的凭证是**用户输入的密码**（或库外的钥匙文件），与连接在不在无关 |
+/// | `list_backups` / `crypto_info` / `reveal_dir` | 只读**库外文件**或打开一个目录，不碰日记内容 |
+/// | `inspect_backup` / `restore_backup` / `copy_backups_to` | 见下面「备份恢复」那一段的说明 |
+///
+/// ⚠️ 新增例外时，**同时**把它加进这张表 —— 否则下一个人只能靠通读代码
+///    来判断"这条为什么不持锁"，而最省事的猜测永远是"忘了写"。
 fn with_vault<T>(state: &State<'_, VaultState>, f: impl FnOnce(&Vault) -> AppResult<T>) -> AppResult<T> {
     let guard = state
         .vault()
@@ -246,6 +275,10 @@ pub fn app_status(state: State<'_, VaultState>) -> AppResult<AppStatus> {
         attachments_dir: state
             .data_dir()
             .join("attachments")
+            .to_string_lossy()
+            .to_string(),
+        pre_restore_dir: default_backup_dir(state.data_dir())
+            .join("pre-restore")
             .to_string_lossy()
             .to_string(),
     })
@@ -1107,20 +1140,445 @@ pub fn list_backups(dest_dir: String) -> AppResult<Vec<BackupResult>> {
             continue;
         }
         let meta = item.metadata()?;
-        let created_at = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
+        let name = path.to_string_lossy().to_string();
+        // 时间**优先从文件名解析**（P2-5 统一口径，与 `inspect_backup` 一致）：
+        // 备份一定会被拷来拷去，一拷 mtime 就变成"拷回来的那一刻"，
+        // 而文件名里的时间戳不变。mtime 只作兜底 —— 用户手工改过名时还能排个序。
+        let created_at = parse_backup_stamp(&name)
+            .or_else(|| {
+                meta.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+            })
             .unwrap_or(0);
         out.push(BackupResult {
-            path: path.to_string_lossy().to_string(),
+            path: name,
             bytes: meta.len(),
             created_at,
         });
     }
     out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// 备份恢复（P2-5）
+// ---------------------------------------------------------------------------
+//
+// 这是全项目**唯一会覆盖整库**的一组操作，所以写法比别处更保守：
+//   · 任何一步失败都不留"半成品" —— 宁可维持原状，也不给一个半新半旧的库；
+//   · 先用同目录的临时文件把两份产物备齐，最后才**原子换名**（不是往 diary.db 上盖）；
+//   · 换库之前一定先留一份"后悔药"（`backups/pre-restore/`）。
+//
+// ⚠️ 这三条命令**都不走 `with_vault`**（见上面那张例外清单）：
+//    · `inspect_backup` —— "换电脑"那个场景里界面停在「创建密码」，根本没有密码，
+//      它必须能在未解锁时也给出信息，而它本身是纯只读的；
+//    · `restore_backup` —— 它**自己操作那把锁**，中途还要把连接置成 `None`。
+//      交给 `with_vault` 会当场自死锁（持锁期间再取同一把锁）；
+//    · `copy_backups_to` —— 搬的是**密文文件**，与库里的内容无关。
+
+/// 一份备份的体检报告（`inspect_backup` 的返回）。
+#[derive(Debug, Clone, Serialize)]
+pub struct BackupInfo {
+    pub db_path: String,
+    /// 配对的可选 meta 文件（`<同 stem>.meta.json`）。
+    pub meta_path: String,
+    /// 配对的 meta 在不在。**false ＝ 这份备份永远打不开**。
+    ///
+    /// 理由：meta 里存着 salt 与 KDF 参数，缺了它**即使密码完全正确**
+    /// 也派生不出密钥。所以"缺 meta"不是警告级别的问题，是死刑。
+    pub meta_found: bool,
+    pub bytes: u64,
+    /// 备份时间（Unix 秒）。优先从**文件名**解析，解析不出才用 mtime 兜底。
+    pub created_at: u64,
+    /// 备份里的篇数。`None` ＝ 读不出来（**绝不编一个数**）。
+    pub entry_count: Option<usize>,
+    /// 用当前这把钥匙能不能打开它。
+    pub openable_now: bool,
+    /// ⭐ 此刻**手里有没有**可用的钥匙去做上面那两个判断。
+    ///
+    /// 为什么必须单独给这个字段：`entry_count = None` 有两种完全不同的原因 ——
+    /// ① 手里根本没有钥匙（免密没开、库也锁着）；② 有钥匙，但打不开这份备份。
+    /// 前者是"我们不知道"，后者是"它不是用你现在的密码加密的"。
+    /// 界面上必须分开说，否则用户会以为自己密码记错了。
+    pub key_available: bool,
+}
+
+/// 备份主文件配对的 meta 文件路径：**同 stem 换后缀**。
+///
+/// 这个配对规则是备份的立身之本（`run_backup` 造 `.db`、`copy_crypto_meta`
+/// 造 `.meta.json`），检查、恢复、后悔药三处都靠它 —— 所以只写这一份。
+fn paired_meta_path(db_path: &Path) -> PathBuf {
+    let stem = db_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    db_path.with_file_name(format!("{stem}.meta.json"))
+}
+
+/// 取"当前这把钥匙"，用来试开备份。**用完必须 `crypto::zeroize` 掉。**
+///
+/// 两个来源，优先级从高到低：
+///   1. **已解锁的连接** —— 它就是"当前密码对应的那把"，最准；
+///   2. **库外的免密钥匙文件**（`data/auto_login.json`）—— 库锁着时也读得到，
+///      内容同样是"上一次解锁成功的那把钥匙"。
+/// 都没有 ⇒ `None`（免密没开、库也锁着）。
+///
+/// ⚠️ 它读的是**内存里已有的钥匙**或**库外文件**，从不向用户索要密码 ——
+///    恢复流程里不该多出一次"再输一遍密码"，那正是本功能要消灭的麻烦。
+fn current_session_key(state: &VaultState) -> Option<[u8; KEY_LEN]> {
+    if let Ok(guard) = state.vault().lock() {
+        if let Some(v) = guard.as_ref() {
+            return Some(*v.session_key());
+        }
+    }
+    match crypto::AutoLogin::load(&crypto::auto_login_path(state.data_dir())) {
+        Ok(Some(al)) => al.key().ok(),
+        _ => None,
+    }
+}
+
+/// 把一份备诉说清楚 —— **纯只读，一个字节都不写**。
+///
+/// 前端在用户按下"恢复"之前调它，把确认弹窗里那几行填上。
+///
+/// ⚠️ 「纯只读」是硬要求（坑 12）：一旦"先看一眼"变成有副作用的操作，
+///    用户就不敢看了 —— 而这个弹窗的全部意义正是让他**敢看**。
+///    它只用到 `metadata()` 和一个 `SQLITE_OPEN_READ_ONLY` 连接。
+#[tauri::command]
+pub fn inspect_backup(state: State<'_, VaultState>, db_path: String) -> AppResult<BackupInfo> {
+    let path = PathBuf::from(db_path.trim());
+    let meta = paired_meta_path(&path);
+
+    let fm = std::fs::metadata(&path).map_err(|_| {
+        AppError::Validation(format!("找不到这个文件：{}", path.to_string_lossy()))
+    })?;
+    if !fm.is_file() {
+        return Err(AppError::Validation(format!(
+            "这不是一个文件：{}",
+            path.to_string_lossy()
+        )));
+    }
+
+    let name = path.to_string_lossy().to_string();
+    // 与 `list_backups` 同一个口径：文件名优先，mtime 兜底。
+    let created_at = parse_backup_stamp(&name)
+        .or_else(|| {
+            fm.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+        })
+        .unwrap_or(0);
+
+    let meta_found = meta.is_file();
+    let mut key = current_session_key(&state);
+    let key_available = key.is_some();
+
+    // meta 不在 ⇒ 已经能确定它开不了，不必再费一次解密（那一下并不便宜）。
+    let (entry_count, openable_now) = match (key.as_ref(), meta_found) {
+        (Some(k), true) => match count_written_entries_readonly(&path, k) {
+            Ok(n) => (Some(n as usize), true),
+            // 打得开库却读不出篇数（例如备份来自更老的版本、表结构不同）——
+            // 一律按"读不出"处理，**不猜、不估**。
+            Err(_) => (None, false),
+        },
+        _ => (None, false),
+    };
+
+    if let Some(k) = key.as_mut() {
+        crypto::zeroize(k);
+    }
+
+    Ok(BackupInfo {
+        db_path: name,
+        meta_path: meta.to_string_lossy().to_string(),
+        meta_found,
+        bytes: fm.len(),
+        created_at,
+        entry_count,
+        openable_now,
+        key_available,
+    })
+}
+
+/// 「后悔药」目录最多留几份。
+///
+/// 为什么必须有上限：每次恢复都留一份整库快照，反复试几次就会攒出一堆副本。
+/// 5 份足够覆盖真实场景 ——"试了几次都不满意、想退回最开始那样"。
+///
+/// ⚠️ 清理复用**同一条**保留策略（`db::prune_backups`），它会连配对的
+///    `.meta.json` 一起删。单独删 `.db` 会留下一个永远打不开的孤儿 meta。
+pub const PRE_RESTORE_KEEP: usize = 5;
+
+/// 恢复的核心流程 —— **不依赖 Tauri 状态**，集成测试可以直接驱动它。
+///
+/// `slot` 就是"当前已解锁连接"那个槽位（与 `VaultState` 里是同一个 `Mutex`）。
+/// 第 ④ 步会把它置成 `None`，试开成功后再填回去 ——
+/// 所以调用方在整个过程中**必须一直持有那把锁**：否则别的命令会在
+/// "库文件正被替换"的中间插进来读写，读到什么全看运气。
+///
+/// 七步，顺序就是设计：
+///   ① 校验（一个字节都不动）→ ② 留后悔药 → ③ 备好临时文件 →
+///   ④ 关连接 → ⑤ 清 WAL 残留 → ⑥ 原子换名 → ⑦ 试开、按结果收尾
+///
+/// ⚠️ 与最初的设计（"先关连接、再复制"）有一处**故意的不同**，理由是那条
+///    "绝不允许半成品"的禁令：原写法里，复制第二个文件（meta）失败会留下
+///    "库换了、meta 没换"的死状态 —— 那个库**谁也打不开**。
+///    改成"先备好两份临时文件、最后原子换名"之后，复制阶段出问题主库纹丝未动，
+///    而 rename 是同目录内的原子操作，中间几乎不存在失败窗口。
+pub fn restore_core(
+    data_dir: &Path,
+    src_db: &Path,
+    slot: &mut Option<Vault>,
+    key: Option<&[u8; KEY_LEN]>,
+) -> AppResult<()> {
+    let src_meta = paired_meta_path(src_db);
+    let live_db = data_dir.join("diary.db");
+    let live_meta = crypto::crypto_meta_path(data_dir);
+
+    // ── ① 校验：任何一条不过都在这里结束，一个字节都没动 ──
+    if !src_db.is_file() {
+        return Err(AppError::Validation(format!(
+            "找不到备份文件：{}",
+            src_db.to_string_lossy()
+        )));
+    }
+    if src_db == live_db {
+        return Err(AppError::Validation(
+            "这就是当前正在用的日记库 —— 从这里恢复等于让软件覆盖自己。请选 backups 目录里的那一份。"
+                .into(),
+        ));
+    }
+    if !src_meta.is_file() {
+        return Err(AppError::Validation(format!(
+            "缺少配对的 {}。备份永远是「.db ＋ .meta.json」两个文件一组，\
+             少一个就永久打不开（缺它即使密码完全正确也派生不出密钥）。",
+            src_meta
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        )));
+    }
+    if std::fs::metadata(src_db)?.len() == 0 {
+        return Err(AppError::Validation(
+            "这个备份文件是空的，恢复它只会得到一片空白".into(),
+        ));
+    }
+
+    // ── ② 后悔药（仅已解锁时；未初始化时没有东西可保）──
+    if let Some(v) = slot.as_ref() {
+        let pre = default_backup_dir(data_dir).join("pre-restore");
+        std::fs::create_dir_all(&pre)?;
+        let stamp = now_stamp();
+        // 复用现成的备份实现（`backup_to` 内部走 VACUUM INTO），**不新写一套**。
+        v.backup_to(&pre.join(format!("diary-{stamp}.db")))?;
+        // ⚠️ 当时的 crypto_meta.json 必须一起留：只留 .db 的后悔药同样打不开。
+        std::fs::copy(&live_meta, pre.join(format!("diary-{stamp}.meta.json")))?;
+        let _ = prune_backups(&pre, PRE_RESTORE_KEEP);
+    }
+
+    // ── ③ 备好临时文件（此刻主库还被连接用着，什么都还没换）──
+    let tmp_db = data_dir.join("diary.db.restoring");
+    let tmp_meta = data_dir.join("crypto_meta.json.restoring");
+    let prep = std::fs::copy(src_db, &tmp_db).and_then(|_| std::fs::copy(&src_meta, &tmp_meta));
+    if let Err(e) = prep {
+        let _ = std::fs::remove_file(&tmp_db);
+        let _ = std::fs::remove_file(&tmp_meta);
+        return Err(AppError::State(format!(
+            "准备替换文件失败：{e}。当前日记没有任何改动。"
+        )));
+    }
+
+    // ── ④ 关连接：Windows 上文件被占用就换不了名 ──
+    *slot = None;
+
+    // ── ⑤ 清 WAL 残留：它们属于**旧库**，留在同名新库旁边会被当成新库的一部分 ──
+    for suffix in ["diary.db-wal", "diary.db-shm"] {
+        let p = data_dir.join(suffix);
+        if p.exists() {
+            if let Err(e) = std::fs::remove_file(&p) {
+                let _ = std::fs::remove_file(&tmp_db);
+                let _ = std::fs::remove_file(&tmp_meta);
+                return Err(AppError::State(format!(
+                    "清理 {} 失败：{e}。日记没有被改动，请先关掉可能正在占用它的程序再重试。",
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                )));
+            }
+        }
+    }
+
+    // ── ⑥ 原子换名（同目录内 rename：不存在"复制到一半"的中间态）──
+    if let Err(e) = std::fs::rename(&tmp_db, &live_db) {
+        let _ = std::fs::remove_file(&tmp_db);
+        let _ = std::fs::remove_file(&tmp_meta);
+        return Err(AppError::State(format!(
+            "替换日记库失败：{e}。日记没有被改动。"
+        )));
+    }
+    if let Err(e) = std::fs::rename(&tmp_meta, &live_meta) {
+        // 几乎不可能失败（同目录、同文件系统），真发生了也要说清楚
+        // "库已经换好了、元信息没换"，并把补救办法一并给出。
+        return Err(AppError::State(format!(
+            "日记库已换成备份里的那份，但加密元信息替换失败：{e}。\
+             元信息暂时留在 {} —— 请再恢复一次这份备份。",
+            tmp_meta.to_string_lossy()
+        )));
+    }
+
+    // ── ⑦ 试开一次：能开就装回去继续用；开不了就扔掉那把已经配不上的钥匙 ──
+    if let Some(k) = key {
+        match Vault::unlock_with_key(data_dir, k) {
+            Ok(v) => *slot = Some(v),
+            Err(_) => {
+                // 多半是"这份备份当时用的是另一个密码"。
+                // 免密钥匙此刻已经对不上这个库，留着只会让下次启动白失败一次。
+                let _ = crypto::AutoLogin::clear(&crypto::auto_login_path(data_dir));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 用一份备份**替换**当前整个库，返回恢复后的应用状态。
+///
+/// 那七步都在 `restore_core` 里；这里只做"接线"：
+///   取钥匙 → 持锁 → 调核心 → 放锁 → 擦掉内存里的钥匙副本 → 回一份新状态。
+///
+/// ⚠️ 全程**只取一次** `vault()` 锁，并一直持有到核心流程结束。
+///    持锁期间**绝不能**再调 `with_vault`（同一把锁，当场自死锁）。
+///    最后回状态那句必须在 `drop(guard)` **之后** —— `app_status` 自己也要取这把锁。
+///
+/// ⚠️ 不需要为后台自动备份线程做任何事：它每 5 分钟醒一次、醒来先要这把锁，
+///    自然会被挡在门外。**别为它再加第二把锁** —— 那只会多一个死锁的机会。
+#[tauri::command]
+pub fn restore_backup(state: State<'_, VaultState>, db_path: String) -> AppResult<AppStatus> {
+    let data_dir = state.data_dir().clone();
+    let src = PathBuf::from(db_path.trim());
+
+    // 取钥匙必须在**丢掉旧连接之前** —— 之后就只能靠库外那把了。
+    let mut guard = state
+        .vault()
+        .lock()
+        .map_err(|_| AppError::State("内部状态锁已损坏".into()))?;
+    let mut key = guard
+        .as_ref()
+        .map(|v| *v.session_key())
+        .or_else(|| {
+            crypto::AutoLogin::load(&crypto::auto_login_path(&data_dir))
+                .ok()
+                .flatten()
+                .and_then(|al| al.key().ok())
+        });
+
+    let outcome = restore_core(&data_dir, &src, &mut guard, key.as_ref());
+
+    // 锁必须在这里立刻放开：`app_status` 与后续任何命令都要用它。
+    drop(guard);
+    if let Some(k) = key.as_mut() {
+        crypto::zeroize(k);
+    }
+    outcome?;
+
+    app_status(state)
+}
+
+/// 「复制备份到…」的结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct CopyBackupsResult {
+    pub copied: usize,
+    pub bytes: u64,
+    /// 实际写入的目标目录（已规范化，便于界面如实回显"到底写到哪了"）。
+    pub dest_dir: String,
+}
+
+/// 把整个 `backups/` 目录复制到别处（含 `pre-restore/`）。
+///
+/// 为什么需要它：备份目录躺在**数据目录里面**（`default_backup_dir`），
+/// 也就是说备份和日记在**同一块硬盘**上 —— 这只能防手滑，防不了硬盘坏掉、
+/// 系统重装、误格盘。而用户自己手动复制必然踩两个坑：
+/// 漏掉 `pre-restore/`、以及把目标里已有的备份覆盖掉。
+///
+/// 三条硬规矩：
+///   · **绝不覆盖**目标里已有的文件 —— 重名加 ` (1)` / ` (2)` 后缀
+///     （复用导出那套 `non_conflicting_path`：同一口径只留一份实现）；
+///   · **绝不删源** —— 这是"复制"，不是"搬家"；
+///   · 目标**不许落在数据目录内部** —— 那等于搬到了自己家里。
+///
+/// ⚠️ 不需要解锁（搬的是密文文件），所以不走 `with_vault`。
+#[tauri::command]
+pub fn copy_backups_to(
+    state: State<'_, VaultState>,
+    dest_dir: String,
+) -> AppResult<CopyBackupsResult> {
+    let data_dir = state.data_dir().clone();
+    let src = default_backup_dir(&data_dir);
+    if !src.is_dir() {
+        return Err(AppError::Validation(
+            "还没有任何备份 —— 先在【数据与备份】里点一次「立即备份」".into(),
+        ));
+    }
+
+    let dest_input = PathBuf::from(dest_dir.trim());
+    if dest_input.as_os_str().is_empty() {
+        return Err(AppError::Validation("请填一个目标目录".into()));
+    }
+    std::fs::create_dir_all(&dest_input)?;
+    if !dest_input.is_dir() {
+        return Err(AppError::Validation(format!(
+            "目标路径不是一个目录：{}",
+            dest_input.to_string_lossy()
+        )));
+    }
+
+    // 规范化之后才比得了"在不在数据目录里面"（路径里可能有 `..` 或符号链接）。
+    let canon_dest = std::fs::canonicalize(&dest_input)?;
+    let canon_data = std::fs::canonicalize(&data_dir).unwrap_or_else(|_| data_dir.clone());
+    if canon_dest.starts_with(&canon_data) {
+        return Err(AppError::Validation(
+            "目标目录不能放在数据目录里面 —— 那样并没有搬到别处，硬盘一坏还是一起没。".into(),
+        ));
+    }
+
+    let mut copied = 0usize;
+    let mut bytes = 0u64;
+    copy_tree(&src, &canon_dest.join("backups"), &mut copied, &mut bytes)?;
+
+    Ok(CopyBackupsResult {
+        copied,
+        bytes,
+        dest_dir: canon_dest.to_string_lossy().to_string(),
+    })
+}
+
+/// 递归复制一棵目录树，**绝不覆盖**同名文件。
+///
+/// 只处理普通文件与目录：符号链接会被跳过（`DirEntry::file_type()` 返回的是
+/// 链接本身的类型，不跟随）—— 跟着链接走可能绕进一个巨大的目录，
+/// 甚至绕回自己造成无限递归。
+///
+/// `pub` 是为了让集成测试能直接驱动它 —— 与 `unlock_via_auto_login` /
+/// `change_password_core` 同一个理由：这一段的"绝不覆盖"如果写错，
+/// 用户的目标目录里会悄无声息地少掉旧备份。
+pub fn copy_tree(src: &Path, dest: &Path, copied: &mut usize, bytes: &mut u64) -> AppResult<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let to = dest.join(entry.file_name());
+        if ty.is_dir() {
+            copy_tree(&entry.path(), &to, copied, bytes)?;
+        } else if ty.is_file() {
+            let final_to = non_conflicting_path(&to)?;
+            std::fs::copy(entry.path(), &final_to)?;
+            *copied += 1;
+            *bytes += std::fs::metadata(&final_to).map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]

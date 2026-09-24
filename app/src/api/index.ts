@@ -62,6 +62,16 @@ export interface AppStatus {
    * 附件是**明文**文件（用户已知风险），所以位置必须让用户看得见。
    */
   attachments_dir: string;
+  /**
+   * 「后悔药」目录（`<数据目录>/backups/pre-restore/`）。
+   *
+   * 每次恢复备份前，软件会把**当前这份库**连同 meta 一起快照到这里。
+   * 恢复确认弹窗要把它原样写出来（并配「打开文件夹」）—— 那是用户按下
+   * "替换"之前最后想知道的一件事。
+   *
+   * 与 `export_default_dir` 同理：规则住在后端，前端不要自己拼路径。
+   */
+  pre_restore_dir: string;
 }
 
 export interface Entry {
@@ -224,6 +234,40 @@ export interface IntegrityReport {
   orphan_char_index: number;
   missing_word_index: number;
   missing_char_index: number;
+}
+
+/** 一份备份的体检报告（对应后端 `commands::BackupInfo`）。恢复前的确认弹窗用它。 */
+export interface BackupInfo {
+  /** 备份主文件（`.db`）的完整路径。 */
+  db_path: string;
+  /** 配对的 `.meta.json` 的完整路径。 */
+  meta_path: string;
+  /** 配对的 meta 在不在。**false ＝ 这份备份永远打不开。** */
+  meta_found: boolean;
+  bytes: number;
+  /** 备份时间（Unix 秒）。优先来自**文件名**，不是文件的修改时间。 */
+  created_at: number;
+  /** 备份里的篇数。`null` ＝ 读不出来（**后端不会编一个数**）。 */
+  entry_count: number | null;
+  /** 用当前这把钥匙能不能打开它。 */
+  openable_now: boolean;
+  /**
+   * 此刻手里**有没有**可用的钥匙去判断上面那两项。
+   *
+   * ⚠️ 必须与 `entry_count === null` 分开用：前者是"我们不知道"
+   *    （没开免密、库也锁着），后者是"它不是用你现在的密码加密的"。
+   *    界面上混成一句话，用户会以为自己密码记错了。
+   */
+  key_available: boolean;
+}
+
+/** 「复制备份到…」的结果。 */
+export interface CopyBackupsResult {
+  /** 复制过去的文件个数（含 `pre-restore/` 里的）。 */
+  copied: number;
+  bytes: number;
+  /** 实际写入的目录（已规范化，便于界面如实回显"写到哪了"）。 */
+  dest_dir: string;
 }
 
 export interface CryptoInfo {
@@ -605,6 +649,42 @@ export const setAutoBackup = (enabled: boolean) =>
 
 export const listBackups = (destDir: string) =>
   invoke<BackupResult[]>("list_backups", { destDir });
+
+/**
+ * 把一份备份说清楚 —— **纯只读**，不会创建、移动、删除任何文件。
+ *
+ * 恢复前的确认弹窗靠它填内容（时间 / 大小 / 篇数 / 能不能用当前密码打开）。
+ *
+ * ⚠️ **未解锁时也能调**：换电脑那个场景里界面还停在「创建密码」，
+ *    那时没有任何密码可输 —— 后端会返回 `key_available: false`，
+ *    而非报错。
+ */
+export const inspectBackup = (dbPath: string) =>
+  invoke<BackupInfo>("inspect_backup", { dbPath });
+
+/**
+ * 用一份备份**替换**当前整个库。
+ *
+ * ⚠️ 全应用唯一会覆盖整库的操作。调用前必须做到两件事：
+ *    ① 用户明确确认过（见 `RestoreDialog`）；
+ *    ② **先 `flushNow()`** 把编辑器里没保存的正文落库 ——
+ *       否则连"后悔药"里都没有最后那几秒写的东西。
+ *
+ * 返回**恢复后**的状态，前端直接拿它覆盖，不用再查一次。
+ * 若那份备份不是当前密码加密的，返回的 `unlocked` 会是 `false`（回解锁页）。
+ */
+export const restoreBackup = (dbPath: string) =>
+  invoke<AppStatus>("restore_backup", { dbPath });
+
+/**
+ * 把整个 `backups/` 目录复制到别的盘（含 `pre-restore/`）。
+ *
+ * 补的是"备份和日记在同一块硬盘上"这个缺口：那块盘坏了，备份陪葬。
+ * ⚠️ **绝不覆盖**目标里已有的文件（重名加 ` (1)` 后缀），也**绝不删源**。
+ * 目标目录不能落在数据目录内部 —— 后端会拒绝并说明原因。
+ */
+export const copyBackupsTo = (destDir: string) =>
+  invoke<CopyBackupsResult>("copy_backups_to", { destDir });
 
 export const integrityCheck = () => invoke<IntegrityReport>("integrity_check");
 

@@ -135,6 +135,14 @@ pub fn run() {
             commands::backup_status,
             commands::set_auto_backup,
             commands::list_backups,
+            // 备份恢复（P2-5）—— 全项目唯一会覆盖整库的操作。
+            // 三条都不走 with_vault（理由见 commands.rs 里那张例外清单）：
+            //   inspect_backup   纯只读，未解锁时也必须能给信息
+            //   restore_backup   自己操作那把锁，中途还要把连接置成 None
+            //   copy_backups_to  搬的是密文文件，与库里的内容无关
+            commands::inspect_backup,
+            commands::restore_backup,
+            commands::copy_backups_to,
             commands::integrity_check,
             commands::rebuild_indexes,
             commands::crypto_info,

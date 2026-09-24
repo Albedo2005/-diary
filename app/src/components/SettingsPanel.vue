@@ -35,6 +35,7 @@ import pkg from "../../package.json";
 import {
   AUTO_LOCK_OPTIONS,
   changePassword,
+  copyBackupsTo,
   disableAutoLogin,
   enableAutoLogin,
   exportMarkdown,
@@ -47,6 +48,7 @@ import {
   type AppStatus,
   type BackupStatus,
   type ChangePasswordResult,
+  type CopyBackupsResult,
   type CryptoInfo,
   type ExportResult,
   type PruneReport,
@@ -95,6 +97,15 @@ const emit = defineEmits<{
   (e: "auto-login-changed", status: AppStatus): void;
   /** 请 App.vue 重新拉一次 status（改密码失败会改变剩余尝试次数 / 锁定状态）。 */
   (e: "refresh-status"): void;
+  /**
+   * 请求"从这份备份恢复"（P2-5）。
+   *
+   * 只发信号、不自己做，理由和「立即备份」一样，而且这里还要多两件事：
+   *   ① 恢复前必须 `flushNow()` 把编辑器里没保存的正文落库；
+   *   ② 恢复后必须**重取全部派生数据**（统计 / 标签 / 写过的日期）。
+   * 这两件都住在 `App.vue`，设置页拿不到编辑器句柄。
+   */
+  (e: "restore", dbPath: string): void;
   /** 一句提示，由 App.vue 的 toast 显示。 */
   (e: "notice", message: string): void;
 }>();
@@ -531,6 +542,62 @@ async function doPrune() {
     pruneBusy.value = false;
   }
 }
+
+// ---------------------------------------------------------------------------
+// 备份恢复（P2-5）
+// ---------------------------------------------------------------------------
+
+/**
+ * 「从备份恢复」的路径输入框。
+ *
+ * 为什么**留空**、而不是预填备份目录：预填一个**目录**会让人以为"点一下就恢复"，
+ * 而这里要的是一个**具体文件**（`.db`）。留空 + 占位符写清要填什么，
+ * 最不容易误点 —— 这是全应用唯一会覆盖整库的按钮。
+ *
+ * 与「导出全部日记」同一做法：只给文本框，**不引入系统文件选择器**
+ *（本机拉不到那个 crate；顺带也让这一批零新依赖）。
+ */
+const restorePath = ref("");
+
+/**
+ * 「复制备份到…」的目标目录。
+ *
+ * ⚠️ 同样**留空**，而且刻意不给任何默认值：能想到的默认值（数据目录旁边）
+ *    恰好是最不该推荐的那个 —— 复制到同一个盘上，硬盘一坏还是一起没。
+ *    用户必须自己写一个**别的盘**。
+ */
+const copyDest = ref("");
+const copyBusy = ref(false);
+const copyError = ref("");
+const copyDone = ref<CopyBackupsResult | null>(null);
+
+/** 只把路径交给 App.vue —— 真正的流程（flushNow → 恢复 → 重取派生数据）住在那里。 */
+function openRestore() {
+  const p = restorePath.value.trim();
+  if (!p) return;
+  emit("restore", p);
+}
+
+/**
+ * 把整个 `backups/` 复制到别的盘。
+ *
+ * ⚠️ 目标路径的合法性（存在、是目录、**不在数据目录内部**）全部由后端判 ——
+ *    前端只负责把结果如实报出来，不自己猜"这个路径行不行"。
+ */
+async function doCopyBackups() {
+  const dir = copyDest.value.trim();
+  if (!dir || copyBusy.value) return;
+  copyBusy.value = true;
+  copyError.value = "";
+  copyDone.value = null;
+  try {
+    copyDone.value = await copyBackupsTo(dir);
+  } catch (err) {
+    copyError.value = toAppError(err).message;
+  } finally {
+    copyBusy.value = false;
+  }
+}
 </script>
 
 <template>
@@ -848,6 +915,57 @@ async function doPrune() {
             </div>
 
             <!--
+              复制备份到…（P2-5 决定 ③）。
+              补的是"备份和日记在**同一块硬盘**上"这个缺口 —— 那块盘坏了，
+              备份跟着一起没。与上面「立即备份」是一对：
+              那个是"再多留几份"，这个是"搬到别的盘去"。
+            -->
+            <div class="row stacked">
+              <div class="label">
+                <div class="t">复制备份到…</div>
+                <div class="d">
+                  把整个 backups 目录（含后悔药）搬到别的盘。原有文件一个都不会被覆盖
+                </div>
+              </div>
+              <div class="ctl">
+                <input
+                  v-model="copyDest"
+                  class="path-input"
+                  type="text"
+                  spellcheck="false"
+                  placeholder="目标目录，例如 E:\日记备份"
+                  :disabled="copyBusy"
+                  @keyup.enter="doCopyBackups"
+                />
+                <button
+                  class="btn"
+                  :disabled="copyBusy || !copyDest.trim()"
+                  @click="doCopyBackups"
+                >
+                  {{ copyBusy ? "正在复制…" : "复制" }}
+                </button>
+              </div>
+            </div>
+
+            <div v-if="copyError" class="row">
+              <div class="label">
+                <div class="t">复制失败</div>
+                <div class="d">{{ copyError }}</div>
+              </div>
+            </div>
+
+            <div v-else-if="copyDone" class="row">
+              <div class="label">
+                <div class="t">已复制 {{ copyDone.copied }} 个文件</div>
+                <div class="d">
+                  共 {{ humanBytes(copyDone.bytes) }}，写进
+                  {{ copyDone.dest_dir }} 下的 backups 子目录；
+                  目标里原有文件一个都没被覆盖
+                </div>
+              </div>
+            </div>
+
+            <!--
               导出全部日记（指令 7）。
               与上面「立即备份」正好是一对：备份是**密文**副本（防丢，还得用本软件打开），
               导出是**明文** Markdown（防被这个软件锁死，任何编辑器都能读）。
@@ -971,9 +1089,39 @@ async function doPrune() {
               <p class="mono">{{ backup.dest_dir }}</p>
             </div>
 
+            <!--
+              从备份恢复（P2-5）—— 全应用**唯一会覆盖整库**的操作。
+              刻意放在这一栏的最下面：多滚一点才碰上它，不容易误点。
+              ⚠️ 真正的流程不住在这里：App.vue 要先 flushNow 落库、恢复后还要
+                 重取全部派生数据（见 App.vue 顶部那张「派生数据登记处」）。
+            -->
+            <div class="row stacked">
+              <div class="label">
+                <div class="t">从备份恢复</div>
+                <div class="d">
+                  ⚠️ 会用备份<strong>整库替换</strong>当前所有日记；恢复前会自动留一份后悔药。
+                  填上面那个目录里某一份备份的 <code>.db</code> 完整路径
+                </div>
+              </div>
+              <div class="ctl">
+                <input
+                  v-model="restorePath"
+                  class="path-input"
+                  type="text"
+                  spellcheck="false"
+                  placeholder="例如 …\data\backups\diary-20260923-161500.db"
+                />
+                <button class="btn" :disabled="!restorePath.trim()" @click="openRestore">
+                  恢复…
+                </button>
+              </div>
+            </div>
+            <p v-if="backup" class="mono">备份文件在：{{ backup.dest_dir }}</p>
+
             <p class="warn">
               备份是<strong>密文</strong>，与数据库使用同一个密码，恢复时用那个密码即可打开。
-              可以直接把 <code>backups</code> 目录整体复制到网盘或其他硬盘。
+              可以直接把 <code>backups</code> 目录整体复制到网盘或其他硬盘 ——
+              上面那个「复制备份到…」就是替你干这件事（连后悔药一起搬）。
             </p>
           </section>
 

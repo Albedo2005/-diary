@@ -14,7 +14,7 @@ use crate::crypto::{self, CryptoMeta, KEY_LEN};
 use crate::error::{AppError, AppResult};
 use crate::schema::{self, DEFAULT_NOTEBOOK_ID};
 use crate::seg::Segmenter;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -487,6 +487,29 @@ pub struct Vault {
     /// lockout.json / auto_login.json / crypto_meta.json 都躺在库文件旁边，
     /// 而 `change_password` 需要同时动后面那两份库外文件。
     pub db_path: PathBuf,
+    /// 本连接所用的密钥。
+    ///
+    /// ⚠️ 为什么连 `Connection` 都拿着密钥了，还要在这里再存一份：
+    ///    换库（备份恢复）时**必须先丢掉旧连接**（Windows 上文件被占用就复制不了），
+    ///    而丢掉之后要判断"当前密码还能不能打开刚换上的那个库"，就必须有密钥。
+    ///    没有它，恢复完只能把用户踢回解锁页 —— 哪怕新库用的就是同一个密码。
+    ///
+    /// ⚠️ 安全面**没有扩大**：它和 `Connection` 同生命周期，
+    ///    库一锁（`*guard = None`）两者一起消失，并由下面的 `Drop` 显式清零。
+    ///    可见性严格限制在 `pub(crate)`（见 `session_key`）。
+    key: [u8; KEY_LEN],
+}
+
+impl Drop for Vault {
+    /// 把密钥在内存里擦掉。
+    ///
+    /// 为什么必须显式做：`[u8; 32]` 是普通数组，`drop` 只是把这块内存还回去，
+    /// 那 32 个字节仍原样留在栈/堆上，可能被下一次分配复用、被内存转储捞走。
+    /// 这个应用存在的意义就是"密钥不落在任何能被人捡到的地方"，
+    /// 所以库一锁就把内存里的那份擦干净。
+    fn drop(&mut self) {
+        crypto::zeroize(&mut self.key);
+    }
 }
 
 /// 手写 Debug，只暴露路径。
@@ -593,6 +616,100 @@ pub fn open_verified_connection(db_path: &Path, key: &[u8; KEY_LEN]) -> AppResul
     let conn = Connection::open(db_path)?;
     apply_key_and_verify(&conn, key)?;
     Ok(conn)
+}
+
+/// 用给定密钥**只读**打开一个库文件（备份检查专用）。
+///
+/// 与 `open_verified_connection` 只差一处，但那一处很要紧：它以
+/// `SQLITE_OPEN_READ_ONLY` 打开。备份检查面对的是**用户摆在别处的备份文件**，
+/// 而 SQLite 在一个可写的库上会顺手创建 `-wal` / `-shm` 同伴文件 ——
+/// 那就意味着"我只是点了一眼看看"，却在用户的备份目录里留下了两个陌生文件；
+/// 在只读介质（光盘、只读网络盘）上更是直接失败。
+///
+/// ⚠️ 备份是本程序用 `VACUUM INTO` 生成的**单文件**库（不含 WAL），
+///    所以只读打开一定读得到；反过来，把带 WAL 的**主库文件**当成备份拿来，
+///    这里会读不出来 —— 那本来也不是一份能用的备份。
+pub fn open_verified_connection_readonly(
+    db_path: &Path,
+    key: &[u8; KEY_LEN],
+) -> AppResult<Connection> {
+    if !db_path.exists() {
+        return Err(AppError::State("数据库不存在，无法验证密码".into()));
+    }
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    apply_key_and_verify(&conn, key)?;
+    Ok(conn)
+}
+
+/// 用给定密钥只读打开一份**备份**，数出里面"写过"的篇数。
+///
+/// 口径必须与统计页完全一致（`has_content_sql()`）—— 否则会出现
+/// "检查时说 12 篇、恢复后统计说 11 篇"这种自己跟自己打架的数目。
+///
+/// ⚠️ 读不出来（密钥不对 / 备份来自更老的版本、表结构不同）一律返回 `Err`，
+///    由调用方翻成"读不出篇数"。**绝不编一个数字**：
+///    这是用户在按下"替换并恢复"之前唯一能看到的依据。
+pub fn count_written_entries_readonly(db_path: &Path, key: &[u8; KEY_LEN]) -> AppResult<i64> {
+    let conn = open_verified_connection_readonly(db_path, key)?;
+    let n = conn.query_row(
+        &format!("SELECT count(*) FROM entry WHERE {}", has_content_sql()),
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n)
+}
+
+/// 从备份文件名里解析创建时间（Unix 秒，UTC）。
+///
+/// 认这三种写法（都是本程序自己生成的，见 `commands::now_stamp`）：
+///
+/// ```text
+/// diary-20260923-161500.db
+/// diary-20260923-161500.meta.json
+/// diary-20260923-161500            ← 纯 stem
+/// ```
+///
+/// 认不出来返回 `None` —— **这不是错误**：备份目录里可能有用户自己放的文件，
+/// 对它最合适的处理是"当它不存在"，而不是报错并让整个列表打不开。
+///
+/// 为什么必须优先用文件名、而不是文件的修改时间：备份一定会被**拷来拷去**
+///（换电脑、丢进网盘再拷回来），一拷 mtime 就变成"拷回来的那一刻"，
+/// 而文件名里的时间戳永远不变。只认 mtime，用户会看到一条被彻底打乱的时间线。
+pub fn parse_backup_stamp(name: &str) -> Option<u64> {
+    let stem = name
+        .strip_suffix(".meta.json")
+        .or_else(|| name.strip_suffix(".db"))
+        .unwrap_or(name);
+    let rest = stem.strip_prefix("diary-")?;
+
+    // 期望 `YYYYMMDD-HHMMSS` ⇒ 剩余正好 15 个字符，第 9 个是分隔号。
+    if rest.len() != 15 || rest.as_bytes().get(8) != Some(&b'-') {
+        return None;
+    }
+    let y: i64 = rest.get(0..4)?.parse().ok()?;
+    let mo: i64 = rest.get(4..6)?.parse().ok()?;
+    let d: i64 = rest.get(6..8)?.parse().ok()?;
+    let h: i64 = rest.get(9..11)?.parse().ok()?;
+    let mi: i64 = rest.get(11..13)?.parse().ok()?;
+    let s: i64 = rest.get(13..15)?.parse().ok()?;
+
+    // 只排除明显不成立的日期（如 13 月、32 日），不做完整日历校验：
+    // 这些名字是本程序自己生成的，这里防的是"用户手工改名改坏了"。
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    if h > 23 || mi > 59 || s > 59 {
+        return None;
+    }
+
+    // 复用本文件里**已有**的那份日期换算（`week_start` / `shift_date` 也在用它）——
+    // 各写一份的话，某一处动了闰年处理，另一处就会悄悄算错，
+    // 而症状只是"备份列表顺序不对"，几乎联想不到原因。
+    let days = days_from_civil(y, mo, d);
+    let secs = days
+        .checked_mul(86_400)?
+        .checked_add(h * 3600 + mi * 60 + s)?;
+    u64::try_from(secs).ok()
 }
 
 /// 从 PIN 派生密钥，并**实际打开库验证**它是对的，返回那把密钥。
@@ -850,6 +967,9 @@ impl Vault {
             conn,
             seg: Segmenter::new(),
             db_path: db_path.to_path_buf(),
+            // 密钥连同连接一起留下：恢复备份要"丢掉旧连接之后仍然能试开新库"，
+            // 靠的就是这一份。详见字段注释与 `session_key`。
+            key: *key,
         })
     }
 
@@ -1982,6 +2102,19 @@ impl Vault {
         Ok(n)
     }
 
+    /// 本连接所用的密钥（备份恢复流程专用）。
+    ///
+    /// 唯一的用法：**换库之前**先把它取出来，换完之后用它判断
+    /// "当前密码还能不能打开刚换上来的那个库" —— 见 `commands::restore_backup`。
+    ///
+    /// ⚠️ 可见性只能是 `pub(crate)`，**绝不能是 `pub`**。
+    ///    `db` 模块对外是公开的（集成测试要用），一旦这里是 `pub`，
+    ///    这把密钥就会顺着 `Vault` 的公开面漏出去 ——
+    ///    而"前端永远拿不到密钥"正是整个加密设计的底线。
+    pub(crate) fn session_key(&self) -> &[u8; KEY_LEN] {
+        &self.key
+    }
+
     /// 统计：总篇数、总字数、连续写作天数（当前 / 最长）、本周与本月写作天数、
     /// 心情分布、每月字数趋势。
     ///
@@ -3061,25 +3194,58 @@ fn yaml_scalar(s: &str) -> String {
 
 /// 目标文件已存在时，在扩展名前追加 ` (1)`、` (2)`… —— **绝不覆盖**。
 ///
+/// ⚠️ `.meta.json` 按**整体**当一个扩展名（见函数内注释）：
+///    备份是"两个文件一组"，后缀插错位置会让配对名对不上，
+///    复制出来的那一份直接变成打不开的废文件。
+///
 /// 上千次都撞名说明这个目录已经不是"偶尔重名"了，再往下试没有意义：
 /// 这时**报错**而不是退回原路径 —— 退回原路径就等于覆盖，
 /// 恰好是这个函数唯一要防的事。
-fn non_conflicting_path(path: &Path) -> AppResult<PathBuf> {
+///
+/// `pub` 是为了让命令层的「复制备份到…」（P2-5）也用它 ——
+/// 那条命令同守"绝不覆盖"，各写一份就等着两处的后缀规则慢慢分叉。
+pub fn non_conflicting_path(path: &Path) -> AppResult<PathBuf> {
     if !path.exists() {
         return Ok(path.to_path_buf());
     }
     let parent = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-    let stem = path
-        .file_stem()
+    let file = path
+        .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    let ext = path.extension().map(|s| s.to_string_lossy().to_string());
+    if file.is_empty() {
+        return Err(AppError::State(format!("不是一个文件路径：{}", path.display())));
+    }
+
+    // ⚠️ 这里必须把 `.meta.json` 当成**一个**扩展名整体处理。
+    //
+    // 按普通的"最后一个点"去拆，`diary-20260923-161500.meta.json` 会被拆成
+    // `diary-20260923-161500.meta` + `.json`，重名后生成
+    // `diary-20260923-161500.meta (1).json` —— 于是它的搭档
+    // `diary-20260923-161500 (1).db` 找不到配对的 meta。
+    //
+    // 后果比"名字难看"严重得多：备份的配对规则是**同 stem 换后缀**
+    //（`db.rs` 的 `parse_backup_stamp` 与 `commands::paired_meta_path` 都按它走），
+    // 配对不上＝"缺 meta"，而缺 meta 的备份**密码再对也永远打不开**。
+    // 也就是说：用户为了安全把备份复制到第二个盘，复制出来的那一份反而成了废文件 ——
+    // 正是"改一处崩三处"最典型的形态（复制功能与配对规则本来是两件不相干的事）。
+    const META_SUFFIX: &str = ".meta.json";
+    let (stem, ext) = match file.strip_suffix(META_SUFFIX) {
+        Some(s) => (s.to_string(), META_SUFFIX.to_string()),
+        None => {
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            match path.extension() {
+                Some(e) => (stem, format!(".{}", e.to_string_lossy())),
+                None => (stem, String::new()),
+            }
+        }
+    };
+
     for n in 1..1000 {
-        let name = match &ext {
-            Some(e) => format!("{stem} ({n}).{e}"),
-            None => format!("{stem} ({n})"),
-        };
-        let candidate = parent.join(name);
+        let candidate = parent.join(format!("{stem} ({n}){ext}"));
         if !candidate.exists() {
             return Ok(candidate);
         }
@@ -3167,6 +3333,52 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // 备份文件名的解析（P2-5 备份恢复）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn backup_stamp_parses_all_three_spellings() {
+        let from_db = parse_backup_stamp("diary-20260923-161500.db").unwrap();
+        let from_meta = parse_backup_stamp("diary-20260923-161500.meta.json").unwrap();
+        let from_stem = parse_backup_stamp("diary-20260923-161500").unwrap();
+
+        // 三种写法必须算出同一个时间 —— 恢复时正是靠它把 .db 和 .meta.json 配成一对。
+        assert_eq!(from_db, from_meta);
+        assert_eq!(from_db, from_stem);
+        assert_eq!(from_db, 1_790_180_100); // 2026-09-23T16:15:00Z
+
+        // 与反方向的换算对得上（同一份日期换算的两个方向只有一处实现）。
+        assert_eq!(unix_to_rfc3339(from_db), "2026-09-23T16:15:00Z");
+    }
+
+    #[test]
+    fn backup_stamp_handles_leap_day_and_epoch() {
+        assert_eq!(
+            parse_backup_stamp("diary-20240229-000001.db").unwrap(),
+            1_709_164_801
+        );
+        assert_eq!(
+            parse_backup_stamp("diary-20000101-000000.db").unwrap(),
+            946_684_800
+        );
+    }
+
+    #[test]
+    fn backup_stamp_rejects_foreign_names() {
+        // 认不出来必须是 None（而不是 Err）：备份目录里可能有用户自己放的文件，
+        // 对它最合适的处理是"当它不存在"，不能让整个列表打不开。
+        assert!(parse_backup_stamp("diary.db").is_none());
+        assert!(parse_backup_stamp("diary-20260923-1615.db").is_none()); // 少一位
+        assert!(parse_backup_stamp("diary-20261323-161500.db").is_none()); // 13 月
+        assert!(parse_backup_stamp("diary-20260932-161500.db").is_none()); // 32 日
+        assert!(parse_backup_stamp("diary-20260923-251500.db").is_none()); // 25 点
+        assert!(parse_backup_stamp("diary-20260923-166100.db").is_none()); // 61 分
+        assert!(parse_backup_stamp("backup-20260923-161500.db").is_none()); // 前缀不对
+        assert!(parse_backup_stamp("notes.txt").is_none());
+        assert!(parse_backup_stamp("").is_none());
+    }
+
+    // -----------------------------------------------------------------------
     // Markdown 导出
     // -----------------------------------------------------------------------
 
@@ -3213,6 +3425,52 @@ mod tests {
         std::fs::write(&second, "x").unwrap();
         let third = non_conflicting_path(&first).unwrap();
         assert_eq!(third, dir.join("2026-09-18 (2).md"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⭐ 重名加后缀时，`.db` 与 `.meta.json` 必须**还是配成一对**。
+    ///
+    /// 这是「复制备份到…」的命门：备份的配对规则是"同 stem 换后缀"，
+    /// 只要 meta 被改成 `…meta (1).json`，它的搭档 `…(1).db` 就配不上，
+    /// 复制出去的那一份＝永远打不开。两个文件都在，用户却打不开 ——
+    /// 最难查的那种故障。
+    #[test]
+    fn non_conflicting_path_keeps_the_backup_pair_together() {
+        let dir = std::env::temp_dir().join("dsh-diary-backup-pair-name");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let db = dir.join("diary-20260923-161500.db");
+        let meta = dir.join("diary-20260923-161500.meta.json");
+        std::fs::write(&db, "x").unwrap();
+        std::fs::write(&meta, "x").unwrap();
+
+        let db2 = non_conflicting_path(&db).unwrap();
+        let meta2 = non_conflicting_path(&meta).unwrap();
+
+        assert_eq!(db2, dir.join("diary-20260923-161500 (1).db"));
+        assert_eq!(
+            meta2,
+            dir.join("diary-20260923-161500 (1).meta.json"),
+            "后缀要插在整个 `.meta.json` 之前，不能插在 `.json` 之前"
+        );
+        // 用真正的配对口径再验一次：同 stem 换后缀必须能互相找到。
+        assert_eq!(
+            meta2.file_name().unwrap().to_string_lossy(),
+            format!(
+                "{}.meta.json",
+                db2.file_name().unwrap().to_string_lossy().strip_suffix(".db").unwrap()
+            )
+        );
+
+        // 原有的普通扩展名行为不许被这次改动带偏。
+        let md = dir.join("2026-09-18.md");
+        std::fs::write(&md, "x").unwrap();
+        assert_eq!(
+            non_conflicting_path(&md).unwrap(),
+            dir.join("2026-09-18 (1).md")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

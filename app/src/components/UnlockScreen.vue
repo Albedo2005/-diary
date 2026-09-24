@@ -35,6 +35,14 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: "unlocked", status: AppStatus): void;
   (e: "status", status: AppStatus): void;
+  /**
+   * 请求"从这份备份恢复"（P2-5 决定 ①）。
+   *
+   * 只发信号，**不自己调恢复**：恢复完要重取全部派生数据、还要判断
+   * "回不回解锁页"，那是 App.vue 的活；而且确认弹窗是两处入口共用的
+   * 同一个组件，不能在这里再复制一份。
+   */
+  (e: "restore", dbPath: string): void;
 }>();
 
 const pin = ref("");
@@ -43,6 +51,22 @@ const hint = ref("");
 const busy = ref(false);
 const errorText = ref("");
 const local = ref<AppStatus>(props.status);
+
+/**
+ * 「有备份？从这里恢复」那块次级入口是否展开（P2-5）。
+ *
+ * 默认收起：它是**少数人才用得上**的路（换电脑、重装系统之后），
+ * 而这一屏的主角永远是"创建密码"。展开是用户主动的动作。
+ */
+const showRestore = ref(false);
+const restorePath = ref("");
+
+/** 把路径交给 App.vue；真正的流程（含二次确认弹窗）住在那里。 */
+function requestRestore() {
+  const p = restorePath.value.trim();
+  if (!p) return;
+  emit("restore", p);
+}
 
 /** 剩余锁定秒数。用本地倒计时显示，但每秒向后端核对一次真值。 */
 const remaining = ref(props.status.remaining_lock_secs);
@@ -278,6 +302,51 @@ async function submit() {
         <p v-if="isInit" class="path-note">
           日记会保存在：<code>{{ local.data_dir }}</code>
         </p>
+
+        <!--
+          有备份？从这里恢复（P2-5 决定 ①）。
+          为什么必须放在"首次创建"这一屏：换电脑 / 重装系统之后，用户手上只剩
+          一份备份，而软件此刻停在"设置密码" —— 他要是先设了个新密码，
+          那份备份就得绕"先建库、再从设置页恢复"一大圈。
+          这是"软件都还打不开时就能把数据救回来"的唯一一条路。
+
+          ⚠️ 一行都不要碰上面「创建密码」的主流程：那是 2.5 定下的东西，
+             也是全应用改动风险最高的一段。这里只是挂在卡片末尾的一个次级入口。
+        -->
+        <div v-if="isInit" class="restore-entry">
+          <button class="link-btn" type="button" @click="showRestore = !showRestore">
+            {{ showRestore ? "收起" : "有备份？从这里恢复" }}
+          </button>
+
+          <div v-if="showRestore" class="restore-box">
+            <p>
+              如果这台电脑上还没有日记本、而你手上有以前备份的
+              <code>diary-….db</code>，可以直接恢复回来 —— 恢复后用
+              <strong>那份备份当时那个密码</strong>解锁，不必先设新密码。
+            </p>
+            <p class="restore-note">
+              备份永远是 <code>.db</code> ＋ <code>.meta.json</code> 两个文件一组，
+              缺一个就永远打不开。两个要一起找出来。
+            </p>
+            <div class="restore-row">
+              <input
+                v-model="restorePath"
+                class="text-input"
+                type="text"
+                spellcheck="false"
+                placeholder="备份 .db 文件的完整路径"
+                @keyup.enter="requestRestore"
+              />
+              <button
+                class="btn"
+                :disabled="!restorePath.trim()"
+                @click="requestRestore"
+              >
+                恢复…
+              </button>
+            </div>
+          </div>
+        </div>
       </template>
     </div>
   </div>
@@ -447,6 +516,85 @@ h1 {
   font-size: 12px;
   line-height: 1.6;
   color: var(--text-3);
+}
+/*
+  「有备份？从这里恢复」次级入口（P2-5）。
+  刻意做小、做轻：它不能跟「创建日记」抢注意力 —— 那是这一屏唯一的主线，
+  而这个入口是少数人才走得上的路。颜色一律走主题变量，不写死色号。
+*/
+.restore-entry {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  text-align: center;
+}
+.link-btn {
+  padding: 0;
+  font-size: 12px;
+  color: var(--text-3);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.link-btn:hover {
+  color: var(--accent);
+}
+.restore-box {
+  margin-top: 12px;
+  padding: 12px;
+  text-align: left;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-2);
+}
+.restore-box p {
+  margin: 0 0 8px;
+}
+.restore-box strong {
+  color: var(--text-1);
+}
+.restore-box code {
+  font-family: var(--mono);
+  font-size: 11px;
+  word-break: break-all;
+}
+.restore-note {
+  color: var(--text-3);
+}
+.restore-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.restore-row .text-input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  font-size: 12px;
+}
+.restore-row .btn {
+  flex-shrink: 0;
+}
+.btn {
+  padding: 8px 13px;
+  font-size: 13px;
+  color: var(--text-1);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 /* 只在初始化时出现一次的数据目录提示 */
 .path-note {

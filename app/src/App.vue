@@ -9,6 +9,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import CalendarPanel from "./components/CalendarPanel.vue";
 import EditorPane from "./components/EditorPane.vue";
 import HiddenScreen from "./components/HiddenScreen.vue";
+import RestoreDialog from "./components/RestoreDialog.vue";
 import SearchPanel from "./components/SearchPanel.vue";
 import SettingsPanel from "./components/SettingsPanel.vue";
 import StatsPanel from "./components/StatsPanel.vue";
@@ -53,8 +54,16 @@ const selected = ref(todayKey());
  *    这与「搜索」的行为完全一致（它也是这么切的）。
  */
 const mode = ref<"write" | "search" | "stats">("write");
-/** 递增以要求日历刷新标记。 */
+/** 递增以要求日历刷新标记。**每次保存都会递增** —— 所以别拿它去驱动整篇重载。 */
 const refreshToken = ref(0);
+
+/**
+ * 递增以要求编辑器**整篇重读**（只给恢复备份用，P2-5）。
+ *
+ * 与 `refreshToken` 严格分开，理由见 `onRestoreDone` 里的注释：
+ * 那个令牌每次保存都在动，谁跟着它重载谁就会把条目重新锁上。
+ */
+const libraryToken = ref(0);
 
 /**
  * 递增以要求两处标签界面刷新。
@@ -179,6 +188,24 @@ async function boot() {
   }
 }
 
+/**
+ * ⭐ **派生数据登记处**
+ *
+ * 凡是"从库里算出来、又被缓存住"的东西，都必须登记在下面这张清单里 ——
+ * 解锁后 与 **恢复备份后** 都要重取一遍。
+ *
+ * 为什么这件事必须有个登记处：恢复是**整库替换**，库里的东西全换了，
+ * 而这些缓存还挂着**旧库**的值。症状是"恢复完了，统计和标签还是恢复前的"，
+ * 而且几乎没人会想到是这个原因。
+ *
+ * 目前在册：
+ *   - `stats`  —— 统计那一屏 ＋ 顶栏的"共 N 篇 · 连续 N 天"
+ *   - `tags`   —— 标签（由 `tagToken` 驱动，两个标签界面各自去后端读）
+ *   - `crypto` —— 加密参数摘要
+ *   - `backup` —— 备份状态（已有几份 / 下次什么时候）
+ *   - `writtenDates` —— 写过的日期（【P2-17】起会加进来）
+ *   - （以后谁新增了缓存，往下补一行）
+ */
 async function loadAux() {
   try {
     const [s, c, b] = await Promise.all([
@@ -192,6 +219,31 @@ async function loadAux() {
   } catch {
     // 辅助信息失败不应阻塞主流程。
   }
+}
+
+/**
+ * 重取**全部**派生数据（见上面那张登记表）。
+ *
+ * ⚠️ 解锁成功后与恢复成功后**走的是同一段代码**（调用点：`onUnlocked`
+ *    与 `onRestoreDone`）。这不是图省事 —— 这两件事的语义本来就一样：
+ *    "库的内容变了，界面上所有从库里算出来的东西都作废"。
+ *    各写一份的话，早晚有一个人会漏掉其中一项。
+ */
+async function refreshDerived() {
+  await loadAux();
+  // 标签同时出现在日历侧栏与编辑器 chip 行，两边各自去后端读，递增令牌即可。
+  tagToken.value++;
+}
+
+/**
+ * 进入未解锁态时把派生数据全部清掉 —— 那些值属于**已经关掉的那个库**。
+ *
+ * 与 `refreshDerived` 是一对：那个是"换个库重取"，这个是"没有库了"。
+ */
+function clearDerived() {
+  stats.value = null;
+  crypto.value = null;
+  backup.value = null;
 }
 
 /**
@@ -216,7 +268,8 @@ function onUnlocked(s: AppStatus) {
   status.value = s;
   // 已经进来了，那条"免密失效"的提示就没有意义了。
   autoLoginFailed.value = false;
-  void loadAux();
+  // ⚠️ 用的是与"恢复备份之后"**同一段**重取代码（见 refreshDerived 的说明）。
+  void refreshDerived();
   // 解锁成功后必须把设置读回来 —— 包括"免密自动解锁"那条路径，
   // 它同样会走到这里。否则会一直用启动时的默认值。
   void loadSettings();
@@ -300,9 +353,7 @@ async function doLock() {
 
   try {
     status.value = await lockVault();
-    stats.value = null;
-    crypto.value = null;
-    backup.value = null;
+    clearDerived();
   } catch (e) {
     flash(toAppError(e).message);
   }
@@ -335,6 +386,66 @@ async function toggleAutoBackup() {
     flash(next ? "已开启自动备份（每天一次）" : "已关闭自动备份");
   } catch (e) {
     flash(toAppError(e).message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 备份恢复（P2-5）
+// ---------------------------------------------------------------------------
+
+/**
+ * 恢复确认弹窗：开不开 / 正在恢复的是哪一份。
+ *
+ * ⚠️ 流程**必须留在 App.vue**，不能塞进设置页或解锁页，有三个理由：
+ *   ① 恢复前要 `editorRef.flushNow()` —— 编辑器句柄只有这里拿得到；
+ *   ② 恢复后要重取**全部**派生数据（`refreshDerived`）；
+ *   ③ 恢复后可能得回解锁页（备份不是当前密码加密的时候）。
+ * 那两处入口只做一件事：把路径发过来。
+ */
+const restoreOpen = ref(false);
+const restorePath = ref("");
+
+/**
+ * 打开恢复确认弹窗。
+ *
+ * ⚠️ **先落库、再恢复**，顺序不能反 —— 和 `doLock` 是同一个病根：
+ *    正文是 1000ms 防抖保存的，不催它一次，恢复前最后几秒打的字
+ *    既不在当前库里、也不会进"后悔药"，等于凭空蒸发了。
+ *    必须 `await`：flush 是异步的，不 await 就等于没等。
+ */
+async function doRestore(dbPath: string) {
+  await editorRef.value?.flushNow();
+  restorePath.value = dbPath;
+  restoreOpen.value = true;
+}
+
+/**
+ * 恢复完成（弹窗里已经确认过、也真的换完库了）。
+ *
+ * 分两种情况，因为它们对用户意味着完全不同的事：
+ *   - **能用当前密码打开** ⇒ 直接继续用，界面上的数字也换成恢复后的；
+ *   - **打不开** ⇒ 回解锁页，并说清"要用这份备份当时那个密码" ——
+ *     绝不能让他以为是自己密码记错了。
+ */
+async function onRestoreDone(s: AppStatus) {
+  restoreOpen.value = false;
+  status.value = s;
+  // 日历上"写过"的标记属于那个已经被换掉的库。
+  refreshToken.value++;
+  // ⚠️ 编辑器要的是**另一个**令牌。这两件事看着像，其实完全不同：
+  //    `refreshToken` 每次保存都会递增（日历靠它刷标记），
+  //    而 EditorPane 收到它就会整篇重载，重载里带着 `lockAllEntries()` ——
+  //    接上去的后果是"打完字一保存就被重新锁上，后面打的字静默丢掉"。
+  //    只有"整个库被换掉"才该让编辑器重读，所以单开一个。
+  libraryToken.value++;
+
+  if (s.unlocked) {
+    await refreshDerived();
+    await loadSettings();
+    flash("已恢复 —— 界面上的数字也都换成恢复后的了");
+  } else {
+    clearDerived();
+    flash("已恢复。请用这份备份当时那个密码解锁");
   }
 }
 
@@ -478,6 +589,7 @@ onUnmounted(() => {
       :auto-login-failed="autoLoginFailed"
       @unlocked="onUnlocked"
       @status="(s) => (status = s)"
+      @restore="doRestore"
     />
 
     <template v-else-if="status">
@@ -535,6 +647,7 @@ onUnmounted(() => {
             ref="editorRef"
             :date="selected"
             :tag-token="tagToken"
+            :library-token="libraryToken"
             :auto-lock-entries="autoLockEntries"
             :triple-click-unlock="tripleClickUnlock"
             @saved="onSaved"
@@ -583,9 +696,29 @@ onUnmounted(() => {
         @password-changed="onPasswordChanged"
         @auto-login-changed="onAutoLoginChanged"
         @refresh-status="refreshStatus"
+        @restore="doRestore"
         @notice="flash"
       />
     </template>
+
+    <!--
+      恢复备份的二次确认弹窗（P2-5）。
+      ⚠️ 必须挂在**最外层、独立成一条判断**：它的两个入口分别在「设置弹窗」
+         与「解锁页」里，而那两处属于不同的 v-if 分支 —— 塞进任何一条分支，
+         另一个场景就永远弹不出来。
+      ⚠️ 也不能插进上面那条 v-if / v-else-if 链的中间（会打断链，让后面的
+         v-else-if 报错），所以放在链外、放最末尾。
+      ⚠️ `will-keep-pre-restore` 直接取 `status.unlocked`：它与后端
+         `restore_core` 里"有没有已解锁连接、因而有没有东西可保"是同一个判断。
+    -->
+    <RestoreDialog
+      v-if="restoreOpen && status"
+      :db-path="restorePath"
+      :pre-restore-dir="status.pre_restore_dir"
+      :will-keep-pre-restore="status.unlocked"
+      @close="restoreOpen = false"
+      @done="onRestoreDone"
+    />
   </div>
 </template>
 
