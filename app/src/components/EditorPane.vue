@@ -103,6 +103,20 @@ const props = defineProps<{
    *    【P2-23】的回顾页也吃它（见 App.vue 的"派生数据登记处"）。
    */
   dates?: string[];
+  /**
+   * 沉浸态：左侧日历栏被收起来了（P2-22）。
+   *
+   * 本组件拿到它做**两件事**：① 给根元素挂 `.wide`（正文限宽居中）；
+   * ② 用它当"编辑器宽度变了"的**唯一通知点**，重算缩略图条的溢出状态
+   *    —— 折叠日历**不改窗口尺寸**，挂在 `window` 上的那个 `resize` 监听
+   *    **不会触发**，`overflowing` 会停在旧值（见下面那个 `watch`）。
+   *
+   * ⚠️ 它必须是 **prop 而不是 class**：Vue 的 class 合并在渲染层、
+   *    不落进 `props` ⇒ 只传 class 的话脚本里读不到，那个 `watch` 就写不出来。
+   * ⚠️ 本条**只碰 `.editor` 的 padding**，⛔ **一行不碰 `.content-input`** ——
+   *    P2-3 要把那个 `textarea` 换成富文本编辑器，碰了两条指令就互相咬住。
+   */
+  wide?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -272,6 +286,18 @@ function toggleStrip() {
 
 /** 一排的宽度跟着窗口走，窗口一动就得重量一次。 */
 onMounted(() => window.addEventListener("resize", measureStrip));
+
+/**
+ * 折叠 / 展开日历会改编辑器宽度（**不触发** `window` 的 `resize`）⇒ 缩略图条要重量一次。
+ *
+ * ⚠️ 必须 `nextTick` —— DOM 宽度要等布局生效后才量得到，同帧量到的是旧宽度。
+ * ⭐ 这个位置同时也是"编辑器宽度变了"的**唯一通知点**：将来 P2-3 那些依赖宽度的东西
+ *    （浮动工具栏 / 气泡菜单 / 虚拟滚动 / 表格列宽）统统挂到这一条 `watch` 里，
+ *    ⛔ 别各自再监听一套（会重复触发、还会漏）。
+ * ⛔ 也**不要**给编辑器再加一个 `ResizeObserver` 或第二个 `resize` 监听 ——
+ *    上面那个 ＋ 这一条已经覆盖全部时机。
+ */
+watch(() => props.wide, () => void nextTick(measureStrip));
 
 /**
  * 标签区是否可编辑。
@@ -1315,7 +1341,7 @@ defineExpose({ flushNow: () => flush() });
 </script>
 
 <template>
-  <section class="editor">
+  <section class="editor" :class="{ wide }">
     <header class="bar">
       <div class="bar-main">
         <div class="left">
@@ -1712,6 +1738,17 @@ defineExpose({ flushNow: () => flush() });
   display: flex;
   flex-direction: column;
   padding: 20px 28px 24px;
+}
+/* 沉浸态（左侧日历栏收起来了，P2-22）：正文收窄到舒适行宽并居中。
+   ⭐ **用 padding 不用 max-width ＋ margin: 0 auto** —— 上面那条日期行和正文
+      在**同一个 padding 里**，会一起内移、天然对齐；给 textarea 加 max-width
+      则会让它自己居中、日期行留在最左边，两处错位。
+   ⚠️ 最小值 28px 就是原来的边距 ⇒ 窗口窄的时候自动退回原样，不会挤到贴边。
+   ⚠️ 这个值将来会跟 P2-3 的"每行 N 字"设置统一，所以收敛成 `--editor-measure`
+      一个变量（定义在 global.css 的 :root，深浅主题同一个值）。 */
+.editor.wide {
+  padding-left: max(28px, calc(50% - var(--editor-measure) / 2));
+  padding-right: max(28px, calc(50% - var(--editor-measure) / 2));
 }
 .bar {
   display: flex;

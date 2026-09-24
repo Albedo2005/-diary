@@ -30,6 +30,13 @@
   --warn-bg: #fdf5e3;
   --ok: #3f7a54;
 
+  /* 沉浸写日记的正文行宽（P2-22 折叠日历栏）。
+     ≈ 38 个 15px 等宽汉字 —— 长文阅读的舒适行宽。
+     ⚠️ 它是**尺度**不是颜色 ⇒ 深浅主题**同一个值**，⛔ 别写两套。
+     ⚠️ 将来 P2-3 的"每行 N 字"设置**必须复用这一个变量**
+        （届时用 documentElement.style.setProperty 覆盖），⛔ 不许另立第二个。 */
+  --editor-measure: 620px;
+
   --mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", Consolas,
     "Courier New", monospace;
 

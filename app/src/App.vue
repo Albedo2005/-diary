@@ -63,6 +63,51 @@ const selected = ref(todayKey());
  *    ⛔ 别为了"顺手保住它"把它提到这里来。
  */
 const mode = ref<"write" | "search" | "stats" | "filter">("write");
+
+/** localStorage 的键。只存一个"折没折"的布尔值，不含任何日记内容。 */
+const CAL_KEY = "diary.calendar-collapsed";
+
+/**
+ * 读折叠状态。⚠️ **兜底方向＝展开** —— 只有精确的 `"1"` 才算折叠；
+ * 其它一切（null / 垃圾值 / 抛异常）都算展开。
+ * ⛔ 别写成 `!== "0"` 之类的反向判断（本项目开关类的通用兜底方向）。
+ */
+function readCalendarCollapsed(): boolean {
+  try {
+    return localStorage.getItem(CAL_KEY) === "1";
+  } catch {
+    return false; // localStorage 被禁（配额满 / 隐私模式）⇒ 退回安全态
+  }
+}
+
+/**
+ * 左侧日历栏是不是收着的（P2-22 沉浸式写日记）。
+ *
+ * ⭐ **它住在 `App.vue` 而不是 `CalendarPanel` 内部**：切到搜索 / 年轮 / 筛选页时
+ *    `CalendarPanel` 本来就会被 `v-if` 卸载（既有行为），放组件内部会被切 tab 弄丢。
+ * ⭐ **初值直接读本地存储**（不是 `onMounted` 里再改）⇒ **首帧就是正确的布局**，
+ *    不会出现"先展开一下、再收起"的闪动。
+ *    ⚠️ 所以上面那个 `CAL_KEY` 与读函数必须排在它**之前** —— `const` 不提升，
+ *       顺序反了会在初始化时就抛"Cannot access 'CAL_KEY' before initialization"。
+ *
+ * ⚠️ 为什么存 `localStorage` 而不是加密库的 `app_settings`：
+ *    ① 读库要等**解锁之后**，而布局在解锁前就得定 ⇒ 走库必然闪一下；
+ *    ② 新增设置项按项目约定要动后端四处（db / commands / lib.rs / api）；
+ *    ③ 它不需要加密 —— 存的是"我喜不喜欢左栏"这一个 bit，**不含任何日记内容**。
+ *    ⇒ 判据与项目通用风格一致：**`localStorage` 只许存界面偏好**。
+ */
+const calendarCollapsed = ref(readCalendarCollapsed());
+
+/** 切换折叠。⚠️ 写失败**不许打断折叠动作**（界面照折，只是下次记不住）。 */
+function toggleCalendar() {
+  calendarCollapsed.value = !calendarCollapsed.value;
+  try {
+    localStorage.setItem(CAL_KEY, calendarCollapsed.value ? "1" : "0");
+  } catch {
+    /* 存不下就算了 —— 它只是个偏好 */
+  }
+}
+
 /** 递增以要求日历刷新标记。**每次保存都会递增** —— 所以别拿它去驱动整篇重载。 */
 const refreshToken = ref(0);
 
@@ -760,6 +805,53 @@ onUnmounted(() => {
 
     <template v-else-if="status">
       <header class="topbar">
+        <!--
+          日历栏开关（P2-22 沉浸式写日记）。
+
+          ⚠️ 它是**窗口级**的开关，不是第五个页面 —— 所以放顶栏**最左**、
+          和 .tabs 之间隔着 .brand（"日记"两个字）。⛔ 别挪进 .tabs、别紧贴它、
+          ⛔ 更别在它和 tab 之间加分割线 —— 用户 2026-09-23 的原话是
+          "和 tab 写在一行，有种功能错乱的感觉"，隔开才看得出性质不同。
+
+          ⚠️ `v-if="mode === 'write'"`：搜索 / 年轮 / 筛选页**根本没有日历栏**，
+          在那边摆一个图标点了没反应，只会让人困惑。
+
+          ⭐ 图标**固定不变**、状态靠 `title` 说 —— 与 EditorPane 的 `.shot-toggle`
+          同一套做法；做成"图标随状态变"会让人以为"这是个新按钮"。
+          ⭐ 它是项目第一个内联 `svg`：Unicode 里找不到字形稳定的"侧栏/面板"
+          （`◧` 换字体换字号就变形、对不齐），而 `stroke="currentColor"` 能跟随主题
+          —— ⛔ 绝不给它写死色号（项目在这条上栽过两轮）。
+        -->
+        <button
+          v-if="mode === 'write'"
+          type="button"
+          class="folder-toggle"
+          :title="calendarCollapsed ? '展开左侧日历栏' : '收起左侧日历栏'"
+          :aria-label="calendarCollapsed ? '展开左侧日历栏' : '收起左侧日历栏'"
+          :aria-expanded="!calendarCollapsed"
+          @click="toggleCalendar"
+        >
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+            <rect
+              x="1.25"
+              y="1.75"
+              width="13.5"
+              height="12.5"
+              rx="3"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+            />
+            <line
+              x1="5.6"
+              y1="2"
+              x2="5.6"
+              y2="14"
+              stroke="currentColor"
+              stroke-width="1.4"
+            />
+          </svg>
+        </button>
         <div class="brand">日记</div>
         <nav class="tabs">
           <button :class="{ on: mode === 'write' }" @click="mode = 'write'">
@@ -811,7 +903,17 @@ onUnmounted(() => {
 
       <main class="body">
         <template v-if="mode === 'write'">
+          <!--
+            ⭐ **`v-show`，不是 `v-if`**：`v-if` 会**卸载**组件 ⇒ 你翻到的月份、
+            打开的年月面板、已拉的标签列表全丢、展开瞬间还要重跑一遍 IPC（可能闪一下）。
+            `v-show` 只是 `display: none`，组件仍在、状态全留、展开即原样。
+            ✅ 这里用它是安全的：`CalendarPanel` 里**没有任何尺寸测量**
+            （对照 `EditorPane`：它靠量 `scrollWidth` 判缩略图装不装得下，
+             `display: none` 会让它量到 0 ⇒ 那边不能这么干。别照抄。）
+            ⚠️ 代价只是一个 268px 的 DOM 常驻（它本来就在，可忽略）。
+          -->
           <CalendarPanel
+            v-show="!calendarCollapsed"
             :selected="selected"
             :refresh-token="refreshToken"
             :first-date="stats?.first_date ?? null"
@@ -822,6 +924,7 @@ onUnmounted(() => {
           <EditorPane
             ref="editorRef"
             :date="selected"
+            :wide="calendarCollapsed"
             :tag-token="tagToken"
             :library-token="libraryToken"
             :auto-lock-entries="autoLockEntries"
@@ -967,6 +1070,26 @@ onUnmounted(() => {
   background: var(--surface);
   flex-shrink: 0;
 }
+/* 折叠日历栏的图标按钮（P2-22）：纯图标、固定 30×30
+   —— 尺寸恒定，顶栏不会因为悬停而抖；颜色全走变量（图标用 currentColor）。 */
+.folder-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  padding: 0;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.folder-toggle:hover {
+  background: var(--hover);
+  color: var(--text-1);
+}
 .brand {
   font-size: 15px;
   font-weight: 600;
@@ -1052,8 +1175,8 @@ onUnmounted(() => {
   窗口最窄是 720px（`tauri.conf.json` 的 `minWidth`）⇒ 到 880px 就把那行数字收起来，
   保证顶栏**不换行、不溢出、按钮都点得到**。
   ⚠️ 那行数字在年轮页里本来就有 ⇒ **一点信息都不丢**。
-  ⚠️ 这条**只做一次**：P2-22（折叠日历）也要占顶栏，它届时**只复查、别再加一份** ——
-     加两份会出现"一处生效、一处不生效"。
+  ✅ **这条只做一次**（P2-7 落地）：P2-22（折叠日历）也要占顶栏，它**只复查、没再加一份**
+     —— 加两份会出现"一处生效、一处不生效"。实测 720px 下顶栏不溢出、不换行。
 */
 @media (max-width: 880px) {
   .topbar {
