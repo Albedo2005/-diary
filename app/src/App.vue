@@ -30,6 +30,7 @@ import {
   setAutoBackup,
   toAppError,
   unlockWithAutoKey,
+  writtenDates,
   type AppStatus,
   type BackupStatus,
   type ChangePasswordResult,
@@ -93,6 +94,18 @@ const stats = ref<Stats | null>(null);
  *    都要重取，别漏。
  */
 const tags = ref<TagStat[]>([]);
+
+/**
+ * **所有写过的日期**（P2-17）—— "那年今日"与将来的回顾页都吃这一份。
+ *
+ * ⚠️ 为什么要一次查到最早：之后切日期全是**纯前端筛**（见 `sameDayInPastYears()`）
+ *    —— 所以翻日期不会因此变卡。写成"往前 5 年"反而会**在某天悄悄失效**，
+ *    而一次查全量（几百~几千条字符串）成本可忽略。
+ * ⚠️ 与日历侧栏那份**不是同一个东西**：那边按**当月**查（`CalendarPanel.load()`），
+ *    这里按**全时段**查；两者都不该被对方取代。
+ * ⚠️ 它是**派生数据**，已登记在下面 `loadAux` 那张清单里 —— 解锁后与恢复备份后都要重取。
+ */
+const writtenDays = ref<string[]>([]);
 const crypto = ref<CryptoInfo | null>(null);
 const backup = ref<BackupStatus | null>(null);
 /** 设置弹窗。日历与编辑器不被卸载，所以这里悬着也不影响未保存的草稿。 */
@@ -228,19 +241,24 @@ async function boot() {
  *                  日历侧栏与编辑器 chip 行仍各自去后端读，由 `tagToken` 驱动）
  *   - `crypto` —— 加密参数摘要
  *   - `backup` —— 备份状态（已有几份 / 下次什么时候）
- *   - `writtenDates` —— 写过的日期（【P2-17】起会加进来）
+ *   - `writtenDays` —— **所有写过的日期**（P2-17 加进来；编辑器头部那句
+ *                      "N 年前的今天"靠筛它得出。【P2-23】的回顾页也吃这一份）
  *   - （以后谁新增了缓存，往下补一行）
  */
 async function loadAux() {
   try {
-    const [s, c, b] = await Promise.all([
+    const [s, c, b, wd] = await Promise.all([
       getStats(),
       cryptoInfo(),
       getBackupStatus(),
+      // 上限写"今天"而不是更晚：未来日期的记录不该参与"写过的日子"这个集合。
+      // ⚠️ 下限写到最早（`0001-01-01`）而不是"往前 N 年" —— 见 writtenDays 的说明。
+      writtenDates("0001-01-01", todayKey()),
     ]);
     stats.value = s;
     crypto.value = c;
     backup.value = b;
+    writtenDays.value = wd;
   } catch {
     // 辅助信息失败不应阻塞主流程。
   }
@@ -287,6 +305,7 @@ async function refreshDerived() {
 function clearDerived() {
   stats.value = null;
   tags.value = [];
+  writtenDays.value = [];
   crypto.value = null;
   backup.value = null;
 }
@@ -700,9 +719,12 @@ onUnmounted(() => {
             :library-token="libraryToken"
             :auto-lock-entries="autoLockEntries"
             :triple-click-unlock="tripleClickUnlock"
+            :dates="writtenDays"
             @saved="onSaved"
             @tags-changed="onTagsChanged"
             @notice="flash"
+            @open="(d) => (selected = d)"
+            @goto-today="selected = todayKey()"
           />
         </template>
         <div v-else-if="mode === 'search'" class="search-wrap">

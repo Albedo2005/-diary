@@ -44,7 +44,8 @@ import {
   type Entry,
   type TagStat,
 } from "../api";
-import { humanDate } from "../utils/date";
+import OnThisDay from "./OnThisDay.vue";
+import { humanDate, todayKey } from "../utils/date";
 import { stripAttachmentImages } from "../utils/imageMarkdown";
 import { visibleText } from "../utils/text";
 
@@ -92,6 +93,16 @@ const props = defineProps<{
    *    「保存了」和「库被换掉了」是两件不同的事，就必须是两个令牌。
    */
   libraryToken?: number;
+  /**
+   * 所有**写过**的日子（P2-17）。由 `App.vue` 拉一次并缓存，经这里转交给
+   * `OnThisDay`。
+   *
+   * ⚠️ 它是**只读**的、而且**只在解锁后**才有值 —— 未解锁时是空数组，
+   *    `OnThisDay` 拿空数组筛不出东西，自然整行不渲染。
+   * ⚠️ **不许在这里自己拉一份**：日期列表全应用只有 `App.vue` 那一份，
+   *    【P2-23】的回顾页也吃它（见 App.vue 的"派生数据登记处"）。
+   */
+  dates?: string[];
 }>();
 
 const emit = defineEmits<{
@@ -100,6 +111,20 @@ const emit = defineEmits<{
   (e: "tags-changed"): void;
   /** 给用户的一句话反馈（由 App.vue 弹 toast）—— 与侧栏走同一条通道。 */
   (e: "notice", message: string): void;
+  /**
+   * 「那年今日」里的「去看看」被点了 —— 参数**只传日期字符串**。
+   *
+   * ⚠️ 事件名与参数形式**不要改**：P2-23 落地后要把它接过去，
+   *    把目标从"跳到那一天"改成"切到回顾页并定位那一年"（账在 P2-23 头上）。
+   */
+  (e: "open", date: string): void;
+  /**
+   * 「回今天」——编辑器头部的**回程票**（P2-17）。
+   *
+   * 它不止服务"那年今日"：从**搜索结果**、从**日历**跳到一个旧日期之后，
+   * 同样需要它。所以事件发到 `App.vue` 去改 `selected`。
+   */
+  (e: "goto-today"): void;
 }>();
 
 /**
@@ -369,6 +394,17 @@ function isPersisted(): boolean {
 const wordCount = computed(
   () => visibleText(content.value).replace(/\s/g, "").length
 );
+
+/**
+ * 现在看的这一天**不是今天** ⇒ 头部显示「回今天」（P2-17）。
+ *
+ * ⚠️ 必须写成 `computed` 并**读一下 `props.date`**（它就是靠这个依赖才重算的）：
+ *    写成模块级的 `const today = todayKey()` 只会在**软件启动那一刻**求值一次，
+ *    开着过夜就会失准（`CalendarPanel.vue` 里就有一处这样的历史写法，
+ *    ⛔ 那处在本次范围外、不要去动它）。
+ *    这样写至少能保证"你一换日期，它就重新判断"。
+ */
+const notToday = computed(() => props.date !== todayKey());
 
 /**
  * 切换锁定 / 解锁。
@@ -1281,12 +1317,40 @@ defineExpose({ flushNow: () => flush() });
 <template>
   <section class="editor">
     <header class="bar">
-      <div class="left">
-        <span class="date">{{ humanDate(props.date) }}</span>
-        <span class="meta">{{ wordCount }} 字</span>
-        <span v-if="saveLabel" class="save" :class="saveState">{{
-          saveLabel
-        }}</span>
+      <div class="bar-main">
+        <div class="left">
+          <span class="date">{{ humanDate(props.date) }}</span>
+          <!--
+            「回今天」—— 一张**回程票**，只在看的不是今天时出现（P2-17）。
+            它不止服务"那年今日"：从搜索结果、从日历跳到一个旧日期之后，
+            同样需要它（不然只能去点日历标题 → 弹面板 → 点「今天」，三步）。
+            ⛔ 不做成大按钮、也不常驻 —— 看着今天时它没有意义，不该占地方。
+            ⛔ 日历面板里那个「今天」**不搬不删**：那边是"我要去某天"（导航），
+               这边是"我要回来"（回家），两个不重复。
+          -->
+          <button
+            v-if="notToday"
+            class="today-link"
+            title="回到今天"
+            @click="emit('goto-today')"
+          >
+            回今天
+          </button>
+          <span class="meta">{{ wordCount }} 字</span>
+          <span v-if="saveLabel" class="save" :class="saveState">{{
+            saveLabel
+          }}</span>
+        </div>
+        <!--
+          「那年今日」—— 只有一句入口，不显示摘要 / 心情 / 字数。
+          ⚠️ 数据与判定都不在它身上：日期列表由 App.vue 缓存（dates），
+             判定在 utils/date.ts（P2-23 的回顾页用同一句）。
+        -->
+        <OnThisDay
+          :date="props.date"
+          :dates="props.dates"
+          @open="(d) => emit('open', d)"
+        />
       </div>
       <div class="right">
         <!--
@@ -1651,16 +1715,33 @@ defineExpose({ flushNow: () => flush() });
 }
 .bar {
   display: flex;
-  align-items: center;
+  /*
+    ⚠️ 左半边现在有**两行**（日期行 ＋ 那年今日），所以顶部对齐 ——
+       `center` 会把右边那两个按钮顶到两行中间，看着像没对齐。
+    ⛔ 不给这里写死高度或行数：P2-17 让行数变了、P2-22 之后宽度还会变。
+  */
+  align-items: flex-start;
   justify-content: space-between;
+  gap: 12px;
   margin-bottom: 14px;
   padding-bottom: 12px;
   border-bottom: 1px solid var(--border);
+}
+/*
+  左半边整体竖排：日期行在上、「那年今日」紧贴其下 ——
+  "今天"的正上方天生就是"过去的今天"，贴紧了语义才成立。
+*/
+.bar-main {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
 }
 .left {
   display: flex;
   align-items: baseline;
   gap: 14px;
+  min-width: 0;
 }
 .date {
   font-size: 15px;
@@ -1681,6 +1762,27 @@ defineExpose({ flushNow: () => flush() });
 }
 .save.saved {
   color: var(--ok);
+}
+/*
+  「回今天」—— 贴着日期的**细文字按钮**（一张回程票，不是主操作）。
+  样式照 `CalendarPanel` 的 `.picker-link` 那一路：小字、细边框、悬停才亮，
+  颜色全部走主题变量，深浅两套都不会露出写死的色号。
+*/
+.today-link {
+  padding: 2px 8px;
+  font-size: 12px;
+  font-family: inherit;
+  line-height: 1.4;
+  color: var(--text-2);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.today-link:hover {
+  color: var(--text-1);
+  border-color: var(--accent);
+  background: var(--hover);
 }
 .toggle {
   padding: 6px 14px;
