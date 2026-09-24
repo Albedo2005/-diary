@@ -49,9 +49,10 @@ probe-out/**
 target/**/*.d
 
 # 本地界面验收证据（验证脚本 / 日志 / 截图）—— 留给人看，不进版本库。
-# 目录按版本命名（如 _verify-2.9/），彼此不覆盖，方便回查"这一版当时是怎么验的"。
+# 目录按版本命名（如 _verify-2.9/、_ui-verify-p2-0/），彼此不覆盖，
+# 方便回查"这一版当时是怎么验的"。
 _verify-*/
-_ui-verify/
+_ui-verify*/
 
 # Never commit real diary data or key material
 *.diarydb
