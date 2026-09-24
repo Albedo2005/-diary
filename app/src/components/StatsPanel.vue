@@ -673,7 +673,6 @@ const streakCard = computed(() => {
                   ⛔ 不许退而求其次改成"上个月的今天"。 -->
           <section class="block">
             <h3>往年今天</h3>
-            <p class="cap">往年同一天的日记，逐年列出</p>
 
             <div class="recap-list">
               <p v-if="onThisDayRows.length === 0" class="empty-note">今天没有以前的日记。</p>
@@ -703,7 +702,6 @@ const streakCard = computed(() => {
           <!-- ── 写得最长的一篇 ─────────────────────────────────────── -->
           <section class="block">
             <h3>写得最长的一篇</h3>
-            <p class="cap">只算写过正文的日记（只有图片的那天不算）</p>
 
             <div class="recap-list">
               <p v-if="!longestCard.has" class="empty-note">还没有写过正文。</p>
@@ -730,7 +728,6 @@ const streakCard = computed(() => {
                ⛔ 一张图都没有时**不显示"0 张"的卡片**，只说一句"还没有图片。" -->
           <section class="block">
             <h3>照片最多的一篇</h3>
-            <p class="cap">附件只可能是图片，所以这里就是照片数</p>
 
             <div class="recap-list">
               <p v-if="!photosCard.has" class="empty-note">还没有图片。</p>
@@ -757,7 +754,6 @@ const streakCard = computed(() => {
                   （只要求逐日相接）不是一回事 —— 后者可能更长，这是对的。 -->
           <section class="block">
             <h3>最长连续同一种心情</h3>
-            <p class="cap">逐日相接、且心情相同（五种心情是并列的类型，不分高低）</p>
 
             <div class="recap-list">
               <p v-if="!streakCard.has" class="empty-note">还没有标过心情。</p>
