@@ -2,9 +2,19 @@
 /**
  * 统计面板（顶栏第三个 tab）。
  *
- * 数据全部来自**一条命令**（`getStats()` → Rust 的 `stats(today)`），
+ * 数据全部来自**两条命令**，且都由 `App.vue` 取好、**当 prop 传进来**：
+ *   1. `getStats()` → Rust 的 `stats(today)` —— 数字卡 / 热力图 / 心情 / 每月字数
+ *   2. `listTags()`（P2-19「常用标签」起）—— 那块榜
+ *
+ * ⚠️ **面板自己不发任何命令。** 让面板自己去 `await listTags()` 会让"这个数字从哪来"
+ *    变成两处，而"只吃 prop"正是这个文件最值钱的地方。
+ * ⚠️ 也**不要**把标签塞进 `stats` 的返回值：`stats` 是"数字统计"，塞一个列表进去
+ *    会让它变胖，而且每调一次都白带一份标签列表。
+ *
  * 这里只负责排版，不做任何统计口径的二次计算 —— 尤其"连续天数"：
  * 那种"从最近一篇往前逐日相接"的判定全项目只应有一份实现（在 `db.rs`）。
+ * 标签同理：篇数**直接吃后端的 `entry_count`**（它和数字卡那行"共 N 篇"是同一把尺子），
+ * 前端只做**过滤与排序**，绝不自己再数一遍。
  *
  * 图表一律用纯 CSS 画，**不引 ECharts 之类的重库**：
  * 日记的数据量很小（最多几百条），引一个图表库只会让安装包白白变大几 MB。
@@ -23,8 +33,8 @@
  *    所以下面把每个要显示的数字都收成**空安全的 computed**，
  *    模板里一次都不直接碰 `stats.xxx` —— 免得为"可能为 null"到处写判断。
  */
-import { computed } from "vue";
-import { MOODS, type Stats } from "../api";
+import { computed, ref } from "vue";
+import { MOODS, type Stats, type TagStat } from "../api";
 import {
   humanDateFull,
   humanMonth,
@@ -34,7 +44,7 @@ import {
   todayKey,
 } from "../utils/date";
 
-const props = defineProps<{ stats: Stats | null }>();
+const props = defineProps<{ stats: Stats | null; tags: TagStat[] }>();
 
 /** 点热力图某一格 → 跳到那天写日记。照抄 `SearchPanel` 的 `@open` 模式，不另发明一套。 */
 const emit = defineEmits<{ (e: "open", date: string): void }>();
@@ -228,6 +238,61 @@ const openDay = (d: HeatDay) => {
   if (d.future) return;
   emit("open", d.date);
 };
+
+/* ── 常用标签（P2-19） ──────────────────────────────────────────────────
+   统计页前三块都是**时间维度**（写了多少 / 什么时候写 / 心情如何），
+   这一块是**主题维度** —— 回答"我都在写什么"。放最后是维度切换，
+   不打断上面的时间叙述。
+
+   ⚠️ 气质同样是**照镜子，不是打分**（同热力图）：
+      · 标题叫「常用标签」，**不叫「标签排行」** —— "排行"带竞技感；
+      · 不给篇数少的标签用红/橙警示色。页面上的数字只描述事实
+        （"你写过多少篇"），不含"你应该多写"。
+
+   ⚠️ 前端**一个数都不算**：篇数直接吃后端的 `entry_count`
+      （它和数字卡里"共 N 篇"是同一把尺子），这里只**过滤 + 排序**。
+   ⚠️ 本块**只读**：不做点击跳转，也因此 ⛔ **绝不能给行加"看着能点"的悬停样式**
+      —— "点标签看那批日记"是 P2-7 筛选页的事。 */
+
+/** 默认只显示前 10 —— 统计页是概览，不该被三十个标签拉成一长条。 */
+const TAG_TOP_N = 10;
+
+/**
+ * 有篇数的标签，按篇数降序。
+ *
+ * ⚠️ 两个刻意的点：
+ *   1. **0 篇的不上榜** —— 后端是**故意**保留它们的（界面上看不见用户就没机会删），
+ *      但放进这份榜就是噪音。过滤只在前端做，后端那条 `ORDER BY 名字` 一个字不动。
+ *   2. **二次键必须显式写全** —— 篇数相同时得有确定的次序，否则每次刷新
+ *      并列的几行会互换位置。不再靠 JS `sort` 的稳定性兜底（虽然规范要求稳定，
+ *      但写出来下一个人（就是你）才看得懂）。
+ */
+const rankedTags = computed(() =>
+  (props.tags ?? [])
+    .filter((t) => t.entry_count > 0)
+    .sort((a, b) => b.entry_count - a.entry_count || a.name.localeCompare(b.name, "zh"))
+);
+
+const maxTagCount = computed(() => Math.max(1, ...rankedTags.value.map((t) => t.entry_count)));
+
+/**
+ * 条宽按最大值归一（第一名满格）。
+ * ⚠️ 留 6% 下限：只有 1 篇的标签若按 1/120 算就是一条**看不见的线**，
+ *    读者会以为"这一行没画出来"。
+ */
+const tagWidth = (n: number) => `${Math.max(6, (n / maxTagCount.value) * 100)}%`;
+
+const tagExpanded = ref(false);
+const shownTags = computed(() =>
+  tagExpanded.value ? rankedTags.value : rankedTags.value.slice(0, TAG_TOP_N)
+);
+const hiddenTagCount = computed(() => Math.max(0, rankedTags.value.length - TAG_TOP_N));
+
+/**
+ * 写过日记、却一个标签都没用过（或全都是 0 篇）。
+ * 给一句人话，**不许显示一片空白**。
+ */
+const tagEmpty = computed(() => rankedTags.value.length === 0);
 </script>
 
 <template>
@@ -360,6 +425,39 @@ const openDay = (d: HeatDay) => {
             <span class="lab">{{ monthLabel(m.key) }}</span>
           </div>
         </div>
+      </section>
+
+      <!-- ── 常用标签（P2-19） ───────────────────────────────────
+           复用心情分布那套横条结构（`.mood-row` / `.track` / `i`）——
+           统计页几块长得像一家人，比多写一套样式值。 -->
+      <section class="block">
+        <h3>常用标签</h3>
+        <!-- 这句必须写在界面上：用户才敢信两个地方的数字是一回事。 -->
+        <p class="cap">按篇数排序，只算写过的日记（口径与上面"共 N 篇"一致）</p>
+
+        <p v-if="tagEmpty" class="empty-note">
+          还没有用过标签 —— 写日记时可以在正文下面加标签。
+        </p>
+
+        <template v-else>
+          <div class="moods tag-list">
+            <div v-for="t in shownTags" :key="t.id" class="mood-row">
+              <!-- 名字可能很长：限宽 ＋ 省略号，全名走 :title（日历页同款做法）。 -->
+              <span class="tag-name" :title="t.name">{{ t.name }}</span>
+              <span class="track"><i :style="{ width: tagWidth(t.entry_count) }"></i></span>
+              <!-- ⛔ 绝对篇数必须写出来：条只说明**相对**多少，不给数字就没法读准。 -->
+              <span class="num">{{ t.entry_count }} 篇</span>
+            </div>
+          </div>
+          <button
+            v-if="hiddenTagCount > 0"
+            type="button"
+            class="more"
+            @click="tagExpanded = !tagExpanded"
+          >
+            {{ tagExpanded ? "收起" : `+ 还有 ${hiddenTagCount} 个标签` }}
+          </button>
+        </template>
       </section>
     </template>
   </div>
@@ -606,5 +704,36 @@ const openDay = (d: HeatDay) => {
 }
 .heat-legend .lg-note {
   margin-left: 6px;
+}
+
+/* ── 常用标签（P2-19） ───────────────────────────────────────
+   颜色**只用现有主题变量**（`var(--accent)` / `var(--hover)` / `var(--text-*)`），
+   ⛔ 一个硬编码色号都不许出现（热力图那两轮栽的正是这一类错）。 */
+.tag-list .tag-name {
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text-2);
+}
+/* 篇数可能上三位数（"128 篇"），比心情那一格宽一点，免得折行。 */
+.tag-list .num {
+  width: 52px;
+}
+/* 折叠行：一个中性的小按钮 —— ⛔ 别做成主按钮，那不是这块的重点。 */
+.more {
+  margin-top: 8px;
+  padding: 2px 8px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text-3);
+  cursor: pointer;
+}
+.more:hover {
+  background: var(--hover);
+  color: var(--text-2);
 }
 </style>

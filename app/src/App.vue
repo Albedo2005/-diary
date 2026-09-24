@@ -25,6 +25,7 @@ import {
   getStats,
   getStatus,
   integrityCheck,
+  listTags,
   lockVault,
   setAutoBackup,
   toAppError,
@@ -34,6 +35,7 @@ import {
   type ChangePasswordResult,
   type CryptoInfo,
   type Stats,
+  type TagStat,
 } from "./api";
 import { humanBytes, todayKey } from "./utils/date";
 
@@ -79,6 +81,18 @@ const libraryToken = ref(0);
 const tagToken = ref(0);
 
 const stats = ref<Stats | null>(null);
+
+/**
+ * 标签列表 —— 只给统计页的「常用标签」块用。
+ *
+ * 标签同时出现在**三个**地方：日历侧栏的列表、编辑器 chip 行 ＋ 下拉候选，
+ * 以及统计页这块榜。前两处**各自**去后端读（由 `tagToken` 驱动）；这里存一份，
+ * 是因为统计面板必须保持"只吃 prop"（理由见 `StatsPanel.vue` 文件头）。
+ *
+ * ⚠️ 它是**派生数据**，已登记在下面 `loadAux` 那张清单里 —— 解锁后与恢复备份后
+ *    都要重取，别漏。
+ */
+const tags = ref<TagStat[]>([]);
 const crypto = ref<CryptoInfo | null>(null);
 const backup = ref<BackupStatus | null>(null);
 /** 设置弹窗。日历与编辑器不被卸载，所以这里悬着也不影响未保存的草稿。 */
@@ -175,7 +189,17 @@ async function boot() {
 
     status.value = s;
     if (s.unlocked) {
-      await loadAux();
+      // ⚠️ 走的是与"解锁成功后""恢复备份后"**同一段**重取代码（`refreshDerived`），
+      //    不是只拉 `loadAux()`。
+      //
+      //    为什么这条路径要紧：**免密打开**时库一开始就是解锁的
+      //    （`unlockWithAutoKey`），全程不会经过 `onUnlocked`；
+      //    同一个进程里 reload 界面也会落到这里。
+      //    以前这里写的是 `loadAux()`，在只统计"数字"的年代没问题；
+      //    P2-19 给登记处加了 `tags` 之后，"只拉 loadAux"就意味着
+      //    **每次冷启动统计页的「常用标签」都是空的**（要改一次标签才出来）。
+      //    ⇒ 以后谁再往登记处加一项，三个入口自动都覆盖 —— 这就是登记处的用处。
+      await refreshDerived();
       // 设置也得跟着读一次：库里存的可能是 1 分钟或永不，
       // 先用默认值起步会让自动锁定在启动后的一小段时间里用错时长。
       // 免密自动解锁同样会走到这里，所以它读到的也是真实设置。
@@ -200,7 +224,8 @@ async function boot() {
  *
  * 目前在册：
  *   - `stats`  —— 统计那一屏 ＋ 顶栏的"共 N 篇 · 连续 N 天"
- *   - `tags`   —— 标签（由 `tagToken` 驱动，两个标签界面各自去后端读）
+ *   - `tags`   —— 标签（App.vue 这里缓存一份，给统计页的「常用标签」块；
+ *                  日历侧栏与编辑器 chip 行仍各自去后端读，由 `tagToken` 驱动）
  *   - `crypto` —— 加密参数摘要
  *   - `backup` —— 备份状态（已有几份 / 下次什么时候）
  *   - `writtenDates` —— 写过的日期（【P2-17】起会加进来）
@@ -222,15 +247,34 @@ async function loadAux() {
 }
 
 /**
+ * 只重读标签列表（统计页的「常用标签」块读它）。
+ *
+ * ⚠️ 为什么单独一个函数、不并进 `loadAux`：`loadAux` 还拉着 `cryptoInfo` /
+ *    `getBackupStatus` 两条与标签毫无关系的命令，而标签是**会被频繁改动**的一项
+ *    （加一个、撤一个、改个名都会走 `onTagsChanged`）—— 每次顺手重拉那两条是白费。
+ */
+async function loadTags() {
+  try {
+    tags.value = await listTags();
+  } catch {
+    // 读不到标签不该干扰主流程；留空列表，面板会显示"还没有用过标签"。
+  }
+}
+
+/**
  * 重取**全部**派生数据（见上面那张登记表）。
  *
- * ⚠️ 解锁成功后与恢复成功后**走的是同一段代码**（调用点：`onUnlocked`
- *    与 `onRestoreDone`）。这不是图省事 —— 这两件事的语义本来就一样：
- *    "库的内容变了，界面上所有从库里算出来的东西都作废"。
- *    各写一份的话，早晚有一个人会漏掉其中一项。
+ * ⚠️ **三个调用点走的是同一段代码**：`boot()`（库在启动时就已解锁 —— 免密打开
+ *    或界面 reload）、`onUnlocked`、`onRestoreDone`。这不是图省事 ——
+ *    这三件事的语义本来就一样："库的内容变了，界面上所有从库里算出来的东西都作废"。
+ *    各写一份的话，早晚有一个人会漏掉其中一项
+ *    （P2-19 真的栽过：`boot()` 漏了，于是开了免密的人每次启动榜都是空的）。
  */
 async function refreshDerived() {
   await loadAux();
+  // ⚠️ 标签也在册 —— 恢复备份是**整库替换**，统计页那块榜读的就是这里缓存的
+  //    `tags`，不重取就会出现"恢复完了，榜还是恢复前的"。
+  await loadTags();
   // 标签同时出现在日历侧栏与编辑器 chip 行，两边各自去后端读，递增令牌即可。
   tagToken.value++;
 }
@@ -242,6 +286,7 @@ async function refreshDerived() {
  */
 function clearDerived() {
   stats.value = null;
+  tags.value = [];
   crypto.value = null;
   backup.value = null;
 }
@@ -304,7 +349,7 @@ function onSaved() {
 }
 
 /**
- * 任何一处改了标签（编辑器加/撤、侧栏改名/删除）→ 让两处界面都重读。
+ * 任何一处改了标签（编辑器加/撤、侧栏改名/删除）→ 让三个标签界面都重读。
  *
  * ⚠️ 只递增令牌，**不判断是谁改的**：判断"这次改动影响哪些视图"需要
  *    在前端复制一份标签与日记的关联关系，而那份镜像迟早会与数据库不一致
@@ -312,7 +357,12 @@ function onSaved() {
  */
 function onTagsChanged() {
   tagToken.value++;
-  // 标签改了不影响统计（统计只看正文），所以这里不重拉 loadAux。
+  // ⚠️ 统计页新增了「常用标签」块，它读的正是 App.vue 缓存的 `tags` ——
+  //    标签一改，那块榜必须跟着变。（这里原来写着"标签改了不影响统计"，
+  //    加上那块榜之后那句话直接作废。）
+  //    ⛔ 只重取标签，**不要图省事调 `loadAux()`** —— 那会白拉 cryptoInfo
+  //    与备份状态两条跟标签毫无关系的命令。
+  void loadTags();
 }
 
 async function doLock() {
@@ -666,9 +716,13 @@ onUnmounted(() => {
           />
         </div>
         <div v-else class="stats-wrap">
-          <!-- 热力图点格子 → 跳到那天写日记（与搜索结果的 @open 是同一套动作）。 -->
+          <!--
+            热力图点格子 → 跳到那天写日记（与搜索结果的 @open 是同一套动作）。
+            标签走**第二个 prop** —— 面板自己不发命令（见 StatsPanel.vue 文件头）。
+          -->
           <StatsPanel
             :stats="stats"
+            :tags="tags"
             @open="
               (d) => {
                 selected = d;
