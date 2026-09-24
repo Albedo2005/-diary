@@ -46,6 +46,7 @@ import {
 } from "../api";
 import { humanDate } from "../utils/date";
 import { stripAttachmentImages } from "../utils/imageMarkdown";
+import { visibleText } from "../utils/text";
 
 const props = defineProps<{
   date: string;
@@ -357,8 +358,16 @@ function isPersisted(): boolean {
   return entry.value !== null && entry.value.id !== 0;
 }
 
+/**
+ * 编辑器右上角那个「N 字」。
+ *
+ * "正文里哪些算字"收在 `utils/text.ts::visibleText()` 里（唯一入口）。
+ * ⚠️ 它现在原样返回，所以这里算出来的数与改动前**一模一样**；
+ *    将来正文多出格式标记时，改那一个函数即可，这里不用动。
+ * ⚠️ 与后端 `word_count` 列的 emoji 口径差异**照旧保留**（那是富文本落地时的账）。
+ */
 const wordCount = computed(
-  () => content.value.replace(/\s/g, "").length
+  () => visibleText(content.value).replace(/\s/g, "").length
 );
 
 /**
