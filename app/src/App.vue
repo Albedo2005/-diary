@@ -20,6 +20,7 @@ import {
   cryptoInfo,
   DEFAULT_AUTO_LOCK_ENTRIES,
   DEFAULT_AUTO_LOCK_SECS,
+  DEFAULT_DAILY_WORD_GOAL,
   DEFAULT_REMINDER_MODE,
   DEFAULT_REMINDER_TIME,
   DEFAULT_TRIPLE_CLICK_UNLOCK,
@@ -293,6 +294,19 @@ const reminderLastFired = ref("");
 const autoStart = ref(false);
 
 /**
+ * 每日字数目标（【P2-12】）。`0` ＝ **不用这个功能**（底部不显示目标）。
+ *
+ * 与上面几项同一套路：先用默认值起步，解锁后由 `loadSettings()` 换成真值。
+ *
+ * ⚠️ 初值必须是 `0`：设置要等解锁才读得回来，那段时间里编辑器底部
+ *    **不该先闪一下目标再消失**。
+ * ⚠️ 它住在**加密库**里（与其余设置一样）—— ⛔ 不进 `localStorage`，
+ *    那是放界面偏好的地方。
+ * ⚠️ 真值源只有这一个：`EditorPane` 与设置页都从这里拿（设置不能有两份）。
+ */
+const dailyWordGoal = ref(DEFAULT_DAILY_WORD_GOAL);
+
+/**
  * 提醒横幅是否挂着（【P2-13】）。
  *
  * ⚠️ 它**不是 toast**：toast 是 3 秒就走掉的操作反馈，
@@ -547,6 +561,8 @@ async function loadSettings() {
     reminderTime.value = s.reminder_time;
     reminderLastFired.value = s.reminder_last_fired;
     autoStart.value = s.auto_start;
+    // 每日字数目标（【P2-12】）。`0` ＝ 不用，编辑器底部那一句随之消失。
+    dailyWordGoal.value = s.daily_word_goal;
   } catch {
     // 保持默认值。不值得为这一项弹错误。
   }
@@ -1014,6 +1030,17 @@ function onAutoStart(on: boolean) {
 }
 
 /**
+ * 设置页改了每日字数目标（【P2-12】）。传过来的是**后端洗净后的值**
+ * （`-5` ⇒ `0`、`999999` ⇒ `100000`）。
+ *
+ * ⚠️ 设置页那个输入框会自己回填洗净值，但**真值源是这里的 ref** ——
+ *    编辑器底部那一句吃的就是它，两边因此不会各说各话。
+ */
+function onDailyWordGoal(n: number) {
+  dailyWordGoal.value = n;
+}
+
+/**
  * 改完提醒设置立刻生效：重看一眼（不用重启软件）。
  * ⚠️ 幂等 —— `reminderCheckedOn` 会挡住当天已经判断过的情况。
  */
@@ -1242,6 +1269,7 @@ onUnmounted(() => {
             :library-token="libraryToken"
             :auto-lock-entries="autoLockEntries"
             :triple-click-unlock="tripleClickUnlock"
+            :daily-word-goal="dailyWordGoal"
             :dates="writtenDays"
             @saved="onSaved"
             @tags-changed="onTagsChanged"
@@ -1339,6 +1367,7 @@ onUnmounted(() => {
         :reminder-mode="reminderMode"
         :reminder-time="reminderTime"
         :auto-start="autoStart"
+        :daily-word-goal="dailyWordGoal"
         @close="showSettings = false"
         @backup="doBackup"
         @integrity="doIntegrity"
@@ -1350,6 +1379,7 @@ onUnmounted(() => {
         @reminder-mode="onReminderMode"
         @reminder-time="onReminderTime"
         @auto-start="onAutoStart"
+        @daily-word-goal="onDailyWordGoal"
         @password-changed="onPasswordChanged"
         @auto-login-changed="onAutoLoginChanged"
         @refresh-status="refreshStatus"

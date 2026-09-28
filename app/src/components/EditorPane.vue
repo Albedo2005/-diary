@@ -78,6 +78,18 @@ const props = defineProps<{
    */
   tripleClickUnlock?: boolean;
   /**
+   * 每日字数目标（【P2-12】）。`0` / `undefined` ＝ **不用这个功能**
+   * （底部不显示目标那一句）。
+   *
+   * ⚠️ `undefined`（父组件还没读到设置）按**不用**处理，方向与
+   *    `autoLockEntries` 的"`undefined` 按锁处理"**正好相反**：
+   *    这一项读错方向最多是"底部少一句提示"；反过来按"有目标"处理，
+   *    会在设置还没读回来的一瞬间**闪一个并不存在的目标**。
+   *    真正"老库默认不用"的语义落在库里的默认值上（见 db.rs 的同名常量）。
+   * ⚠️ 它只在看**今天**时显示（见 `showGoal` 的说明）。
+   */
+  dailyWordGoal?: number;
+  /**
    * 「整个库被换掉了」信号（P2-5 恢复备份时由父组件递增）。
    *
    * 为什么必须有它：恢复是**整库替换**，而 `selected`（正在看哪天）通常没变 ——
@@ -431,6 +443,33 @@ const wordCount = computed(
  *    这样写至少能保证"你一换日期，它就重新判断"。
  */
 const notToday = computed(() => props.date !== todayKey());
+
+/**
+ * 每日字数目标（【P2-12】）。`0` ＝ 不用这个功能。
+ *
+ * ⚠️ `undefined` 一律当 `0` —— 理由见 prop 声明里那条"方向相反"的说明。
+ */
+const goal = computed(() => props.dailyWordGoal ?? 0);
+
+/**
+ * 目标那一句要不要显示。
+ *
+ * ⭐ **只有看"今天"时才显示**：目标是给今天的。翻到别的日子还显示它，
+ *    会被读成"这天只写了 62 字"——那是**错的信息**，比不显示糟得多。
+ * ⚠️ 它读 `notToday`（而不是自己再调一次 `todayKey()`）：
+ *    "今天是什么"只有那一个依赖 `props.date` 的地方，多一份迟早对不上。
+ */
+const showGoal = computed(() => goal.value > 0 && !notToday.value);
+
+/**
+ * 已经写到目标了。
+ *
+ * 达成后底部那一句**整个换掉**（不是加一个尾巴）：用户 2026-09-28 拍板
+ * "只留「今天已完成 ✓」" —— 数字与目标都收起来，对勾走 `--ok` 的绿色。
+ */
+const goalReached = computed(
+  () => showGoal.value && wordCount.value >= goal.value
+);
 
 /**
  * 切换锁定 / 解锁。
@@ -1362,7 +1401,21 @@ defineExpose({ flushNow: () => flush() });
           >
             回今天
           </button>
-          <span class="meta">{{ wordCount }} 字</span>
+          <!--
+            字数目标（【P2-12】）—— 只在看**今天**时出现，达成后换成
+            一句「今天已完成 ✓」（✓ 走 --ok 的成功色）。
+            ⚠️ 达成前是「N / 目标 字」：把原来那句「N 字」**整个换成比值**，
+               ⛔ 不是"两句并排"（用户 2026-09-28 挑的就是这个形状）。
+            ⛔ 不做进度条、⛔ 不变红、⛔ 不加感叹号 / 弹窗 / 音效 ——
+               它是个鼓励性的数字，不是考核。
+          -->
+          <span v-if="showGoal && goalReached" class="meta">
+            今天已完成 <span class="tick">✓</span>
+          </span>
+          <span v-else-if="showGoal" class="meta"
+            >{{ wordCount }} / {{ goal }} 字</span
+          >
+          <span v-else class="meta">{{ wordCount }} 字</span>
           <span v-if="saveLabel" class="save" :class="saveState">{{
             saveLabel
           }}</span>
@@ -1789,6 +1842,17 @@ defineExpose({ flushNow: () => flush() });
   font-size: 12px;
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
+}
+/*
+  字数目标达成时那个对勾（【P2-12】）。
+  ⚠️ 颜色走 `--ok`（成功色），深浅两套主题都有定义 —— ⛔ 不许写死色号。
+  ⚠️ 只让**对勾**变绿，句子本身仍是 `.meta` 的 `--text-3`：
+     用户 2026-09-28 的原话是"绿色对勾"，而整句变绿会让这一行
+     和旁边那些状态字（「已保存」之类）抢语气。
+  ⛔ 不许用红色 / 感叹号 / 动效 —— 这是鼓励性的数字，不是考核。
+*/
+.tick {
+  color: var(--ok);
 }
 .save {
   font-size: 12px;

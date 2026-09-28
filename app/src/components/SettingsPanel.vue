@@ -35,6 +35,7 @@ import pkg from "../../package.json";
 import {
   AUTO_LOCK_OPTIONS,
   CLOSE_ACTION_OPTIONS,
+  MAX_DAILY_WORD_GOAL,
   REMINDER_MODE_OPTIONS,
   changePassword,
   copyBackupsTo,
@@ -48,6 +49,7 @@ import {
   setAutoLockSecs,
   setAutoStart,
   setCloseAction,
+  setDailyWordGoal,
   setReminderEnabled,
   setReminderMode,
   setReminderTime,
@@ -95,6 +97,13 @@ const props = defineProps<{
   reminderTime: string;
   /** 开机自启（【P2-13】）。由 App.vue 持有（它负责解锁后校正注册表路径）。 */
   autoStart: boolean;
+  /**
+   * 每日字数目标（【P2-12】）。`0` ＝ **不用这个功能**。
+   *
+   * ⚠️ 真值源在 App.vue —— 它还要把同一个值传给 `EditorPane`
+   *    （编辑器底部那一句吃的就是它），放两份必然对不上。
+   */
+  dailyWordGoal: number;
 }>();
 
 const emit = defineEmits<{
@@ -141,6 +150,12 @@ const emit = defineEmits<{
   (e: "reminder-mode", mode: ReminderMode): void;
   /** 「开机自启」已成功写入后端（【P2-13】）。 */
   (e: "auto-start", on: boolean): void;
+  /**
+   * 每日字数目标已成功写入后端（【P2-12】）。
+   * 带的是**后端洗净后的值**（`-5` ⇒ `0`、`999999` ⇒ `100000`）——
+   * 它可能和用户填的不一样，App.vue 要拿它当新真值。
+   */
+  (e: "daily-word-goal", goal: number): void;
   /** 一句提示，由 App.vue 的 toast 显示。 */
   (e: "notice", message: string): void;
 }>();
@@ -423,6 +438,36 @@ async function onToggleAutoStart(e: Event) {
     emit("auto-start", next);
   } catch (err) {
     el.checked = props.autoStart; // 回滚，不留假状态
+    emit("notice", toAppError(err).message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 每日字数目标（【P2-12】）
+// ---------------------------------------------------------------------------
+
+/**
+ * 改「每日字数目标」。
+ *
+ * ⚠️ 必须拿后端返回的值**回填那个框**（与 `onChangeReminderTime` 同一理由）：
+ *    这一项**不报错**（留空 / 负数 / 原文 / 超上限都能得出一个合法结果），
+ *    只会被修正。不回填的话，用户看到的和真正存下去的就不是同一个数。
+ * ⚠️ **留空是合法输入**（＝ 不用这个功能）⇒ ⛔ 不能像别的字段那样
+ *    在 `!next` 时直接 `return` —— 那样用户清空之后目标还挂在编辑器底部。
+ * ⚠️ 回填时 `0` 要显示成**空框**，⛔ 不是显示一个 `0`：
+ *    `0` 在这里的意思是"不用"，写个 `0` 会让人以为"目标是 0 个字"。
+ */
+async function onChangeDailyWordGoal(e: Event) {
+  const el = e.target as HTMLInputElement;
+  const raw = el.value;
+  // 本来就是"不用"、这次也是空 ⇒ 没有什么可写的（免得白撞一次 IPC）。
+  if (!raw.trim() && props.dailyWordGoal === 0) return;
+  try {
+    const clean = await setDailyWordGoal(raw);
+    el.value = clean > 0 ? String(clean) : ""; // 把界面拨到后端那句话上
+    emit("daily-word-goal", clean);
+  } catch (err) {
+    el.value = props.dailyWordGoal > 0 ? String(props.dailyWordGoal) : ""; // 回滚
     emit("notice", toAppError(err).message);
   }
 }
@@ -1331,10 +1376,11 @@ async function doCopyBackups() {
           <!-- ── 通用（【P2-21】新增；【P2-13】加了三项） ──────────────
                这一栏回答的是"让写日记这件事**自己发生**"：
                关掉窗口还留在后台、到点提醒、开机自己起来。
-               顺序：写作提醒 → 提醒节奏 → 提醒时间 → 开机自启 → 点击关闭时。
-               ⚠️ "提醒"排最前，因为它才是这一栏的**目的** ——
-                  关闭行为与开机自启都只是"让提醒响得了"的手段。
-               （每日字数目标归【P2-12】，落地时也往这栏里加。） -->
+               顺序：写作提醒 → 提醒节奏 → 提醒时间 → 开机自启 → 点击关闭时
+                   → **每日字数目标**。
+               ⚠️ 前四项是**一条链**（"让提醒响得了"）；每日字数目标与它们无关，
+                  所以另起一段、排在**最末**（【P2-12】落地时加，指令原文：
+                  "往 P2-13 那 5 行后面接着排，别插到中间"）。 -->
           <section v-else-if="tab === 'general'">
             <!--
               ⚠️ 说明文字**每项一句**：用户 2026-09-28 当场定的规矩 ——
@@ -1423,6 +1469,34 @@ async function doCopyBackups() {
                     {{ o.label }}
                   </option>
                 </select>
+              </div>
+            </div>
+
+            <!--
+              每日字数目标（【P2-12】）。
+              ⚠️ 排在**最末** —— 指令原文："往 P2-13 那 5 行后面接着排，别插到中间"。
+                 它跟上面四项不是一族（那四项都在"让提醒响得了"这条链上），
+                 所以另起一段、放在末尾。
+              ⚠️ 这一行**不写说明**（用户 2026-09-28 当场定的："不写"）——
+                 标题自己说清了；"留空 ＝ 不用"清空那个框就知道了。
+                 ⛔ 别为了"好懂"再加一句解释，那会破 9-28 立的那条规矩。
+              ⚠️ 它是**自己填**的数字（填 `137` 就是 `137`），
+                 ⛔ 不是 50 / 100 / 200 那种固定档位 —— 用户明确否掉过。
+            -->
+            <div class="row">
+              <div class="label">
+                <div class="t">每日字数目标</div>
+              </div>
+              <div class="ctl">
+                <input
+                  type="number"
+                  min="0"
+                  :max="MAX_DAILY_WORD_GOAL"
+                  step="1"
+                  :value="dailyWordGoal > 0 ? dailyWordGoal : ''"
+                  @change="onChangeDailyWordGoal"
+                />
+                <span class="unit">字</span>
               </div>
             </div>
           </section>
@@ -1640,6 +1714,32 @@ input[type="time"] {
 input[type="time"]:disabled {
   color: var(--text-3);
   cursor: default;
+}
+
+/*
+ * 数字框（每日字数目标，【P2-12】）：同一套外观，但要**窄**。
+ * ⚠️ 默认宽度是"填满一行的长度"，而后面的单位「字」会被甩到很远的地方，
+ *    看着像两个不相干的控件。宽度按"6 位数 ＋ 上下箭头"留够即可
+ *    （后端上限十万，所以最长就是 6 位）。
+ */
+input[type="number"] {
+  width: 84px;
+  padding: 5px 9px;
+  font-size: 13px;
+  color: var(--text-1);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+
+/*
+ * 数字框后面的单位（【P2-12】）。
+ * ⚠️ 它是**单位**、不是说明文字 —— 所以不占 `.d` 那一行，
+ *    也就没有破"界面上的解释最多一句、最好没有"那条规矩。
+ */
+.unit {
+  font-size: 12px;
+  color: var(--text-3);
 }
 
 /* 开关：朴素的原生 checkbox，不引组件库 */

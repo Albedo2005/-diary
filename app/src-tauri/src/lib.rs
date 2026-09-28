@@ -234,6 +234,10 @@ pub fn run() {
             commands::present_reminder,
             commands::set_auto_start,
             commands::sync_auto_start,
+            // 每日字数目标（【P2-12】）。
+            // ⚠️ 读它**不走单独的命令**：值在 `get_settings` 那个结构体里
+            //    （与提醒那几项同一手法，加字段不用加读命令）。
+            commands::set_daily_word_goal,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");

@@ -78,6 +78,16 @@ pub mod setting_keys {
     ///    （用户拿别的工具删了注册表项之类），校正方向见
     ///    `commands::sync_auto_start()`。
     pub const AUTO_START: &str = "auto_start";
+    /// 每日字数目标（【P2-12】）。十进制数字的字符串；`0` ＝ 不用这个功能。
+    ///
+    /// ⚠️ 与 `CLOSE_ACTION` **不是**同一路：那一项"键不存在"是一个**独立状态**
+    ///    （要跟提醒走），而这一项没有第三态 —— 键不存在与 `0` 行为完全一样
+    ///    （都是"不显示目标"）。所以读取端"缺失 / 读不懂"一律回落 `0`、不报错。
+    ///
+    /// ⚠️ 它是个**鼓励性**的数字，不是考核：非数字 / 负数回落 `0`，
+    ///    超过上限**钳到上限**（用户填 `999999` 想表达的是"很高"，
+    ///    别把他的设置抹成"没设"）。
+    pub const DAILY_WORD_GOAL: &str = "daily_word_goal";
 }
 
 /// 自动锁定时长的**档位白名单**（秒）。`0` 表示"永不"。
@@ -111,6 +121,20 @@ pub const DEFAULT_AUTO_LOCK_ENTRIES: bool = true;
 ///    "选中一整段"，一个字节都不改）。老库（没有这个 key）走同一个默认值。
 ///    读取时沿用 `auto_lock_entries` 的口径：**只有精确 "false" 才算关**。
 pub const DEFAULT_TRIPLE_CLICK_UNLOCK: bool = true;
+
+/// 每日字数目标的出厂默认值：**`0` ＝ 不用这个功能**（【P2-12】）。
+///
+/// ⚠️ 默认必须是"不用"：这是个纯鼓励性的数字，用户没要求就不该有
+///    任何"你还差多少字"的东西出现在屏幕上。
+pub const DEFAULT_DAILY_WORD_GOAL: u32 = 0;
+
+/// 每日字数目标的**上限**：十万字（【P2-12】）。
+///
+/// ⚠️ 超出**钳到上限**，不是回落 `0` —— 用户填 `999999` 想表达的是
+///    "很高"，把他这一项抹成"没设"是**把他的设置删了**，比钳住糟得多。
+///    上限存在的理由只是防止一个荒谬的数字把界面撑坏
+///    （`type="number"` 能被粘进任意长的串）。
+pub const MAX_DAILY_WORD_GOAL: u32 = 100_000;
 
 /// 应用设置。
 ///
@@ -157,6 +181,13 @@ pub struct AppSettings {
     pub reminder_last_fired: String,
     /// 开机自启（【P2-13】）。默认**关**。
     pub auto_start: bool,
+    /// 每日字数目标（【P2-12】）。`0` ＝ **不用这个功能**（编辑器底部不显示目标）。
+    ///
+    /// ⚠️ 它是**设置**，不是内容：⛔ 不进 `entry` 表、⛔ 不落 `localStorage`，
+    ///    与其余设置一样住在加密库里。
+    /// ⚠️ 目标只在看**今天**时显示 —— 翻到别的日子还用它会让人误读成
+    ///    "这天只写了这么多"。
+    pub daily_word_goal: u32,
 }
 
 impl Default for AppSettings {
@@ -176,6 +207,9 @@ impl Default for AppSettings {
             reminder_time: DEFAULT_REMINDER_TIME.to_string(),
             reminder_last_fired: String::new(),
             auto_start: false,
+            // 每日字数目标默认"不用"（【P2-12】）—— 没要求就不该有
+            // 任何"你还差多少字"的东西出现在屏幕上。
+            daily_word_goal: DEFAULT_DAILY_WORD_GOAL,
         }
     }
 }
@@ -308,6 +342,29 @@ pub fn normalize_reminder_time(raw: &str) -> String {
         return DEFAULT_REMINDER_TIME.to_string();
     }
     format!("{h:02}:{m:02}")
+}
+
+/// 把"库里那一格"洗净成每日字数目标（【P2-12】）。
+///
+/// ⚠️ **写入与读取共用这一处**（与 `normalize_reminder_time` 同一路数）：
+///    "前端给了个怪值"与"库里被外部工具写坏"因此走同一条回落路径。
+///
+/// 宽容到什么程度是**刻意**的：
+///   - `"100"`    ⇒ `100`（**非整十、非档位的值一律保留** —— 用户要的就是自己填）
+///   - `"-5"`     ⇒ `0`（负数不是坏值，是"不用"）
+///   - `"abc"` / `""` / 缺失 ⇒ `0`，**不报错**
+///   - `"999999"` ⇒ `100000`（**钳到上限，不是回落 0** —— 见 `MAX_DAILY_WORD_GOAL`）
+///
+/// 不报错是刻意的：这条路径每次解锁都要读（`get_settings`），
+/// 为它抛错会让一个什么都没做错的用户打不开软件。
+pub fn normalize_daily_word_goal(raw: &str) -> u32 {
+    // ⚠️ 先按 `i64` 解析再钳：这样负数能走到 `clamp` 上，
+    //    与"太大"共用同一个出口（用 `u32` 解析的话负号会直接报错 → 也回落到 0，
+    //    结果虽然一样，但"负数"与"坏值"就分不出来了，注释也说不清）。
+    raw.trim()
+        .parse::<i64>()
+        .map(|v| v.clamp(0, MAX_DAILY_WORD_GOAL as i64) as u32)
+        .unwrap_or(DEFAULT_DAILY_WORD_GOAL)
 }
 
 /// 一条日记。
@@ -3351,6 +3408,14 @@ impl Vault {
             .get_setting(setting_keys::AUTO_START)?
             .map(|v| v.trim() == "true")
             .unwrap_or(false);
+        // 每日字数目标（【P2-12】）：洗净收在 `normalize_daily_word_goal`
+        // **一处**（读、写两端共用），这里只管把那一格的原文交给它。
+        // 缺失 / 读坏 ⇒ `0` ⇒ 编辑器底部不显示目标那一句。
+        let daily_word_goal = normalize_daily_word_goal(
+            &self
+                .get_setting(setting_keys::DAILY_WORD_GOAL)?
+                .unwrap_or_default(),
+        );
         Ok(AppSettings {
             auto_lock_secs: secs,
             auto_lock_entries,
@@ -3361,6 +3426,7 @@ impl Vault {
             reminder_time,
             reminder_last_fired,
             auto_start,
+            daily_word_goal,
         })
     }
 
@@ -3567,6 +3633,33 @@ impl Vault {
     ///    但分层上**数据层不该认识注册表**（它连 `tauri` 都不依赖）。
     pub fn set_auto_start(&self, on: bool) -> AppResult<()> {
         self.set_setting(setting_keys::AUTO_START, if on { "true" } else { "false" })
+    }
+
+    /// 每日字数目标（【P2-12】）。`0` ＝ **不用这个功能**。
+    ///
+    /// 与 `get_settings()` 同一口径 —— 洗净共用 `normalize_daily_word_goal`
+    /// **一处**（这一项最怕的就是"读出来一个数、写进去另一个数"）。
+    pub fn daily_word_goal(&self) -> AppResult<u32> {
+        Ok(normalize_daily_word_goal(
+            &self
+                .get_setting(setting_keys::DAILY_WORD_GOAL)?
+                .unwrap_or_default(),
+        ))
+    }
+
+    /// 写每日字数目标，**返回洗净后的值**。
+    ///
+    /// ⚠️ 参数是 `&str` 而不是 `u32`：界面上那个框是**文本**，用户会清空它、
+    ///    会粘进一串奇怪的东西。洗净（含"留空 ⇒ 0"）收在
+    ///    `normalize_daily_word_goal` 一处，**数据层不该要求调用方先算好**。
+    /// ⚠️ 返回值的用途与 `set_reminder_time` 一致：界面拿它**回填**，
+    ///    于是"负数 / 原文 / 超上限"当场就能看出被修正了。
+    /// ⚠️ 与 `set_auto_lock_secs` 那句"白名单之外返回错误"是**刻意**的差别 ——
+    ///    那一项是安全参数，这一项只是个数数，报错只会让人白填一遍。
+    pub fn set_daily_word_goal(&self, raw: &str) -> AppResult<u32> {
+        let clean = normalize_daily_word_goal(raw);
+        self.set_setting(setting_keys::DAILY_WORD_GOAL, &clean.to_string())?;
+        Ok(clean)
     }
 
     /// 到下次自动备份还差多少秒。0 表示现在就该备份。
@@ -6418,6 +6511,109 @@ mod tests {
             "2026-09-28",
             "get_settings 那条路上也要带出来"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------------
+    // 每日字数目标（【P2-12】）
+    // ---------------------------------------------------------------------
+
+    /// 出厂默认 `0` ＝ **不用这个功能** —— 老库（没这个键）也走它。
+    ///
+    /// 为什么默认必须是"不用"：这是个纯鼓励性的数字，用户没要求时
+    /// 屏幕上不该出现任何"你还差多少字"的东西。
+    #[test]
+    fn daily_word_goal_defaults_to_zero() {
+        let (vault, dir) = reminder_vault("goal-default");
+
+        assert_eq!(vault.daily_word_goal().unwrap(), DEFAULT_DAILY_WORD_GOAL);
+        assert_eq!(vault.daily_word_goal().unwrap(), 0);
+        assert_eq!(vault.get_settings().unwrap().daily_word_goal, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⭐ **非整十的值必须原样保留** —— "自己填"就是这一项的全部意义
+    /// （用户明确否掉了 50/100/200 那种固定档位）。
+    #[test]
+    fn daily_word_goal_keeps_arbitrary_value() {
+        let (vault, dir) = reminder_vault("goal-keep");
+
+        assert_eq!(vault.set_daily_word_goal("137").unwrap(), 137);
+        assert_eq!(vault.daily_word_goal().unwrap(), 137);
+        assert_eq!(
+            vault.get_settings().unwrap().daily_word_goal,
+            137,
+            "get_settings 那条路上也要带出来"
+        );
+        // 换一个值要改得动（不是"只在没设过时才生效"）。
+        assert_eq!(vault.set_daily_word_goal("100").unwrap(), 100);
+        assert_eq!(vault.daily_word_goal().unwrap(), 100);
+        // 再清空 ⇒ 回到"不用"。
+        assert_eq!(vault.set_daily_word_goal("").unwrap(), 0);
+        assert_eq!(vault.daily_word_goal().unwrap(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 坏值**一律回落 `0`、不报错** —— 与 `normalize_reminder_time` 同一规矩：
+    /// 这条路径每次解锁都要读，为它抛错会让什么都没做错的人打不开软件。
+    #[test]
+    fn daily_word_goal_falls_back_on_garbage() {
+        let (vault, dir) = reminder_vault("goal-garbage");
+
+        // ⭐ 留空 ＝ 不用 —— 界面上"把那个框清空"走的就是这条路。
+        assert_eq!(vault.set_daily_word_goal("").unwrap(), 0);
+        assert_eq!(vault.set_daily_word_goal("abc").unwrap(), 0);
+        // 负数不是坏值，是"不用"。
+        assert_eq!(vault.set_daily_word_goal("-5").unwrap(), 0);
+        // 带空白要容错（粘进来的值常常带空白）。
+        assert_eq!(vault.set_daily_word_goal("  80  ").unwrap(), 80);
+        // 库里那一格被外部工具写坏，**读**的时候也要回落。
+        vault
+            .set_setting(setting_keys::DAILY_WORD_GOAL, "abc")
+            .unwrap();
+        assert_eq!(vault.daily_word_goal().unwrap(), 0);
+        assert_eq!(vault.get_settings().unwrap().daily_word_goal, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⭐ 超上限**钳到上限，不是回落 `0`** —— 用户填 `999999` 想表达的是"很高"，
+    /// 把他这一项抹成"没设"（＝目标消失）比钳住糟得多。
+    #[test]
+    fn daily_word_goal_clamps_to_max() {
+        let (vault, dir) = reminder_vault("goal-clamp");
+
+        assert_eq!(
+            vault.set_daily_word_goal("999999").unwrap(),
+            MAX_DAILY_WORD_GOAL
+        );
+        assert_eq!(vault.daily_word_goal().unwrap(), MAX_DAILY_WORD_GOAL);
+        // 正好落在上限上的值当然要原样保留（别把它也当成"超了"）。
+        assert_eq!(
+            vault.set_daily_word_goal("100000").unwrap(),
+            MAX_DAILY_WORD_GOAL
+        );
+        assert_eq!(vault.daily_word_goal().unwrap(), MAX_DAILY_WORD_GOAL);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 它是**设置**，必须跨进程读得到（⛔ 不许只在界面里留一份 —— 那正是
+    /// 用户定下的"设置一律进加密库"）。
+    #[test]
+    fn daily_word_goal_survives_reopen() {
+        let (vault, dir) = reminder_vault("goal-reopen");
+
+        vault.set_daily_word_goal("250").unwrap();
+        drop(vault);
+
+        // 重开一个连接 ＝ 模拟"重启软件"。
+        let again = Vault::unlock(&dir, "135790").unwrap();
+        assert_eq!(again.daily_word_goal().unwrap(), 250);
+        assert_eq!(again.get_settings().unwrap().daily_word_goal, 250);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

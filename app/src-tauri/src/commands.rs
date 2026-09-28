@@ -1195,6 +1195,19 @@ pub fn set_auto_start(state: State<'_, VaultState>, on: bool) -> AppResult<()> {
     with_vault(&state, |v| v.set_auto_start(on))
 }
 
+/// 写「每日字数目标」（【P2-12】）。**返回洗净后的值**。
+///
+/// ⚠️ 前端要拿返回值**回填那个数字框**（与 `set_reminder_time` 同一理由）：
+///    这一项**不报错**（留空 / 负数 / 原文 / 超上限都能得出一个合法结果），
+///    只会被修正 —— 不回填的话，用户看到的和真正存下去的就**不是同一个数**。
+/// ⚠️ `0` ＝ 不用这个功能（编辑器底部那一句随之消失）。
+/// ⚠️ 参数是 `String` 而不是数字：界面上那个框是**文本**，用户会清空它、
+///    会粘进一串奇怪的东西 ⇒ "留空"这个状态必须能传进来。
+#[tauri::command]
+pub fn set_daily_word_goal(state: State<'_, VaultState>, goal: String) -> AppResult<u32> {
+    with_vault(&state, |v| v.set_daily_word_goal(&goal))
+}
+
 /// 把注册表里的自启路径校正成**当前这个 exe**（幂等，已经对了就什么都不做）。
 ///
 /// 为什么需要它：注册表里记的是**一个绝对路径**。软件换了位置

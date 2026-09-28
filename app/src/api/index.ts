@@ -447,6 +447,14 @@ export interface AppSettings {
   reminder_last_fired: string;
   /** 开机自启（【P2-13】）。默认 `false`。 */
   auto_start: boolean;
+  /**
+   * 每日字数目标（【P2-12】）。`0` ＝ **不用这个功能**。
+   *
+   * ⚠️ 它是**设置**，不是内容：不进 `entry` 表、不落 `localStorage`。
+   * ⚠️ 只在看**今天**时用它 —— 翻到别的日子显示目标会让人误读成
+   *    "这天只写了这么点"。
+   */
+  daily_word_goal: number;
 }
 
 /**
@@ -1136,6 +1144,31 @@ export const setAutoStart = (on: boolean) => invoke<void>("set_auto_start", { on
  *    不会把他的自启悄悄改到那个路径上。
  */
 export const syncAutoStart = () => invoke<void>("sync_auto_start");
+
+/**
+ * 每日字数目标的默认值：`0` ＝ **不用这个功能**（【P2-12】）。
+ *
+ * ⚠️ 默认必须是"不用"：这是个纯鼓励性的数字，用户没要求时屏幕上
+ *    不该出现任何"你还差多少字"的东西（与提醒"默认关"同一方向）。
+ * ⚠️ 初值就用它 —— 设置要等解锁才读得回来，那段时间里
+ *    编辑器底部**不该先闪一下目标再消失**。
+ */
+export const DEFAULT_DAILY_WORD_GOAL = 0;
+
+/** 前端能填的最大值，与后端 `db::MAX_DAILY_WORD_GOAL` 一致。 */
+export const MAX_DAILY_WORD_GOAL = 100000;
+
+/**
+ * 写「每日字数目标」（【P2-12】）。**返回后端洗净后的值**。
+ *
+ * ⚠️ 参数是**字符串**（输入框里那个原文）：用户会清空它 ⇒ 必须能把
+ *    "留空"这个状态传下去（留空 ＝ `0` ＝ 不用）。
+ * ⚠️ 必须拿返回值**回填输入框**：这一项不报错，只会被修正
+ *    （`-5` ⇒ `0`、`999999` ⇒ `100000`），不回填的话用户看到的
+ *    和真正存下去的就**不是同一个数**。
+ */
+export const setDailyWordGoal = (goal: string) =>
+  invoke<number>("set_daily_word_goal", { goal });
 
 // ---------------------------------------------------------------------------
 // 图片附件（P1 #10）
