@@ -417,7 +417,32 @@ export interface AppSettings {
    *    关掉后手动 🔒 / 🔓 按钮照旧好用。
    */
   triple_click_unlock: boolean;
+  /**
+   * 点窗口 `✕` 时做什么（【P2-21】）。
+   *
+   * ⚠️ 它与下面 `CloseAction` 那两个值是**同一套**，别另立字符串。
+   */
+  close_action: CloseAction;
 }
+
+/**
+ * 点窗口 `✕` 时做什么（【P2-21】）。与后端 `db::CloseAction` 一一对应。
+ *
+ * ⚠️ **只有两个值** —— "用户从没设置过"**不是**第三个值：
+ *    那种情况后端会自己推导（跟提醒走：提醒开着 ⇒ 最小化到托盘），
+ *    前端看到的**永远是推导之后的结果**，不需要知道"设过没有"。
+ */
+export type CloseAction = "tray" | "quit";
+
+/**
+ * 「点击关闭时」的两个选项。文案就是用户看到的文案。
+ *
+ * ⚠️ 顺序固定：`tray` 在前（它是"跟提醒走"推导出来的那一头，也是更常见的用法）。
+ */
+export const CLOSE_ACTION_OPTIONS: { value: CloseAction; label: string }[] = [
+  { value: "tray", label: "最小化到托盘" },
+  { value: "quit", label: "直接退出" },
+];
 
 /**
  * 自动锁定时长的档位。**白名单**，与后端 `db::AUTO_LOCK_ALLOWED_SECS` 一一对应。
@@ -955,6 +980,36 @@ export const setAutoLockEntries = (on: boolean) =>
  */
 export const setTripleClickUnlock = (on: boolean) =>
   invoke<void>("set_triple_click_unlock", { on });
+
+/**
+ * 读「点击关闭时」——**生效值**（【P2-21】）。
+ *
+ * ⚠️ 它读的是"真的点 ✕ 会发生什么"，不是"库里存了什么"：
+ *    托盘在这台机器上建不起来时，后端一律返回 `"quit"`
+ *    （否则用户点 ✕ ⇒ 窗口消失、托盘上又没图标 ⇒ 他再也回不来了）。
+ *    所以设置页**要显示这一条的结果**，别自己从 `getSettings()` 里挑字段 ——
+ *    那个字段可能显示"最小化到托盘"而实际却是直接退出。
+ */
+export const getCloseAction = () => invoke<CloseAction>("get_close_action");
+
+/**
+ * 写「点击关闭时」（【P2-21】）。
+ *
+ * ⚠️ 存的是**用户的选择**，后端不会拿"这台机器有没有托盘"去改写它 ——
+ *    换个环境就有了。真正生效与否由读取路径判定（见 `getCloseAction`）。
+ * ⚠️ 写入失败时界面必须回滚成原值（见 SettingsPanel 的处理）。
+ */
+export const setCloseAction = (action: CloseAction) =>
+  invoke<void>("set_close_action", { action });
+
+/**
+ * 真的退出应用（【P2-21】）。
+ *
+ * ⚠️ **只能在前端落完库之后调它**：正文是 1 秒防抖保存的，
+ *    早调一步就会丢掉"点 ✕ 前最后打的那几个字"。
+ *    正常路径是：后端发 `app-quit-requested` → 前端 `flushNow()` → 这条。
+ */
+export const quitApp = () => invoke<void>("quit_app");
 
 // ---------------------------------------------------------------------------
 // 图片附件（P1 #10）

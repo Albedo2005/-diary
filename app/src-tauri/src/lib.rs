@@ -29,7 +29,11 @@ pub mod seg;
 
 // `Manager` trait 必须显式引入：`App` 上的 `manage()` / `state()` 等方法是
 // 由这个 trait 提供的，不在作用域内会报 "no method named `manage`"。
-use tauri::Manager;
+// `Emitter` trait 同理 —— `emit()` 是它提供的方法（托盘菜单里那条"退出"
+// 要先请前端落库，就是用它往后端→前端发事件）。
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Emitter, Manager};
 
 use commands::VaultState;
 
@@ -90,7 +94,39 @@ pub fn run() {
             app.manage(state.clone());
             // 后台线程持有另一个克隆，与命令层看到的是同一份解锁状态。
             commands::spawn_auto_backup(state);
+            // 托盘（【P2-21】）。⚠️ 建在 `manage` **之后** ——
+            // 它要把"托盘建起来了"记回 `VaultState`，那份状态得先注册好。
+            // ⚠️ 它**没有返回值**：托盘建不起来也不该让软件起不来（见函数说明）。
+            setup_tray(app.handle());
             Ok(())
+        })
+        // ⭐ 关窗口时到底"藏进托盘"还是"真退出"，由设置决定（【P2-21】）。
+        .on_window_event(|window, event| {
+            // ⚠️ **只拦 `CloseRequested`**：它带着 `api`，能 `prevent_close()`。
+            //    ⛔ 别去拦 `Destroyed` —— 那个事件来的时候窗口已经在销毁了，
+            //    它**没有** `api` 字段，`prevent_close()` 对它无效（拦了也白拦）。
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // 关掉之后干什么由我们说了算，所以先拦下来。
+                api.prevent_close();
+
+                let app = window.app_handle();
+                let state = app.state::<VaultState>();
+
+                // ⚠️ 读设置失败（未解锁 / 库坏了 / 被外部工具写坏）一律当
+                //    "直接退出"：**宁可关得掉，也绝不能出现"点了 ✕ 什么都没发生"**。
+                //    这层兜底收在 `commands::close_action_now()` 里，
+                //    连同"托盘不可用 ⇒ 一律直接退出"一起判（那是唯一的判定点）。
+                if commands::close_action_now(&state) == crate::db::CloseAction::Tray {
+                    // 藏起来：**进程还活着**、库连接还开着、密钥**还留在内存里**。
+                    // ⚠️ 这是**刻意**的 —— 提醒要靠它才响得了。
+                    //    真正把密钥从内存里清掉的是「锁定」，不是关窗口。
+                    //    （这句话也必须如实写在设置页那一行的说明里。）
+                    let _ = window.hide();
+                } else {
+                    // 让前端先落库再真退（编辑器是 1 秒防抖，见 `request_quit`）。
+                    request_quit(app);
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             // 状态
@@ -175,7 +211,162 @@ pub fn run() {
             commands::set_auto_lock_secs,
             commands::set_auto_lock_entries,
             commands::set_triple_click_unlock,
+            // 关闭行为与托盘（【P2-21】）。
+            // `get_close_action` 返回的是**生效值**（已经叠上"托盘可不可用"），
+            // 所以设置页读到什么、点 ✕ 就真的做什么 —— 不会出现两处说法不一致。
+            // `quit_app` 是"前端已经落完库，现在真的退"那一下。
+            commands::get_close_action,
+            commands::set_close_action,
+            commands::quit_app,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");
+}
+
+// ---------------------------------------------------------------------------
+// 系统托盘与关闭行为（【P2-21】）
+// ---------------------------------------------------------------------------
+
+/// 把主窗口叫回来：显示 → 取消最小化 → 聚焦。
+///
+/// 三句都要做，缺一个都会留下别扭状态：
+///   - 只 `show()` 不 `unminimize()` ⇒ 窗口出来了但还最小化着，点了像没反应；
+///   - 不 `set_focus()` ⇒ 窗口在别的窗口后面，用户以为没打开。
+///
+/// 拿不到 `"main"` 窗口就什么都不做（`tauri.conf.json` 里窗口没写 `label`，
+/// Tauri 2 的默认 label 就是 `"main"`，与 capabilities 里的 `["main"]` 一致）。
+fn show_main(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
+/// 请求"真的退出"：先请前端把没落库的正文写完，再退。
+///
+/// ⚠️ **不能在这里直接 `app.exit(0)`**：正文是 **1 秒防抖保存**的，
+///    点 `✕` 那一瞬间最后打的那些字**可能还没落库**，直接退会把它们丢掉。
+///    所以这里只发一条事件，真退由前端在 `flushNow()` 之后调 `quit_app` 完成。
+///
+/// ⭐ **顺序是这一段的要害：先把兜底武装起来，再去请前端。**
+///    `emit` 会在某些状态下**一直等渲染进程**（实测：窗口被隐藏过、
+///    或前端主线程正忙时），那一句就可能卡住当前线程 ——
+///    兜底要是写在它后面，就永远轮不到执行，结果就是**"点了 ✕ 关不掉"**。
+///
+/// ⚠️ 这条不是本件新引入的问题：改动前点 `✕` 就是直接走、同样会丢字。
+///    本件顺手把它堵上，而且**两条路（点 ✕ / 托盘菜单的「退出」）共用它**。
+fn request_quit(app: &tauri::AppHandle) {
+    spawn_quit_watchdog(app.clone());
+    let _ = app.emit("app-quit-requested", ());
+}
+
+/// 退出的**兜底**：2 秒后不管前端有没有回话，直接退。
+///
+/// 为什么必须有：前端可能根本不理我们 —— 正在启动（页面还没挂监听）、
+/// 页面崩了、脚本出错…… 少了它就会出现**"点了 ✕ 关不掉"**，
+/// 那比丢一个字严重得多（用户只能去开任务管理器）。
+///
+/// ⚠️ `app.exit(0)` 不会再触发一次 `CloseRequested`（它是直接退进程），
+///    所以不会绕回来形成死循环。
+///
+/// ⭐ **两层退法**，因为第一层在"事件循环正卡着"时是排不上队的：
+///   `app.exit()` 只是**把退出请求塞进事件循环的消息队列**
+///   （它自己不阻塞、也不会立刻退）。若此刻主线程正卡在别处
+///   （比如上面那条 `emit`），这条请求就永远处理不到 ⇒ 进程还在。
+///   所以再等一会儿补一层**硬退**，把"关不掉"从可能性里彻底删掉。
+///
+///   代价：极端情况下最后那一秒多里没落库的字会丢 ——
+///   但那是"本来就已经卡住"的场景，能关掉比什么都重要。
+fn spawn_quit_watchdog(app: tauri::AppHandle) {
+    let spawned = std::thread::Builder::new()
+        .name("quit-watchdog".into())
+        .spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            // 第一层：请事件循环正常退出（它会走 Tauri 自己的收尾）。
+            app.exit(0);
+            // 第二层：再等一会儿还不退 ⇒ 事件循环确实卡着，硬退。
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            std::process::exit(0);
+        });
+    // 线程都建不起来（极端情况）也得留个痕：那时就只剩"指望前端"这一条路了。
+    if let Err(e) = spawned {
+        eprintln!("退出兜底线程未能启动（此时只能等前端回话）：{e}");
+    }
+}
+
+/// 建系统托盘图标。
+///
+/// ⭐ 它存在的**真正理由不是"方便"**，而是【P2-13】的写作提醒**需要进程活着**：
+///    窗口关掉、进程没了，21:00 的提醒永远响不了。
+///    这也是"关闭行为的默认值要跟提醒走"的由来（见 `db::close_action()`）。
+///
+/// ⚠️ 全程**绝不上抛错误**：托盘是锦上添花，建不起来最多是
+///    "关闭行为退回直接退出"（见 `commands::apply_tray_availability`）。
+///    为一个图标让软件起不来，是拿小功能换掉整个软件。
+///    ⇒ 所以这里把 `try_setup_tray` 的 `Err` **收成一句日志**就完事：
+///      ⛔ 调用处不要写 `?`、⛔ 更不要 `expect` / `unwrap`。
+fn setup_tray(app: &tauri::AppHandle) {
+    if let Err(e) = try_setup_tray(app) {
+        eprintln!("托盘创建失败：{e}；关闭行为会退回「直接退出」");
+    }
+}
+
+/// 真正建托盘那一段。任何一步失败都返回 `Err` —— **由 `setup_tray` 收成日志**。
+fn try_setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let state = app.state::<VaultState>();
+
+    // 图标一律用 `default_window_icon()`：它在**编译期**就已经解码好
+    // （来自 `tauri.conf.json` 的 `bundle.icon`）。
+    // ⚠️ 不要自己去找 png 路径、更不要引 `image` crate ——
+    //    本机 `Cargo.lock` 里**没有** `image`，引了直接构建失败。
+    let Some(icon) = app.default_window_icon().cloned() else {
+        eprintln!("托盘图标缺失：跳过托盘，关闭行为会退回「直接退出」");
+        return Ok(());
+    };
+
+    // 菜单两项。**id 是稳定标识，别拿中文字 label 去匹配** ——
+    // label 是给人看的，将来改一个字就把逻辑改坏了。
+    let show_i = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let quit_i = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
+
+    let icon = TrayIconBuilder::with_id("main-tray")
+        .icon(icon)
+        .menu(&menu)
+        .tooltip("日记")
+        // 左键点图标要"显示窗口"，所以菜单**只在右键出** ——
+        // 否则左键既弹菜单又显示窗口，两件事叠在一起。
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, ev| match ev.id().as_ref() {
+            "show" => show_main(app),
+            // ⚠️ 走"退出"这条路**必须让前端先落库**，所以不是 `app.exit(0)`，
+            //    而是发一条请求交给前端（见 `request_quit`）。
+            "quit" => request_quit(app),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, ev| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = ev
+            {
+                show_main(tray.app_handle());
+            }
+        })
+        .build(app)?;
+
+    // ⚠️ 这个返回值**不能随手丢**：`TrayIcon` 是引用计数的，
+    //    "最后一个实例被 drop 时图标就被移除"（tauri 2.11 的原话）。
+    //    这里之所以能在函数结束时让它离开作用域，是因为 `build()` 内部
+    //    已经 clone 了一份存进应用的资源表
+    //    （`app.resources_table().add(icon.clone())`）⇒ 计数不为 0。
+    //    ⛔ 别改成 `mem::forget`（没必要），也别调 `set_visible(false)`。
+    drop(icon);
+
+    // 记下"托盘真的建起来了"。**必须在 build 成功之后**：
+    // 置早了，用户在"托盘没建成"的机器上点 ✕ 就会关不回来。
+    state.set_tray_ok();
+    Ok(())
 }

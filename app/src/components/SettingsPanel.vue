@@ -30,24 +30,28 @@
  * 各走各的、切个分类就对不上。
  * 例外只有一处：改密码成功后由 App.vue 用返回的新状态覆盖（见 password-changed）。
  */
-import { computed, nextTick, ref } from "vue";
+import { computed, nextTick, onMounted, ref } from "vue";
 import pkg from "../../package.json";
 import {
   AUTO_LOCK_OPTIONS,
+  CLOSE_ACTION_OPTIONS,
   changePassword,
   copyBackupsTo,
   disableAutoLogin,
   enableAutoLogin,
   exportMarkdown,
+  getCloseAction,
   pruneOrphanAttachments,
   revealDir,
   setAutoLockEntries,
   setAutoLockSecs,
+  setCloseAction,
   setTripleClickUnlock,
   toAppError,
   type AppStatus,
   type BackupStatus,
   type ChangePasswordResult,
+  type CloseAction,
   type CopyBackupsResult,
   type CryptoInfo,
   type ExportResult,
@@ -110,15 +114,91 @@ const emit = defineEmits<{
   (e: "notice", message: string): void;
 }>();
 
-type TabKey = "security" | "data" | "about";
+type TabKey = "security" | "data" | "habit" | "about";
 
 const TABS: { key: TabKey; label: string }[] = [
   { key: "security", label: "安全" },
   { key: "data", label: "数据与备份" },
+  // 【习惯】（【P2-21】新增）：回答的是"让写日记这件事**自己发生**"那一族 ——
+  // 关闭行为（关掉窗口还留在托盘）、提醒、字数目标、开机自启都住这里。
+  // ⚠️ 本件只放**一项**（点击关闭时）；【P2-13】再往里加提醒 / 开机自启，
+  //    【P2-12】加每日字数目标 —— 栏名要换只动这一个字符串。
+  { key: "habit", label: "习惯" },
   { key: "about", label: "关于" },
 ];
 
 const tab = ref<TabKey>("security");
+
+// ---------------------------------------------------------------------------
+// 点击关闭时（【P2-21】）
+// ---------------------------------------------------------------------------
+
+/**
+ * 点窗口 `✕` 时做什么。
+ *
+ * ⚠️ 这一项**不住 `App.vue`**（与上面三个开关不同）：它只在这一屏显示与修改，
+ *    别处谁都不用 —— 真按 `✕` 时干什么由**后端**读库决定
+ *    （`lib.rs` 的 `on_window_event` → `commands::close_action_now`），
+ *    整个过程不经前端。所以这里自己调 `api/` 拿值、自己写。
+ *
+ * ⚠️ 初值给 `"quit"`：读到之前显示「直接退出」。
+ *    兜底方向必须与后端一致 —— 后端在"读不到设置"时也是按直接退出处理
+ *    （宁可关得掉，也不能出现"点了 ✕ 什么都没发生"）。
+ */
+const closeAction = ref<CloseAction>("quit");
+
+/**
+ * 拉一次**生效值**。
+ *
+ * ⚠️ 读的是 `getCloseAction()`，不是 `getSettings().close_action`：
+ *    前者已经叠上"这台机器有没有托盘可用"，后者只是库里的选择。
+ *    显示库里的值会出现"设置里写着最小化到托盘、点 ✕ 却直接退了"这种
+ *    用户永远查不明白的不一致。
+ */
+async function loadCloseAction() {
+  try {
+    closeAction.value = await getCloseAction();
+  } catch {
+    // 读不到就保持初值（`"quit"`），**不弹提示** ——
+    // 这是打开设置页时的背景动作，用户没做错什么。
+  }
+}
+
+onMounted(() => {
+  void loadCloseAction();
+});
+
+/**
+ * 切换「点击关闭时」。
+ * 与 `onChangeAutoLock` 同一套路：自己调后端、失败时把界面拨回原值。
+ *
+ * ⚠️ 成功后**必须重读一次生效值**，不能把用户刚选的那个直接当成新值：
+ *    托盘在这台机器上建不起来时后端仍然返回 `"quit"` ——
+ *    直接把 `"tray"` 显示出来就成了"设置骗人"。
+ * ⚠️ 重读回来的值若与用户选的不同，还要**手动把 `<select>` 拨回去**：
+ *    DOM 里用户已经拨到新项了，而这个 ref 的值可能压根没变
+ *    （比如本来就存着 `"quit"`），Vue 认为绑定值没变化、不会重渲染该属性。
+ */
+async function onChangeCloseAction(e: Event) {
+  const el = e.target as HTMLSelectElement;
+  const next = el.value as CloseAction;
+  if (next === closeAction.value) return;
+  try {
+    await setCloseAction(next);
+    closeAction.value = await getCloseAction();
+    if (el.value !== closeAction.value) {
+      el.value = closeAction.value;
+      // 说清为什么没生效，别让用户以为是自己点错了。
+      emit(
+        "notice",
+        "这台机器上没有可用的托盘图标 ——「点击关闭时」会按「直接退出」执行（否则关掉窗口就回不来了）。",
+      );
+    }
+  } catch (err) {
+    el.value = closeAction.value; // 回滚，不留假状态
+    emit("notice", toAppError(err).message);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // 展示用的格式化
@@ -1122,6 +1202,45 @@ async function doCopyBackups() {
               备份是<strong>密文</strong>，与数据库使用同一个密码，恢复时用那个密码即可打开。
               可以直接把 <code>backups</code> 目录整体复制到网盘或其他硬盘 ——
               上面那个「复制备份到…」就是替你干这件事（连后悔药一起搬）。
+            </p>
+          </section>
+
+          <!-- ── 习惯（【P2-21】新增） ───────────────────────────────
+               这一栏回答的是"让写日记这件事**自己发生**"：
+               关掉窗口还留在后台、到点提醒、每天写够多少字、开机自己起来。
+               ⚠️ 本件（P2-21）只放**一项**；提醒 / 开机自启归【P2-13】，
+                  每日字数目标归【P2-12】，都会往这里加。 -->
+          <section v-else-if="tab === 'habit'">
+            <div class="row">
+              <div class="label">
+                <div class="t">点击关闭时</div>
+                <div class="d">
+                  关上窗口之后还留在托盘里 —— 提醒要靠它才响得了（窗口关了、进程没了，提醒就永远响不了）。与提醒一样，选了它就永远按它走。
+                </div>
+              </div>
+              <div class="ctl">
+                <select :value="closeAction" @change="onChangeCloseAction">
+                  <option v-for="o in CLOSE_ACTION_OPTIONS" :key="o.value" :value="o.value">
+                    {{ o.label }}
+                  </option>
+                </select>
+              </div>
+            </div>
+
+            <!--
+              ⚠️ 这段必须**如实写**：用户很容易把"窗口关了"当成"安全了"。
+              藏进托盘时进程还活着、**密钥也还在内存里** —— 这是刻意的
+              （提醒要靠它），但必须说出来，不能让他以为关了就等于锁了。
+            -->
+            <p class="tip">
+              选「最小化到托盘」时，关窗口只是把界面收起来：<strong>软件仍在后台运行</strong>，
+              也<strong>不会</strong>把密钥从内存里清掉 —— 这正是提醒能按时响的前提。
+              要让密钥立刻消失，用顶栏那个「锁定」。
+              托盘图标上点左键可随时把窗口叫回来，右键菜单里有「退出」。
+            </p>
+            <p class="tip">
+              这台机器上若没有可用的托盘图标，这一项会自动按「直接退出」执行 ——
+              否则窗口一关、托盘上又没图标，你就再也回不来了。
             </p>
           </section>
 

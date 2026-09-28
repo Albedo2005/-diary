@@ -45,7 +45,16 @@ jieba-rs = "0.7"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri = { version = "2", features = [] }
+# tray-icon：右下角托盘图标（【P2-21】）。它**不是**一个新 crate ——
+# 它是 `tauri` 的一个 feature，`tray-icon 0.24.2` / `muda 0.19.3` 本来就在
+# Cargo.lock 里（是 tauri 自己的依赖，见生产日志的坑表），所以打开它是**零下载**。
+#
+# ⚠️ feature 必须写在这里（工作区根），**不要在命令行上 `--features tray-icon`**：
+#    命令行加的那种迟早有一次忘了带 ⇒ 编出来的版本**没有托盘**，
+#    而且**不会报任何错**。写进 manifest 才是"永远生效"。
+# ⚠️ 写在这里就够了：`app/src-tauri/Cargo.toml` 里是 `tauri = { workspace = true }`，
+#    改错地方（改到成员 crate 的 features 里）同样**不报错、静默不生效**。
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 
 # 附件（P1 #10）：文件名用 sha256 生成（同一张图插两次天然去重），

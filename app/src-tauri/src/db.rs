@@ -33,6 +33,20 @@ pub mod setting_keys {
     pub const AUTO_LOCK_SECS: &str = "auto_lock_secs";
     pub const AUTO_LOCK_ENTRIES: &str = "auto_lock_entries";
     pub const TRIPLE_CLICK_UNLOCK: &str = "triple_click_unlock";
+    /// 点窗口 `✕` 时做什么（【P2-21】）：`"tray"` / `"quit"`。
+    ///
+    /// ⚠️ **键不存在 ≠ 上面两个值**：不存在表示"用户从没设置过"，
+    ///    这时按"跟提醒走"推导（见 `close_action()`）。所以写入端
+    ///    **永远不写第三个值**，也不写空串。
+    pub const CLOSE_ACTION: &str = "close_action";
+    /// 写作提醒是否开启（【P2-13】的键）。
+    ///
+    /// ⚠️ 本件（【P2-21】）**只读不写**：它用来算"关闭行为"的默认值
+    ///    （提醒开着 ⇒ 默认最小化到托盘，否则提醒响不了）。
+    ///    【P2-13】落地后才由那边的设置页写它 —— ⚠️ 届时**口径必须一致**：
+    ///    只有精确的 `"true"` 才算开（与 `auto_backup_enabled()` 同一口径），
+    ///    因为"提醒"这一项的默认方向就是**关**。
+    pub const REMINDER_ENABLED: &str = "reminder_enabled";
 }
 
 /// 自动锁定时长的**档位白名单**（秒）。`0` 表示"永不"。
@@ -90,6 +104,12 @@ pub struct AppSettings {
     /// ⚠️ 这一项只是"手势开关"，与 `auto_lock_entries` **不是一回事**：
     ///    它不决定"要不要自动锁"，只决定"锁上之后怎么解开方便"。
     pub triple_click_unlock: bool,
+    /// 点窗口 `✕` 时做什么（【P2-21】）。默认**跟提醒走**，见 `close_action()`。
+    ///
+    /// ⚠️ 它是 `AppSettings` 里唯一一个"默认值不是常量"的字段 ——
+    ///    只有 `close_action()` 能算准（它要读提醒开关），
+    ///    这里的字段值就是它的结果，别自己另算一遍。
+    pub close_action: CloseAction,
 }
 
 impl Default for AppSettings {
@@ -98,6 +118,54 @@ impl Default for AppSettings {
             auto_lock_secs: DEFAULT_AUTO_LOCK_SECS,
             auto_lock_entries: DEFAULT_AUTO_LOCK_ENTRIES,
             triple_click_unlock: DEFAULT_TRIPLE_CLICK_UNLOCK,
+            // ⚠️ 这里只能是 `Quit`：`Default` 拿不到库、读不到提醒开关，
+            //    而"提醒没开"时的推导结果就是 `Quit`。真值一律走
+            //    `close_action()`，别拿这个当业务默认值用。
+            close_action: CloseAction::Quit,
+        }
+    }
+}
+
+/// 点窗口 `✕` 时做什么（【P2-21】）。
+///
+/// ⚠️ 为什么是**枚举**而不是 `bool`：这一项有三个状态 ——
+///   「最小化到托盘」「直接退出」**以及「用户从没设置过」**。
+///   而"没设置过"不是前两者中的任意一个：它要**跟提醒走**
+///   （提醒开着就默认进托盘，否则提醒永远响不了）。
+///   用 `bool` ＋ 一个"有没有设过"的布尔，等于把一个三态拆成两个字段，
+///   迟早出现"设过但值是默认"这种自相矛盾的组合。
+///
+/// 序列化形状是 `"tray"` / `"quit"`（前端与库里的字符串都是这个）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseAction {
+    /// 窗口藏起来、进程继续跑（提醒要靠它才响）。
+    Tray,
+    /// 真的退出进程。
+    Quit,
+}
+
+impl CloseAction {
+    /// 库里的存储值。写入端与解析端**共用这两个字面量**，
+    /// 免得"写的是 tray、读的是 tray "这种拼错。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CloseAction::Tray => "tray",
+            CloseAction::Quit => "quit",
+        }
+    }
+
+    /// 从库里的值解析。
+    ///
+    /// ⚠️ **不认识的值的返回值由调用方决定**：这里返回 `None`
+    ///    （＝"当作从没设置过"），由 `close_action()` 落到"跟提醒走"的推导上。
+    ///    这样"库里被外部工具写坏"与"老库没这个 key"走**同一条**路径 ——
+    ///    与 `get_settings()` 那句"缺失 / 解析失败一律回落默认值"是同一条规矩。
+    fn parse(s: &str) -> Option<CloseAction> {
+        match s.trim() {
+            "tray" => Some(CloseAction::Tray),
+            "quit" => Some(CloseAction::Quit),
+            _ => None,
         }
     }
 }
@@ -3103,10 +3171,18 @@ impl Vault {
             .get_setting(setting_keys::TRIPLE_CLICK_UNLOCK)?
             .map(|v| v.trim() != "false")
             .unwrap_or(DEFAULT_TRIPLE_CLICK_UNLOCK);
+        // 点 `✕` 时做什么（【P2-21】）。
+        //
+        // ⚠️ 这里**不自己推**：它的默认值要读"提醒开关"，推导收在
+        //    `close_action()` **一处**。抄一遍就会漂移 ——
+        //    而漂移的后果是"设置页显示的值"与"真按 ✕ 时的行为"不一致，
+        //    用户永远发现不了，只会觉得这软件的设置时灵时不灵。
+        let close_action = self.close_action()?;
         Ok(AppSettings {
             auto_lock_secs: secs,
             auto_lock_entries,
             triple_click_unlock,
+            close_action,
         })
     }
 
@@ -3151,6 +3227,72 @@ impl Vault {
             setting_keys::TRIPLE_CLICK_UNLOCK,
             if on { "true" } else { "false" },
         )
+    }
+
+    /// 点窗口 `✕` 时做什么（【P2-21】）。
+    ///
+    /// **三个状态，一处推导**：
+    ///
+    /// | 库里的 `close_action` | 含义 | 返回 |
+    /// |---|---|---|
+    /// | 键不存在 / 读不懂 | 用户**从没设置过**（老库、被外部工具写坏） | **跟提醒走**：提醒开 ⇒ `Tray`，否则 `Quit` |
+    /// | `"tray"` | 用户亲手选的 | 永远 `Tray` |
+    /// | `"quit"` | 用户亲手选的 | 永远 `Quit` |
+    ///
+    /// ⚠️ **第二、三行为什么要"永远"**：用户把关闭行为改成"直接退出"之后，
+    ///    某天又打开了提醒 —— 如果他看到关闭行为自己跳回"最小化到托盘"，
+    ///    他会得出"这软件的设置自己会变"的结论，**之后就不再相信任何设置了**。
+    ///    ⇒ 一句话：**默认值跟提醒走，用户的选择永远优先。**
+    ///
+    /// ⚠️ 与 `get_settings()` 同一条规矩：**读不出来不报错、回落**。
+    ///    这条每次点 `✕` 都要读，为它抛错就会出现"点了 ✕ 什么都没发生"。
+    ///    （调用方那边还有一层兜底：真读不到就按 `Quit` 处理，见
+    ///    `commands.rs` 的 `close_action_now()`。）
+    ///
+    /// ⚠️ 数据层**不认识托盘**（它不读 `tray_ok`）。"托盘建不起来 ⇒ 一律退回
+    ///    直接退出"那条判定住在 `commands.rs` —— 理由见那张例外清单附近的说明。
+    pub fn close_action(&self) -> AppResult<CloseAction> {
+        if let Some(a) = self
+            .get_setting(setting_keys::CLOSE_ACTION)?
+            .as_deref()
+            .and_then(CloseAction::parse)
+        {
+            return Ok(a);
+        }
+
+        // 没设过 ⇒ 跟提醒走。
+        //
+        // 为什么默认值必须跟着提醒：托盘图标存在的**真正理由**不是"方便"，
+        // 而是【P2-13】的提醒需要进程还活着 —— 窗口关掉、进程没了，
+        // 21:00 的提醒永远响不了。所以"开了提醒却默认直接退出"
+        // 等于给用户装了一个永远不会响的提醒。
+        //
+        // ⚠️ 口径与 `auto_backup_enabled()` 一致：**只有精确的 "true" 才算开**。
+        //    （提醒这一项的默认方向是"关"，与 `auto_lock_entries` 的
+        //    "只有 false 才算关"正好相反 —— 读错方向的代价不同，
+        //    提醒读错最多是没响，锁定读错是静默地失去保护。）
+        let reminder_on = self
+            .get_setting(setting_keys::REMINDER_ENABLED)?
+            .map(|v| v.trim() == "true")
+            .unwrap_or(false);
+        Ok(if reminder_on {
+            CloseAction::Tray
+        } else {
+            CloseAction::Quit
+        })
+    }
+
+    /// 写入"点 `✕` 时做什么"（【P2-21】）。
+    ///
+    /// 与另外两个开关同一形状：参数是**枚举**，非法值在类型上进不来，
+    /// 所以这里没有白名单可校验 —— 写下去的一定是 `tray` / `quit` 两个词之一。
+    ///
+    /// ⚠️ 它**不写第三态**（"没设过"）：一旦用户在这里选过一次，
+    ///    从此就永远用他的值，再也不看提醒开关（理由见 `close_action()`）。
+    ///    ⇒ 所以**不要**提供"恢复默认"这种把它删掉的操作，
+    ///    那会让这一项在用户眼里变成"自己会变的设置"。
+    pub fn set_close_action(&self, action: CloseAction) -> AppResult<()> {
+        self.set_setting(setting_keys::CLOSE_ACTION, action.as_str())
     }
 
     /// 到下次自动备份还差多少秒。0 表示现在就该备份。
@@ -4662,6 +4804,224 @@ mod tests {
         assert_eq!(d.auto_lock_secs, DEFAULT_AUTO_LOCK_SECS);
         assert!(d.auto_lock_entries);
         assert!(d.triple_click_unlock);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // 关闭行为（【P2-21】）
+    // -----------------------------------------------------------------------
+
+    /// 三条测试共用的脚手架：一个空库 ＋ 一个临时目录。
+    ///
+    /// ⚠️ 目录名必须**每个测试各不相同**：这几个测试会并发跑（默认多线程），
+    ///    共用一个目录就是互相删库。
+    fn close_action_vault(tag: &str) -> (Vault, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("dsh-diary-close-action-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let vault = Vault::create(&dir, "135790", None).unwrap();
+        (vault, dir)
+    }
+
+    /// 从没设置过 ＋ 提醒**开着** ⇒ 最小化到托盘。
+    ///
+    /// 这是"跟提醒走"那条规则的正方向：提醒需要进程活着才响得了，
+    /// 所以开了提醒的人默认必须进托盘。
+    #[test]
+    fn close_action_unset_with_reminder_on_is_tray() {
+        let (vault, dir) = close_action_vault("reminder-on");
+
+        vault
+            .set_setting(setting_keys::REMINDER_ENABLED, "true")
+            .unwrap();
+        assert_eq!(
+            vault.close_action().unwrap(),
+            CloseAction::Tray,
+            "提醒开着时，从没设置过的关闭行为必须默认进托盘"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 从没设置过 ＋ 提醒**关着** ⇒ 直接退出。
+    ///
+    /// ⚠️ 老库（连提醒这个 key 都没有）走的也是这一条 —— 即升级上来的行为
+    ///    与改动前**逐项一致**（改动前点 ✕ 就是直接退出）。反过来默认进托盘，
+    ///    等于给所有人塞一个"关不掉"的窗口，而托盘图标他们根本没见过。
+    #[test]
+    fn close_action_unset_with_reminder_off_is_quit() {
+        let (vault, dir) = close_action_vault("reminder-off");
+
+        // 老库：连 reminder_enabled 这个 key 都不存在
+        assert_eq!(
+            vault.close_action().unwrap(),
+            CloseAction::Quit,
+            "提醒没开（老库连这个 key 都没有）时必须默认直接退出"
+        );
+
+        // 显式写着 "false" 也一样
+        vault
+            .set_setting(setting_keys::REMINDER_ENABLED, "false")
+            .unwrap();
+        assert_eq!(vault.close_action().unwrap(), CloseAction::Quit);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 用户选过 `quit` 之后，**就算提醒后来打开了**，仍然是 `quit`。
+    ///
+    /// 这一条守的是"**用户的选择永远优先**"：如果这里跟着提醒跳回托盘，
+    /// 用户会得出"这软件的设置自己会变"的结论 —— 之后他就不再相信任何设置了。
+    #[test]
+    fn close_action_quit_survives_reminder_turning_on() {
+        let (vault, dir) = close_action_vault("quit-wins");
+
+        vault.set_close_action(CloseAction::Quit).unwrap();
+        // 先把提醒关着确认一次，再打开确认一次 —— 两个方向都不能动摇它
+        assert_eq!(vault.close_action().unwrap(), CloseAction::Quit);
+        vault
+            .set_setting(setting_keys::REMINDER_ENABLED, "true")
+            .unwrap();
+        assert_eq!(
+            vault.close_action().unwrap(),
+            CloseAction::Quit,
+            "用户亲手选的「直接退出」不能被后来打开的提醒改掉"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 用户选过 `tray` 之后，**就算提醒后来关掉了**，仍然是 `tray`。
+    ///
+    /// 与上一条同一条规则的另一个方向。顺带钉住"提醒关掉 ⇒ 不再进托盘"
+    /// 这个直觉是**错的**：进托盘是用户的选择，不是提醒的附属品。
+    #[test]
+    fn close_action_tray_survives_reminder_turning_off() {
+        let (vault, dir) = close_action_vault("tray-wins");
+
+        vault
+            .set_setting(setting_keys::REMINDER_ENABLED, "true")
+            .unwrap();
+        vault.set_close_action(CloseAction::Tray).unwrap();
+        vault
+            .set_setting(setting_keys::REMINDER_ENABLED, "false")
+            .unwrap();
+        assert_eq!(
+            vault.close_action().unwrap(),
+            CloseAction::Tray,
+            "用户亲手选的「最小化到托盘」不能被后来关掉的提醒改掉"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写进去再读回来，值与库里的**文本**都对得上。
+    ///
+    /// ⚠️ 断言里连库里的字符串一起验：`AppSettings.close_action` 走的是
+    ///    `close_action()`，而 `✕` 那条路径（`commands::close_action_now`）
+    ///    也走它 —— 但只要写入端把 `as_str()` 拼错一个字母，
+    ///    两者都会静默回落到"跟提醒走"，**看起来一切正常**。
+    #[test]
+    fn close_action_roundtrip_and_stored_text() {
+        let (vault, dir) = close_action_vault("roundtrip");
+
+        vault.set_close_action(CloseAction::Tray).unwrap();
+        assert_eq!(vault.close_action().unwrap(), CloseAction::Tray);
+        assert_eq!(
+            vault.get_setting(setting_keys::CLOSE_ACTION).unwrap().as_deref(),
+            Some("tray")
+        );
+
+        vault.set_close_action(CloseAction::Quit).unwrap();
+        assert_eq!(vault.close_action().unwrap(), CloseAction::Quit);
+        assert_eq!(
+            vault.get_setting(setting_keys::CLOSE_ACTION).unwrap().as_deref(),
+            Some("quit")
+        );
+
+        // `get_settings()` 里那个字段同源 —— 不许出现"设置页显示的值
+        // 与真按 ✕ 时的行为不一致"
+        vault.set_close_action(CloseAction::Tray).unwrap();
+        assert_eq!(
+            vault.get_settings().unwrap().close_action,
+            CloseAction::Tray
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 库里被外部工具写坏（`"xxx"` / 空串 / 大小写不同的 `"TRAY"` / 数字）⇒
+    /// 回落成"按提醒推导"，**不报错、不 panic**。
+    ///
+    /// 与 `get_settings()` 既有的"一律回落默认值"是同一条规矩。
+    /// ⚠️ 注意"回落"不是"一律退回 quit"：回落之后**仍要跟着提醒走** ——
+    ///    写坏一个值不该让开着提醒的人的提醒从此响不了。
+    ///
+    /// ⚠️ 这一组里**不要**放 `"  tray"` / `"tray "` 这类"只是两侧带空白"的值 ——
+    ///    它们**不是坏值**：解析统一 `trim()`（见 `CloseAction::parse`），
+    ///    与读 `reminder_enabled` 那句 `v.trim() == "true"` 同一口径。
+    ///    容错那件事由下面 `close_action_tolerates_surrounding_whitespace` 专门管。
+    #[test]
+    fn close_action_unknown_value_falls_back_to_reminder() {
+        let (vault, dir) = close_action_vault("bad-value");
+
+        for bad in ["", " ", "xxx", "TRAY", "1", "true"] {
+            // 提醒开着时：坏值 ⇒ 仍然进托盘
+            vault
+                .set_setting(setting_keys::REMINDER_ENABLED, "true")
+                .unwrap();
+            vault.set_setting(setting_keys::CLOSE_ACTION, bad).unwrap();
+            assert_eq!(
+                vault.close_action().unwrap(),
+                CloseAction::Tray,
+                "坏值 {bad:?} 必须回落成「跟提醒走」（提醒开着 ⇒ 进托盘）"
+            );
+
+            // 提醒关掉后：同一个坏值 ⇒ 直接退出
+            vault
+                .set_setting(setting_keys::REMINDER_ENABLED, "false")
+                .unwrap();
+            assert_eq!(
+                vault.close_action().unwrap(),
+                CloseAction::Quit,
+                "坏值 {bad:?} 必须回落成「跟提醒走」（提醒关着 ⇒ 直接退出）"
+            );
+        }
+
+        // 顺手钉住 `AppSettings::default()` 那一项：`Default` 拿不到库，
+        // 只能给 `Quit`；真值必须走 `close_action()`
+        assert_eq!(AppSettings::default().close_action, CloseAction::Quit);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 值两侧带空白（手改库、或从别处复制粘贴带上的）⇒ **照常认**。
+    ///
+    /// 口径要与同区的 `reminder_enabled` 一致：那边读的是 `v.trim() == "true"`，
+    /// 所以这边也不能"一个容错、一个挑剔"。
+    /// ⚠️ 容错的**只有空白**：大小写不同（`"TRAY"`）**不算**认得出来（见上一条测试）。
+    #[test]
+    fn close_action_tolerates_surrounding_whitespace() {
+        let (vault, dir) = close_action_vault("whitespace");
+
+        for (raw, want) in [
+            ("  tray", CloseAction::Tray),
+            ("tray\n", CloseAction::Tray),
+            ("\tquit ", CloseAction::Quit),
+        ] {
+            // ⚠️ 故意先把提醒设成与期望值**相反**的方向：只要这么写还能读出 want，
+            //    就证明它真的是"认出了这个值"、而不是碰巧落到跟提醒走的推导上。
+            vault
+                .set_setting(setting_keys::REMINDER_ENABLED, "false")
+                .unwrap();
+            vault.set_setting(setting_keys::CLOSE_ACTION, raw).unwrap();
+            assert_eq!(
+                vault.close_action().unwrap(),
+                want,
+                "{raw:?} 两侧空白要能容错（不该被当成坏值）"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

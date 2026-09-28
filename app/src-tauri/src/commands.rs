@@ -13,13 +13,14 @@
 use crate::crypto::{self, CryptoMeta, KdfParams, KEY_LEN};
 use crate::db::{
     count_written_entries_readonly, derive_and_verify, non_conflicting_path, parse_backup_stamp,
-    prune_backups, AppSettings, Attachment, BackupResult, DayMood, Entry, EntrySummary,
-    ExportResult, FilterResult, IntegrityReport, PruneReport, Recap, SearchHit, Stats, TagStat,
-    Vault,
+    prune_backups, AppSettings, Attachment, BackupResult, CloseAction, DayMood, Entry,
+    EntrySummary, ExportResult, FilterResult, IntegrityReport, PruneReport, Recap, SearchHit, Stats,
+    TagStat, Vault,
 };
 use crate::error::{AppError, AppResult};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::State;
 
@@ -107,6 +108,21 @@ struct VaultStateInner {
     data_dir: PathBuf,
     /// 已解锁的数据库连接。None 表示未解锁。
     vault: Mutex<Option<Vault>>,
+    /// 托盘图标到底建起来没有（【P2-21】）。
+    ///
+    /// ⚠️ 为什么需要它：如果托盘**没建起来**（图标缺失、或系统不让建）而
+    ///    关闭行为还是「最小化到托盘」—— 用户点 `✕`，窗口消失，
+    ///    **托盘上没有图标可点**，他就**再也回不来了**（只能开任务管理器）。
+    ///    ⇒ 托盘不可用时，关闭行为**一律按"直接退出"执行**。
+    ///
+    /// ⚠️ 为什么住在这里、而不是 `db.rs`：数据层**不认识托盘**
+    ///    （它连 `tauri` 都不该依赖）。"托盘可不可用"是**进程级事实**，
+    ///    判定点收在 `commands.rs` 的 `close_action_now()` 一处。
+    ///
+    /// 默认 `false`：**先假设没有托盘**。启动过程中（`setup` 建托盘之前）
+    /// 任何一次读取都会得到"直接退出"—— 这是保守方向：
+    /// 最坏是"该进托盘的时候退出了"，而不是"退不掉的窗口"。
+    tray_ok: AtomicBool,
 }
 
 impl Clone for VaultState {
@@ -125,6 +141,7 @@ impl VaultState {
             inner: std::sync::Arc::new(VaultStateInner {
                 data_dir,
                 vault: Mutex::new(None),
+                tray_ok: AtomicBool::new(false),
             }),
         }
     }
@@ -137,6 +154,21 @@ impl VaultState {
     /// 借用已解锁的连接。
     pub fn vault(&self) -> &Mutex<Option<Vault>> {
         &self.inner.vault
+    }
+
+    /// 托盘图标是否建起来了。见 `tray_ok` 字段的说明。
+    pub fn tray_ok(&self) -> bool {
+        self.inner.tray_ok.load(Ordering::Relaxed)
+    }
+
+    /// 建托盘成功之后由 `lib.rs` 的 `setup` 调一次。
+    ///
+    /// ⚠️ 只允许置位成 `true`（没有反方向的调用）：托盘在进程生命周期里
+    ///    只会建一次。真出现"托盘后来没了"（Explorer 崩了重开之类），
+    ///    那是系统层的事，靠 `SetProcessDefaultLayout` 那套也救不回来 ——
+    ///    不在本件的范围内。
+    pub fn set_tray_ok(&self) {
+        self.inner.tray_ok.store(true, Ordering::Relaxed);
     }
 }
 
@@ -219,6 +251,7 @@ pub fn default_export_dir(data_dir: &Path) -> PathBuf {
 /// | `unlock_with_auto_key` / `enable_auto_login` / `disable_auto_login` | 三条的凭证是**用户输入的密码**（或库外的钥匙文件），与连接在不在无关 |
 /// | `list_backups` / `crypto_info` / `reveal_dir` | 只读**库外文件**或打开一个目录，不碰日记内容 |
 /// | `inspect_backup` / `restore_backup` / `copy_backups_to` | 见下面「备份恢复」那一段的说明 |
+/// | `quit_app`（【P2-21】） | 它就是"退出进程"，一字节数据都不读。**而且它恰恰必须在"读不到库"时也能用**：点 `✕` 的收尾路径上，库可能已经锁了、或设置读坏了 —— 那时若要求"先解锁"，软件就**关不掉了** |
 ///
 /// ⚠️ 新增例外时，**同时**把它加进这张表 —— 否则下一个人只能靠通读代码
 ///    来判断"这条为什么不持锁"，而最省事的猜测永远是"忘了写"。
@@ -1069,6 +1102,82 @@ pub fn set_auto_lock_entries(state: State<'_, VaultState>, on: bool) -> AppResul
 #[tauri::command]
 pub fn set_triple_click_unlock(state: State<'_, VaultState>, on: bool) -> AppResult<()> {
     with_vault(&state, |v| v.set_triple_click_unlock(on))
+}
+
+// ---------------------------------------------------------------------------
+// 关闭行为与托盘（【P2-21】）
+// ---------------------------------------------------------------------------
+
+/// ⭐ 关闭行为的**唯一判定点**：叠上"托盘到底可不可用"。
+///
+/// 规则只有一句：**托盘用不了 ⇒ 一律「直接退出」**。
+///
+/// 为什么非要有这一条：关闭行为是「最小化到托盘」而托盘**没建起来**时，
+/// 用户点 `✕` ⇒ 窗口消失、托盘上没有图标 ⇒ **他再也回不来了**，
+/// 只能开任务管理器结束进程。宁可关得掉，也绝不能出现"点 ✕ 就失联"。
+///
+/// ⚠️ 判定收在这里一处，`get_close_action` 命令与"点 ✕"那条路径
+///    （`close_action_now`）**共用它** —— 抄第二份的后果是
+///    "设置页显示「直接退出」，实际却进了托盘"（或反过来），
+///    而用户永远不知道该信哪个。
+fn apply_tray_availability(state: &VaultState, action: CloseAction) -> CloseAction {
+    if state.tray_ok() {
+        action
+    } else {
+        CloseAction::Quit
+    }
+}
+
+/// 点窗口 `✕` 那一刻该做什么。**给 `lib.rs` 的 `on_window_event` 用**。
+///
+/// ⚠️ 它**刻意不返回 `Result`**：这条路径上任何失败都必须变成"能执行的结论"。
+///    读设置失败（未解锁 / 库损坏 / 外部工具写坏）一律按 `Quit` ——
+///    宁可关得掉，也不能"点了 ✕ 什么都没发生"。
+///
+/// ⚠️ 内部只 `with_vault` **一次**，而且**没有**在持有那把锁的时候
+///    再调一次 `with_vault`（那会自死锁）。
+pub(crate) fn close_action_now(state: &State<'_, VaultState>) -> CloseAction {
+    let stored = with_vault(state, |v| v.close_action()).unwrap_or(CloseAction::Quit);
+    apply_tray_availability(state.inner(), stored)
+}
+
+/// 读"点 `✕` 时做什么"（生效值）。
+///
+/// ⚠️ 与 `get_settings()` 里那个 `close_action` 字段**不是两条规则**：
+///    推导（"没设过 ⇒ 跟提醒走"）只有 `db::close_action()` 一份，
+///    这里只是在它上面再叠一层"托盘可不可用"（`apply_tray_availability`）。
+///
+/// 走 `with_vault`：设置住在加密库里，未解锁读不到 —— 读不到就该说
+/// "先解锁"，而不是编一个值出来（与 `get_settings` 同一理由）。
+#[tauri::command]
+pub fn get_close_action(state: State<'_, VaultState>) -> AppResult<CloseAction> {
+    let stored = with_vault(&state, |v| v.close_action())?;
+    Ok(apply_tray_availability(state.inner(), stored))
+}
+
+/// 写"点 `✕` 时做什么"。
+///
+/// ⚠️ 存的是**用户的选择**，不叠加托盘可用性 —— 系统这会儿没有托盘，
+///    不代表用户的选择是错的（换个环境就有了）。真正生效与否
+///    由读取路径判定（`apply_tray_availability`）。
+#[tauri::command]
+pub fn set_close_action(state: State<'_, VaultState>, action: CloseAction) -> AppResult<()> {
+    with_vault(&state, |v| v.set_close_action(action))
+}
+
+/// 退出整个应用（【P2-21】）。
+///
+/// ⚠️ **必须是前端在 flush 完之后调它**：正文是 1 秒防抖保存的，
+///    点 `✕` 那一瞬间最后打的字可能还没落库（`lib.rs` 里那条
+///    `app-quit-requested` 就是为这件事发的）。
+///    这条命令本身只负责"真的退"，不负责落库。
+///
+/// ⚠️ **不走 `with_vault`**：它一字节数据都不读，而且它恰恰必须在
+///    "读不到库"时也能用 —— 否则"库锁着的时候关不掉软件"。
+///    理由已记进上面那张例外清单。
+#[tauri::command]
+pub fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
 }
 
 /// 后台自动备份的检查间隔。

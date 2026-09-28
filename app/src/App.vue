@@ -29,6 +29,7 @@ import {
   integrityCheck,
   listTags,
   lockVault,
+  quitApp,
   setAutoBackup,
   toAppError,
   unlockWithAutoKey,
@@ -41,6 +42,7 @@ import {
   type Stats,
   type TagStat,
 } from "./api";
+import { listen } from "@tauri-apps/api/event";
 import { humanBytes, todayKey } from "./utils/date";
 
 const status = ref<AppStatus | null>(null);
@@ -766,14 +768,62 @@ watch(unlocked, (ok) => {
   if (!ok) clearLockTimer();
 });
 
+// ---------------------------------------------------------------------------
+// 退出前的落库（【P2-21】）
+// ---------------------------------------------------------------------------
+
+/**
+ * 后端发来"要退出了"：点 ✕ 走的是"直接退出"、或者托盘菜单里点了「退出」。
+ *
+ * ⚠️ **顺序不能反**：正文是 1000ms 防抖保存的，点 ✕ 那一瞬间最后打的字
+ *    可能还没落库 —— 必须先 `flushNow()` 把它写下去，再真退。
+ *    （与 `doLock` / `doRestore` 是同一个病根、同一条解法：
+ *     凡是"界面要没了"的路径，都得先催编辑器一次，而且 `await` 住。）
+ *
+ * ⚠️ `flushNow()` 在**当前不是写日记页**时没有实例（编辑器已被卸载）：
+ *    用 `?.` 兜住 —— 没实例就没有东西要 flush，直接退。
+ *
+ * ⚠️ 出错也得退：`flushNow()` 失败时不会往外抛（失败由 flush 自己写进
+ *    `saveState`），而 `quitApp()` 万一失败，**绝不能卡在这里不退** ——
+ *    "关不掉"比丢一行字严重得多。后端的 2 秒兜底会收掉进程，
+ *    但那是兜底，不是设计。
+ */
+async function onQuitRequested() {
+  await editorRef.value?.flushNow();
+  try {
+    await quitApp();
+  } catch {
+    // 什么都不做：等后端那 2 秒的兜底把进程收掉
+  }
+}
+
+/**
+ * 事件监听的注销句柄。
+ *
+ * ⚠️ 必须注销：`listen` 是**全局**监听，不注销的话热重载会叠出第二、第三份。
+ */
+let unlistenQuit: (() => void) | null = null;
+
 onMounted(() => {
   void boot();
   window.addEventListener("blur", onBlur);
   window.addEventListener("focus", onFocus);
+  // 「退出前请先落库」这条事件的监听（【P2-21】）。
+  // ⚠️ 这是本软件**第一处**用 Tauri 的"后端 → 前端"事件（此前全是前端调后端）。
+  //    权限不用管：`core:default` 里已经含 `core:event:default`（监听权）。
+  // ⚠️ `listen` 返回的是 Promise，且理论上可能失败 —— 失败不该让界面起不来，
+  //    所以吞掉错误（真失败了还有后端的 2 秒兜底）。
+  void listen("app-quit-requested", () => void onQuitRequested())
+    .then((un) => {
+      unlistenQuit = un;
+    })
+    .catch(() => {});
 });
 onUnmounted(() => {
   window.removeEventListener("blur", onBlur);
   window.removeEventListener("focus", onFocus);
+  unlistenQuit?.();
+  unlistenQuit = null;
 });
 </script>
 
