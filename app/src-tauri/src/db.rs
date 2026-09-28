@@ -47,6 +47,37 @@ pub mod setting_keys {
     ///    只有精确的 `"true"` 才算开（与 `auto_backup_enabled()` 同一口径），
     ///    因为"提醒"这一项的默认方向就是**关**。
     pub const REMINDER_ENABLED: &str = "reminder_enabled";
+    /// 提醒时间，`"HH:MM"`（24 小时制、两位补零）。
+    ///
+    /// ⚠️ **必须洗净成 `HH:MM` 再存**：前端那个时间框"理论上"只会给这个形状，
+    ///    但"理论上"不算保证（给不给秒、给不给 `9:5`，随 WebView2 版本变）。
+    ///    洗净收在 `normalize_reminder_time()` **一处**，**读的时候也过一遍** ——
+    ///    于是"前端给了个怪形状"与"库里被外部工具写坏"走同一条回落路径。
+    ///
+    /// ⚠️ 前端要拿这个字符串**直接比大小**判断"到点没有"（`"21:05" < "21:10"`），
+    ///    所以两位补零是硬要求，不是好看。
+    pub const REMINDER_TIME: &str = "reminder_time";
+    /// 提醒的重复策略（【P2-13】）：`"daily"` / `"on_open"` / `"never"`。
+    ///
+    /// ⚠️ 认不出的值**回落 `daily`**（不是"不提醒"）—— 与 `close_action` 的
+    ///    "认不出就当作没设过"同一方向：**宁可多提醒一次，也不要静默失效**。
+    pub const REMINDER_MODE: &str = "reminder_mode";
+    /// 最后一次**真的响过**提醒的日期（`YYYY-MM-DD`）。从没响过 = 键不存在。
+    ///
+    /// ⚠️ 为什么这一个要落盘（而前端那个 `remindedOn` 那种运行期状态不该落）：
+    ///    `daily` 档对用户的承诺是"**一天一次**"。不落盘的话，他重启一次软件
+    ///    当天就会被再提一次，"一天一次"当场变成"一天好几次"。
+    ///    ⇒ 它是**承诺的一部分**，不是缓存。
+    /// ⚠️ 但**只记"响过"**，不记"错过"：没开机那天什么都不写，
+    ///    下次打开也**不补**（用户 2026-09-23："电脑没开机就不提醒，证明用户很忙"）。
+    pub const REMINDER_LAST_FIRED: &str = "reminder_last_fired";
+    /// 开机自启（【P2-13】）：`"true"` / `"false"`。
+    ///
+    /// ⚠️ 这里记的是**用户的意图**；系统真正认的那份在注册表里
+    ///    （`HKCU\...\Run` 下的 `Diary` 值）。两者可能不同步
+    ///    （用户拿别的工具删了注册表项之类），校正方向见
+    ///    `commands::sync_auto_start()`。
+    pub const AUTO_START: &str = "auto_start";
 }
 
 /// 自动锁定时长的**档位白名单**（秒）。`0` 表示"永不"。
@@ -110,6 +141,22 @@ pub struct AppSettings {
     ///    只有 `close_action()` 能算准（它要读提醒开关），
     ///    这里的字段值就是它的结果，别自己另算一遍。
     pub close_action: CloseAction,
+    /// 写作提醒是否开启（【P2-13】）。默认**关**。
+    ///
+    /// ⚠️ 默认关是**用户拍板的**（指令里也是"别擅自帮用户打开"）：
+    ///    提醒会让窗口自己跳出来，这种事必须由他亲手开。
+    pub reminder_enabled: bool,
+    /// 提醒的重复策略（【P2-13】）。默认 `Daily`（一天一次）。
+    pub reminder_mode: ReminderMode,
+    /// 提醒时间，洗净后的 `"HH:MM"`。默认 `21:00`。
+    pub reminder_time: String,
+    /// 最后一次真的响过提醒的日期（`YYYY-MM-DD`）；从没响过是**空串**。
+    ///
+    /// ⚠️ 空串是刻意的（不用 `Option`）：前端只需要拿它跟今天比字符串，
+    ///    空串天然"不等于任何一天" ⇒ 不会挡住第一次提醒。
+    pub reminder_last_fired: String,
+    /// 开机自启（【P2-13】）。默认**关**。
+    pub auto_start: bool,
 }
 
 impl Default for AppSettings {
@@ -122,6 +169,13 @@ impl Default for AppSettings {
             //    而"提醒没开"时的推导结果就是 `Quit`。真值一律走
             //    `close_action()`，别拿这个当业务默认值用。
             close_action: CloseAction::Quit,
+            // 提醒与开机自启都默认**关** —— 两项方向一致：
+            // "软件自己动起来"的那类行为一律先关着，等用户亲手打开。
+            reminder_enabled: false,
+            reminder_mode: DEFAULT_REMINDER_MODE,
+            reminder_time: DEFAULT_REMINDER_TIME.to_string(),
+            reminder_last_fired: String::new(),
+            auto_start: false,
         }
     }
 }
@@ -168,6 +222,92 @@ impl CloseAction {
             _ => None,
         }
     }
+}
+
+/// 提醒的重复策略（【P2-13】）。
+///
+/// ⚠️ 为什么"永远不提醒"也占一档、而不是让用户去关那个开关：
+///    开关管的是"要不要提醒"这**件整事**，这一档管的是**报到的节奏**。
+///    用户的原话是"写入设置里，自己选择" —— 三档摆在一起，他一次能看完。
+///    （"永远不提醒"与"关掉开关"结果一样，但他心里想的可能是两件事：
+///      "最近别烦我" vs "这功能我不要了"。）
+///
+/// 序列化形状：`"daily"` / `"on_open"` / `"never"`（前端与库里同一个词）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReminderMode {
+    /// 到点响一次，当天不再响 —— **重启也不再响**（这一档要落盘，
+    /// 见 `setting_keys::REMINDER_LAST_FIRED`）。出厂默认。
+    Daily,
+    /// 不看到点：**软件一启动**就判断一次，当天还没写就提。
+    /// 同一次运行里只提一次（重启软件 = "又打开了一次" = 会再提）。
+    OnOpen,
+    /// 不提醒。
+    Never,
+}
+
+impl ReminderMode {
+    /// 库里的存储值。写入端与解析端**共用这三个字面量**，免得拼错。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReminderMode::Daily => "daily",
+            ReminderMode::OnOpen => "on_open",
+            ReminderMode::Never => "never",
+        }
+    }
+
+    /// 从库里的值解析。
+    ///
+    /// ⚠️ 与 `CloseAction::parse` 同一形状：**认不出返回 `None`**，
+    ///    由调用方落到默认值上（"库里被写坏"与"老库没这个键"走同一条路径）。
+    fn parse(s: &str) -> Option<ReminderMode> {
+        match s.trim() {
+            "daily" => Some(ReminderMode::Daily),
+            "on_open" => Some(ReminderMode::OnOpen),
+            "never" => Some(ReminderMode::Never),
+            _ => None,
+        }
+    }
+}
+
+/// 提醒时间的出厂默认值。
+///
+/// ⚠️ **这只是默认值，不是固定档位** —— 用户可以挑任意时:分
+///    （用户 2026-09-23 明确要求，⛔ 别做成 20:00/21:00/22:00 三个按钮），
+///    改完立即生效、不用重启软件。
+pub const DEFAULT_REMINDER_TIME: &str = "21:00";
+
+/// 提醒策略的出厂默认值：**一天一次**（用户 2026-09-28 亲自选的）。
+pub const DEFAULT_REMINDER_MODE: ReminderMode = ReminderMode::Daily;
+
+/// 把"用户给的时间"洗净成 `HH:MM`；洗不出来就回落出厂值。
+///
+/// ⚠️ **写入与读取都要过它**（不是只在写入端洗）：库里那个值可能被外部
+///    工具改坏，而"存进去的时候是好的"不构成保证。
+///
+/// 宽容到什么程度是**刻意**的：
+///   - `"9:5"`   ⇒ `"09:05"`（补零是硬要求：前端拿它做**字符串比较**
+///                            判断"到点没有"，`"9:5"` 与 `"21:00"` 没法比大小）
+///   - `"07:05"` ⇒ 原样（**非默认值不会被吞掉** —— 这条最要紧）
+///   - `"09:30:00"` ⇒ `"09:30"`（秒对本功能无意义，直接丢；这**不是**坏值）
+///   - `"abc"` / `"25:00"` / `""` / 只有一段 ⇒ 回落 `21:00`，**不报错**
+///
+/// 不报错是刻意的：它读的路径上有"每次解锁都要读设置"——为它抛错会让
+/// 升级上来的库一打开就报错，而用户什么都没做错（与 `get_settings` 同一条规矩）。
+pub fn normalize_reminder_time(raw: &str) -> String {
+    let mut parts = raw.trim().split(':');
+    let (Some(h), Some(m)) = (parts.next(), parts.next()) else {
+        return DEFAULT_REMINDER_TIME.to_string();
+    };
+    // ⚠️ 用 `u32` 而不是先转 `i32`：负号（`-1:30`）在 `u32` 上直接解析失败，
+    //    会走回落那条路 —— 上面的 `h > 23` 只管"太大"，管不了负数。
+    let (Ok(h), Ok(m)) = (h.trim().parse::<u32>(), m.trim().parse::<u32>()) else {
+        return DEFAULT_REMINDER_TIME.to_string();
+    };
+    if h > 23 || m > 59 {
+        return DEFAULT_REMINDER_TIME.to_string();
+    }
+    format!("{h:02}:{m:02}")
 }
 
 /// 一条日记。
@@ -3178,11 +3318,49 @@ impl Vault {
         //    而漂移的后果是"设置页显示的值"与"真按 ✕ 时的行为"不一致，
         //    用户永远发现不了，只会觉得这软件的设置时灵时不灵。
         let close_action = self.close_action()?;
+        // 写作提醒（【P2-13】）。
+        //
+        // ⚠️ 开关的口径与 `auto_backup_enabled()` 一致：**只有精确的 "true" 才算开**。
+        //    这一项的默认方向是"关"，读错方向最多是少提醒一次（他没损失什么）；
+        //    与 `auto_lock_entries` 的"只有 false 才算关"正好相反 ——
+        //    两边读错方向的代价不对称，所以口径也不对称，这是刻意的。
+        let reminder_enabled = self
+            .get_setting(setting_keys::REMINDER_ENABLED)?
+            .map(|v| v.trim() == "true")
+            .unwrap_or(false);
+        // 策略：认不出就回落 `daily`（见 `ReminderMode::parse` 的说明）。
+        let reminder_mode = self
+            .get_setting(setting_keys::REMINDER_MODE)?
+            .as_deref()
+            .and_then(ReminderMode::parse)
+            .unwrap_or(DEFAULT_REMINDER_MODE);
+        // 时间：**读的时候也洗一遍**（理由见 `normalize_reminder_time`）。
+        let reminder_time = normalize_reminder_time(
+            &self
+                .get_setting(setting_keys::REMINDER_TIME)?
+                .unwrap_or_default(),
+        );
+        // 最后一次响过的日期；老库没有这个键 ⇒ 空串 ⇒ 不挡第一次提醒。
+        let reminder_last_fired = self
+            .get_setting(setting_keys::REMINDER_LAST_FIRED)?
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        // 开机自启：与提醒开关同一口径（只有精确 "true" 才算开）。
+        let auto_start = self
+            .get_setting(setting_keys::AUTO_START)?
+            .map(|v| v.trim() == "true")
+            .unwrap_or(false);
         Ok(AppSettings {
             auto_lock_secs: secs,
             auto_lock_entries,
             triple_click_unlock,
             close_action,
+            reminder_enabled,
+            reminder_mode,
+            reminder_time,
+            reminder_last_fired,
+            auto_start,
         })
     }
 
@@ -3293,6 +3471,102 @@ impl Vault {
     ///    那会让这一项在用户眼里变成"自己会变的设置"。
     pub fn set_close_action(&self, action: CloseAction) -> AppResult<()> {
         self.set_setting(setting_keys::CLOSE_ACTION, action.as_str())
+    }
+
+    /// 写作提醒是否开启（【P2-13】）。口径与 `get_settings()` 一致。
+    ///
+    /// ⚠️ 它**不碰** `close_action`：关闭行为的默认值要"跟提醒走"，
+    ///    那条推导在 `close_action()` 里**现算**（见那里的说明）——
+    ///    ⇒ 在这里顺手写一次库，会把"用户的选择永远优先"这条规则弄坏。
+    pub fn reminder_enabled(&self) -> AppResult<bool> {
+        Ok(self
+            .get_setting(setting_keys::REMINDER_ENABLED)?
+            .map(|v| v.trim() == "true")
+            .unwrap_or(false))
+    }
+
+    /// 写"写作提醒是否开启"。
+    ///
+    /// ⚠️ 这是**唯一一处**能改变 `close_action()` 推导结果的东西
+    ///    （提醒开着 ⇒ 关闭行为默认进托盘）。所以调用方**不要**跟着
+    ///    再写一次 `close_action` —— 一旦写了，"用户没设过"这个状态就没了。
+    pub fn set_reminder_enabled(&self, on: bool) -> AppResult<()> {
+        self.set_setting(
+            setting_keys::REMINDER_ENABLED,
+            if on { "true" } else { "false" },
+        )
+    }
+
+    /// 提醒时间，洗净后的 `"HH:MM"`。见 `normalize_reminder_time`。
+    pub fn reminder_time(&self) -> AppResult<String> {
+        Ok(normalize_reminder_time(
+            &self
+                .get_setting(setting_keys::REMINDER_TIME)?
+                .unwrap_or_default(),
+        ))
+    }
+
+    /// 写提醒时间。**返回洗净后的值** —— 界面上那个输入框要拿它回填，
+    /// 这样"用户输了个怪东西"当场就能在界面上看出被修正了。
+    ///
+    /// ⚠️ 与另外几项不同，它**不做白名单校验、也不报错**：任何输入都能
+    ///    得出一个合法结果（洗不出来就是 21:00）。这与 `set_auto_lock_secs`
+    ///    那句"白名单之外返回错误"是刻意的差别 —— 那一项是安全参数，
+    ///    这一项只是"什么时候提醒我"。
+    pub fn set_reminder_time(&self, raw: &str) -> AppResult<String> {
+        let clean = normalize_reminder_time(raw);
+        self.set_setting(setting_keys::REMINDER_TIME, &clean)?;
+        Ok(clean)
+    }
+
+    /// 提醒的重复策略。认不出的值回落 `daily`。
+    pub fn reminder_mode(&self) -> AppResult<ReminderMode> {
+        Ok(self
+            .get_setting(setting_keys::REMINDER_MODE)?
+            .as_deref()
+            .and_then(ReminderMode::parse)
+            .unwrap_or(DEFAULT_REMINDER_MODE))
+    }
+
+    /// 写提醒的重复策略。参数是**枚举** ⇒ 非法值在类型上进不来，
+    /// 与 `set_close_action` 同一形状，没有白名单要校验。
+    pub fn set_reminder_mode(&self, mode: ReminderMode) -> AppResult<()> {
+        self.set_setting(setting_keys::REMINDER_MODE, mode.as_str())
+    }
+
+    /// 最后一次真的响过提醒的日期（`YYYY-MM-DD`）；没有就是空串。
+    pub fn reminder_last_fired(&self) -> AppResult<String> {
+        Ok(self
+            .get_setting(setting_keys::REMINDER_LAST_FIRED)?
+            .unwrap_or_default()
+            .trim()
+            .to_string())
+    }
+
+    /// 记下"今天响过了"。
+    ///
+    /// ⚠️ 只该在**真的提醒过之后**写：这一格是"一天一次"那个承诺的凭据，
+    ///    提前写下去会让当天**再也不响**（比多响一次糟得多）。
+    ///    写坏了也不致命 —— 它只是个日期字符串，最坏是一天多响一次。
+    pub fn set_reminder_last_fired(&self, date: &str) -> AppResult<()> {
+        self.set_setting(setting_keys::REMINDER_LAST_FIRED, date.trim())
+    }
+
+    /// 开机自启的**用户意图**（系统认的那份在注册表里，见 `setting_keys::AUTO_START`）。
+    pub fn auto_start(&self) -> AppResult<bool> {
+        Ok(self
+            .get_setting(setting_keys::AUTO_START)?
+            .map(|v| v.trim() == "true")
+            .unwrap_or(false))
+    }
+
+    /// 写"开机自启"的用户意图。
+    ///
+    /// ⚠️ 它**只写库** —— 注册表那一下由 `commands::set_auto_start()` 做。
+    ///    两处必须一起写（库 = 用户的意图，注册表 = 系统认的事实），
+    ///    但分层上**数据层不该认识注册表**（它连 `tauri` 都不依赖）。
+    pub fn set_auto_start(&self, on: bool) -> AppResult<()> {
+        self.set_setting(setting_keys::AUTO_START, if on { "true" } else { "false" })
     }
 
     /// 到下次自动备份还差多少秒。0 表示现在就该备份。
@@ -5923,6 +6197,226 @@ mod tests {
             filter_find_hit(&after, "2026-09-10").unwrap().tags,
             vec!["a", "b", "c"],
             "退休不影响『这一篇上挂着什么』"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------------
+    // 写作提醒与开机自启（【P2-13】）
+    // ---------------------------------------------------------------------
+
+    /// 造一个只属于提醒那几条测试的库。
+    fn reminder_vault(tag: &str) -> (Vault, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("dsh-diary-reminder-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let vault = Vault::create(&dir, "135790", None).unwrap();
+        (vault, dir)
+    }
+
+    /// 提醒与开机自启**默认都是关的** —— 别擅自帮用户打开（指令 §九 明令）。
+    #[test]
+    fn reminder_defaults_are_off_and_harmless() {
+        let (vault, dir) = reminder_vault("defaults");
+
+        assert!(!vault.reminder_enabled().unwrap(), "提醒默认必须是关的");
+        assert_eq!(vault.reminder_time().unwrap(), "21:00");
+        assert_eq!(vault.reminder_mode().unwrap(), ReminderMode::Daily);
+        assert_eq!(vault.reminder_last_fired().unwrap(), "");
+        assert!(!vault.auto_start().unwrap(), "开机自启默认必须是关的");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 顺便把"整套默认值"钉住 —— 升级上来的老库走的就是这一套。
+    #[test]
+    fn app_settings_default_block_includes_reminder() {
+        let s = AppSettings::default();
+        assert!(!s.reminder_enabled);
+        assert_eq!(s.reminder_mode, ReminderMode::Daily);
+        assert_eq!(s.reminder_time, "21:00");
+        assert_eq!(s.reminder_last_fired, "");
+        assert!(!s.auto_start);
+    }
+
+    /// `get_settings()` 那条路也要把五个新字段带出来（前端只读它一次）。
+    #[test]
+    fn get_settings_carries_reminder_fields() {
+        let (vault, dir) = reminder_vault("settings-fields");
+
+        vault.set_reminder_enabled(true).unwrap();
+        vault.set_reminder_mode(ReminderMode::OnOpen).unwrap();
+        vault.set_reminder_time("7:05").unwrap();
+        vault.set_auto_start(true).unwrap();
+
+        let s = vault.get_settings().unwrap();
+        assert!(s.reminder_enabled);
+        assert_eq!(s.reminder_mode, ReminderMode::OnOpen);
+        assert_eq!(s.reminder_time, "07:05", "读的时候也要洗净");
+        assert!(s.auto_start);
+        // ⚠️ 顺带确认"打开提醒"没有把关闭行为写死（理由见下一条测试）
+        assert_eq!(s.close_action, CloseAction::Tray);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 时间洗净：`"9:5"` ⇒ `"09:05"`（补零是硬要求，前端拿它比字符串）。
+    #[test]
+    fn reminder_time_is_zero_padded() {
+        let (vault, dir) = reminder_vault("time-pad");
+
+        assert_eq!(vault.set_reminder_time("9:5").unwrap(), "09:05");
+        assert_eq!(
+            vault.reminder_time().unwrap(),
+            "09:05",
+            "写进去的那个值就是读出来的那个值"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⭐ **非默认值不被回落规则吞掉** —— 它是"用户自由挑时间"的地基。
+    #[test]
+    fn reminder_time_keeps_non_default_values() {
+        let (vault, dir) = reminder_vault("time-keep");
+
+        for (raw, want) in [
+            ("07:05", "07:05"),
+            // ⚠️ 凌晨零点：绝不能被当成"空值"或"没设置"回落掉
+            ("00:00", "00:00"),
+            ("23:59", "23:59"),
+            // 带秒：丢掉秒，但**不是**坏值 ⇒ 不回落
+            ("12:30:00", "12:30"),
+            // 两侧空白
+            (" 06:15 ", "06:15"),
+        ] {
+            vault.set_reminder_time(raw).unwrap();
+            assert_eq!(vault.reminder_time().unwrap(), want, "{raw:?} 被吞掉了");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 坏时间一律回落 `21:00`、**不报错**（读设置那条路径不能抛）。
+    #[test]
+    fn reminder_time_falls_back_on_garbage() {
+        let (vault, dir) = reminder_vault("time-bad");
+
+        for bad in [
+            "", " ", "abc", "25:00", "12:60", "-1:30", "21", ":30", "21:", "21:0x",
+        ] {
+            vault
+                .set_reminder_time(bad)
+                .unwrap_or_else(|e| panic!("{bad:?} 不该报错：{e}"));
+            assert_eq!(
+                vault.reminder_time().unwrap(),
+                "21:00",
+                "{bad:?} 该回落成出厂值"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 策略档位：三档写读一致；认不出的值回落 `daily`。
+    #[test]
+    fn reminder_mode_round_trips_and_falls_back() {
+        let (vault, dir) = reminder_vault("mode");
+
+        for m in [
+            ReminderMode::Daily,
+            ReminderMode::OnOpen,
+            ReminderMode::Never,
+        ] {
+            vault.set_reminder_mode(m).unwrap();
+            assert_eq!(vault.reminder_mode().unwrap(), m);
+        }
+
+        // ⚠️ 坏值回落"一天一次"，**不是**"不提醒" ——
+        //    方向与 `close_action` 一致：宁可多提一次，也不要静默失效。
+        for bad in ["", " ", "DAILY", "1", "一直"] {
+            vault.set_setting(setting_keys::REMINDER_MODE, bad).unwrap();
+            assert_eq!(
+                vault.reminder_mode().unwrap(),
+                ReminderMode::Daily,
+                "{bad:?} 该回落成 default"
+            );
+        }
+        // 两侧空白要能容错（与 `CloseAction::parse` 同一口径）
+        vault
+            .set_setting(setting_keys::REMINDER_MODE, " never\n")
+            .unwrap();
+        assert_eq!(vault.reminder_mode().unwrap(), ReminderMode::Never);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 几个开关写读一致（提醒开关 / 开机自启 / 已提醒日期）。
+    #[test]
+    fn reminder_switches_round_trip() {
+        let (vault, dir) = reminder_vault("switches");
+
+        vault.set_reminder_enabled(true).unwrap();
+        assert!(vault.reminder_enabled().unwrap());
+        vault.set_reminder_enabled(false).unwrap();
+        assert!(!vault.reminder_enabled().unwrap());
+
+        vault.set_auto_start(true).unwrap();
+        assert!(vault.auto_start().unwrap());
+        vault.set_auto_start(false).unwrap();
+        assert!(!vault.auto_start().unwrap());
+
+        vault.set_reminder_last_fired("2026-09-28").unwrap();
+        assert_eq!(vault.reminder_last_fired().unwrap(), "2026-09-28");
+        // 两侧空白要洗净：它要跟今天的日期做**字符串比较**，带空白就永远不相等
+        vault.set_reminder_last_fired(" 2026-09-27 ").unwrap();
+        assert_eq!(vault.reminder_last_fired().unwrap(), "2026-09-27");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⭐ **开关提醒不许顺手把关闭行为写死** —— "用户的选择永远优先"靠它。
+    ///
+    /// 写库了会怎样：用户开一次提醒、再关掉，`close_action` 里就留下了
+    /// 一个值，"没设过"这个状态**永远回不来** ⇒ 从此关闭行为不再跟提醒走。
+    #[test]
+    fn reminder_toggle_does_not_pin_close_action() {
+        let (vault, dir) = reminder_vault("no-pin");
+
+        vault.set_reminder_enabled(true).unwrap();
+        assert_eq!(vault.close_action().unwrap(), CloseAction::Tray);
+        vault.set_reminder_enabled(false).unwrap();
+        assert_eq!(vault.close_action().unwrap(), CloseAction::Quit);
+        // 再来回一次，仍然要跟得动
+        vault.set_reminder_enabled(true).unwrap();
+        assert_eq!(vault.close_action().unwrap(), CloseAction::Tray);
+
+        assert_eq!(
+            vault.get_setting(setting_keys::CLOSE_ACTION).unwrap(),
+            None,
+            "提醒的开关不许动 close_action 那个键"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⭐ "最后响过的日期"必须**跨进程读得到** —— 它就是 `daily` 档
+    /// "一天一次"那个承诺的凭据（只存内存的话，重启一次当天就会再响一次）。
+    #[test]
+    fn reminder_last_fired_survives_reopen() {
+        let (vault, dir) = reminder_vault("last-fired");
+
+        vault.set_reminder_last_fired("2026-09-28").unwrap();
+        drop(vault);
+
+        // 重开一个连接 ＝ 模拟"重启软件"
+        let again = Vault::unlock(&dir, "135790").unwrap();
+        assert_eq!(again.reminder_last_fired().unwrap(), "2026-09-28");
+        assert_eq!(
+            again.get_settings().unwrap().reminder_last_fired,
+            "2026-09-28",
+            "get_settings 那条路上也要带出来"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

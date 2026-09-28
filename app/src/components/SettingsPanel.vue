@@ -35,6 +35,7 @@ import pkg from "../../package.json";
 import {
   AUTO_LOCK_OPTIONS,
   CLOSE_ACTION_OPTIONS,
+  REMINDER_MODE_OPTIONS,
   changePassword,
   copyBackupsTo,
   disableAutoLogin,
@@ -45,7 +46,11 @@ import {
   revealDir,
   setAutoLockEntries,
   setAutoLockSecs,
+  setAutoStart,
   setCloseAction,
+  setReminderEnabled,
+  setReminderMode,
+  setReminderTime,
   setTripleClickUnlock,
   toAppError,
   type AppStatus,
@@ -56,6 +61,7 @@ import {
   type CryptoInfo,
   type ExportResult,
   type PruneReport,
+  type ReminderMode,
 } from "../api";
 import { humanBytes } from "../utils/date";
 
@@ -75,6 +81,20 @@ const props = defineProps<{
    * 同样由 App.vue 持有 —— 它还要传给 EditorPane，不能有两份。
    */
   tripleClickUnlock: boolean;
+  /**
+   * 写作提醒是否开启（【P2-13】）。由 App.vue 持有 ——
+   * 它还要跑那个每分钟看一眼的定时器、还要决定挂不挂横幅。
+   */
+  reminderEnabled: boolean;
+  /**
+   * 提醒的重复策略（【P2-13】）。真值源同样在 App.vue ——
+   * 定时器每 tick 都要看它，放两份必然对不上。
+   */
+  reminderMode: ReminderMode;
+  /** 提醒时间，`"HH:MM"`（后端的洗净值）。 */
+  reminderTime: string;
+  /** 开机自启（【P2-13】）。由 App.vue 持有（它负责解锁后校正注册表路径）。 */
+  autoStart: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -110,6 +130,17 @@ const emit = defineEmits<{
    * 这两件都住在 `App.vue`，设置页拿不到编辑器句柄。
    */
   (e: "restore", dbPath: string): void;
+  /** 「写作提醒」开关已成功写入后端，通知 App.vue 更新本地值（【P2-13】）。 */
+  (e: "reminder-enabled", on: boolean): void;
+  /**
+   * 提醒时间已成功写入后端。带的是**后端洗净后的值** ——
+   * 它可能和用户填的不一样（`"9:5"` ⇒ `"09:05"`），App.vue 要拿它当新真值。
+   */
+  (e: "reminder-time", time: string): void;
+  /** 提醒策略已成功写入后端（【P2-13】）。 */
+  (e: "reminder-mode", mode: ReminderMode): void;
+  /** 「开机自启」已成功写入后端（【P2-13】）。 */
+  (e: "auto-start", on: boolean): void;
   /** 一句提示，由 App.vue 的 toast 显示。 */
   (e: "notice", message: string): void;
 }>();
@@ -301,6 +332,97 @@ async function onToggleTripleClickUnlock(e: Event) {
     emit("triple-click-unlock", next);
   } catch (err) {
     el.checked = props.tripleClickUnlock; // 回滚，不留假状态
+    emit("notice", toAppError(err).message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 写作提醒与开机自启（【P2-13】）
+// ---------------------------------------------------------------------------
+
+/**
+ * 切换「写作提醒」。
+ * 与上面三个开关**完全同一套路**：自己调后端、成功后 emit 新值让 App.vue
+ * 更新 ref（ref 仍是唯一真值源）、失败时把勾拨回原值。
+ *
+ * ⚠️ App.vue 收到之后会**重读一次设置**（不是只改这一个 ref）：
+ *    打开/关掉提醒会改变「点击关闭时」的**显示值**（没设过时跟提醒走），
+ *    而那个值由后端推导 —— 只改本地这一个 ref 会让那一行停在旧值上。
+ *
+ * ⚠️ 光靠 App.vue 重读**还不够**：上面那一行「点击关闭时」的值存在本组件
+ *    自己的 `closeAction` ref 里（它走 `getCloseAction()`，要叠上"这台机器
+ *    有没有托盘可用"，与 App.vue 那份不是同一个东西），而它只在 `onMounted`
+ *    读过一次 ⇒ 弹窗开着的时候勾提醒，那一行会停在旧值上，
+ *    用户看到的是"设置自己会骗人"。 ⇒ 这里必须自己再读一次。
+ */
+async function onToggleReminder(e: Event) {
+  const el = e.target as HTMLInputElement;
+  const next = el.checked;
+  if (next === props.reminderEnabled) return;
+  try {
+    await setReminderEnabled(next);
+    emit("reminder-enabled", next);
+    await loadCloseAction();
+  } catch (err) {
+    el.checked = props.reminderEnabled; // 回滚，不留假状态
+    emit("notice", toAppError(err).message);
+  }
+}
+
+/** 切换提醒策略（三档）。与上面的 `<select>` 同一套路 + 失败回滚。 */
+async function onChangeReminderMode(e: Event) {
+  const el = e.target as HTMLSelectElement;
+  const next = el.value as ReminderMode;
+  if (next === props.reminderMode) return;
+  try {
+    await setReminderMode(next);
+    emit("reminder-mode", next);
+  } catch (err) {
+    el.value = props.reminderMode; // 回滚，不留假状态
+    emit("notice", toAppError(err).message);
+  }
+}
+
+/**
+ * 改提醒时间。
+ *
+ * ⚠️ **必须拿后端返回的值回填那个输入框**（`setReminderTime` 返回洗净值）：
+ *    它是 `<input type="time">`，但**不保证**交给我们的就一定是 `HH:MM`
+ *    （给不给秒随 WebView2 版本变）。后端洗完这里要照它显示 ——
+ *    否则用户看到的和真正存下去的不是同一个值。
+ * ⚠️ 这一项**不报错**（任何输入都能得出一个合法结果），所以这里没有
+ *    "失败回滚"，只有"把界面拨到后端说的那个值"。
+ */
+async function onChangeReminderTime(e: Event) {
+  const el = e.target as HTMLInputElement;
+  const next = el.value;
+  if (!next || next === props.reminderTime) return;
+  try {
+    const clean = await setReminderTime(next);
+    el.value = clean; // 把界面拨到后端那句话上
+    emit("reminder-time", clean);
+  } catch (err) {
+    el.value = props.reminderTime; // 回滚，不留假状态
+    emit("notice", toAppError(err).message);
+  }
+}
+
+/**
+ * 切换「开机自启」。
+ *
+ * ⚠️ 这一项失败时**必须把原因说出来**（其余开关失败也只是回滚 + toast，
+ *    同一条路）：它要**动注册表**，而失败原因（权限、组策略锁住注册表）
+ *    不是用户自己能猜到的，光把勾拨回去他会以为是点坏了。
+ */
+async function onToggleAutoStart(e: Event) {
+  const el = e.target as HTMLInputElement;
+  const next = el.checked;
+  if (next === props.autoStart) return;
+  try {
+    await setAutoStart(next);
+    emit("auto-start", next);
+  } catch (err) {
+    el.checked = props.autoStart; // 回滚，不留假状态
     emit("notice", toAppError(err).message);
   }
 }
@@ -1206,12 +1328,83 @@ async function doCopyBackups() {
             </p>
           </section>
 
-          <!-- ── 通用（【P2-21】新增） ───────────────────────────────
+          <!-- ── 通用（【P2-21】新增；【P2-13】加了三项） ──────────────
                这一栏回答的是"让写日记这件事**自己发生**"：
-               关掉窗口还留在后台、到点提醒、每天写够多少字、开机自己起来。
-               ⚠️ 本件（P2-21）只放**一项**；提醒 / 开机自启归【P2-13】，
-                  每日字数目标归【P2-12】，都会往这里加。 -->
+               关掉窗口还留在后台、到点提醒、开机自己起来。
+               顺序：写作提醒 → 提醒节奏 → 提醒时间 → 开机自启 → 点击关闭时。
+               ⚠️ "提醒"排最前，因为它才是这一栏的**目的** ——
+                  关闭行为与开机自启都只是"让提醒响得了"的手段。
+               （每日字数目标归【P2-12】，落地时也往这栏里加。） -->
           <section v-else-if="tab === 'general'">
+            <!--
+              ⚠️ 说明文字**每项一句**：用户 2026-09-28 当场定的规矩 ——
+                 "界面上的解释最多一句话、最好没有"。这里留下的两句都是
+                 "不写他真会做错事"的那种（提醒要靠软件在后台跑，
+                 不写他会以为关了窗口提醒照样响）。
+            -->
+            <div class="row">
+              <div class="label">
+                <div class="t">写作提醒</div>
+                <div class="d">每天到点，那天还没写日记就提醒你。</div>
+              </div>
+              <div class="ctl">
+                <label class="toggle">
+                  <input
+                    type="checkbox"
+                    :checked="reminderEnabled"
+                    @change="onToggleReminder"
+                  />
+                </label>
+              </div>
+            </div>
+
+            <!-- 三档的差别，选项文字自己就说清了 ⇒ 这一行不写说明。 -->
+            <div class="row">
+              <div class="label">
+                <div class="t">提醒节奏</div>
+              </div>
+              <div class="ctl">
+                <select :value="reminderMode" @change="onChangeReminderMode">
+                  <option v-for="o in REMINDER_MODE_OPTIONS" :key="o.value" :value="o.value">
+                    {{ o.label }}
+                  </option>
+                </select>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="label">
+                <div class="t">提醒时间</div>
+                <!--
+                  ⚠️ `on_open` 档**不看到点**，这一行也就没意义了 ——
+                  置灰 + 一句状态说明。留着能点会让用户以为"设了却不生效"。
+                -->
+                <div v-if="reminderMode === 'on_open'" class="d">
+                  这一档不看到点
+                </div>
+              </div>
+              <div class="ctl">
+                <input
+                  type="time"
+                  :value="reminderTime"
+                  :disabled="reminderMode === 'on_open'"
+                  @change="onChangeReminderTime"
+                />
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="label">
+                <div class="t">开机自启</div>
+                <div class="d">开机后在后台运行，关掉它提醒就不会响。</div>
+              </div>
+              <div class="ctl">
+                <label class="toggle">
+                  <input type="checkbox" :checked="autoStart" @change="onToggleAutoStart" />
+                </label>
+              </div>
+            </div>
+
             <div class="row">
               <div class="label">
                 <div class="t">点击关闭时</div>
@@ -1432,6 +1625,21 @@ select {
   border: 1px solid var(--border);
   border-radius: 7px;
   cursor: pointer;
+}
+
+/* 时间选择器：与上面那个 select 同一套外观（原生控件不描一遍会跟旁边不搭） */
+input[type="time"] {
+  padding: 5px 9px;
+  font-size: 13px;
+  color: var(--text-1);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  cursor: pointer;
+}
+input[type="time"]:disabled {
+  color: var(--text-3);
+  cursor: default;
 }
 
 /* 开关：朴素的原生 checkbox，不引组件库 */

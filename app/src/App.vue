@@ -20,6 +20,8 @@ import {
   cryptoInfo,
   DEFAULT_AUTO_LOCK_ENTRIES,
   DEFAULT_AUTO_LOCK_SECS,
+  DEFAULT_REMINDER_MODE,
+  DEFAULT_REMINDER_TIME,
   DEFAULT_TRIPLE_CLICK_UNLOCK,
   getBackupStatus,
   getRecap,
@@ -27,10 +29,14 @@ import {
   getStats,
   getStatus,
   integrityCheck,
+  isDateWritten,
   listTags,
   lockVault,
+  presentReminder,
   quitApp,
   setAutoBackup,
+  setReminderLastFired,
+  syncAutoStart,
   toAppError,
   unlockWithAutoKey,
   writtenDates,
@@ -39,6 +45,7 @@ import {
   type ChangePasswordResult,
   type CryptoInfo,
   type Recap,
+  type ReminderMode,
   type Stats,
   type TagStat,
 } from "./api";
@@ -254,6 +261,73 @@ const autoLockEntries = ref(DEFAULT_AUTO_LOCK_ENTRIES);
  */
 const tripleClickUnlock = ref(DEFAULT_TRIPLE_CLICK_UNLOCK);
 
+/**
+ * 写作提醒是否开启（【P2-13】）。默认 **关**。
+ *
+ * ⚠️ 默认关是**用户拍板的**（指令里也明令"别擅自帮用户打开"）：
+ *    提醒会让窗口自己跳出来，这种事必须他亲手开。
+ * 与上面三项同一套路：先用默认值起步，解锁后由 `loadSettings()` 换成真值。
+ */
+const reminderEnabled = ref(false);
+
+/**
+ * 提醒的重复策略（【P2-13】）。默认"一天提醒一次"。
+ *
+ * ⚠️ 三档与"提醒开关"是**两件事**：开关管"要不要提醒"，
+ *    这一档管"报到的节奏"（用户 2026-09-28 拍板：写入设置、自己选）。
+ */
+const reminderMode = ref<ReminderMode>(DEFAULT_REMINDER_MODE);
+
+/** 提醒时间，`"HH:MM"`（后端洗净过的两位补零值）。 */
+const reminderTime = ref(DEFAULT_REMINDER_TIME);
+
+/**
+ * 最后一次真的响过提醒的日期（`YYYY-MM-DD`）；从没响过是空串。
+ *
+ * ⚠️ 它**必须落库**（不是内存标记）：`daily` 档对用户的承诺是"一天一次"，
+ *    只存内存的话，他重启一次软件当天就会被再提醒一次。
+ */
+const reminderLastFired = ref("");
+
+/** 开机自启（【P2-13】）。默认 **关**。 */
+const autoStart = ref(false);
+
+/**
+ * 提醒横幅是否挂着（【P2-13】）。
+ *
+ * ⚠️ 它**不是 toast**：toast 是 3 秒就走掉的操作反馈，
+ *    而这条要**一直挂到用户处理**（点「去写」或点「×」）——
+ *    所以它有自己的 ref、自己的样式、自己的关闭方式。
+ */
+const showReminder = ref(false);
+
+/**
+ * 本次运行里"该不该提醒"是**为哪一天**判断过的（内存标记，**不落盘**）。
+ *
+ * ⚠️ 它存在的理由是"别每分钟都去问一次库"：`tickReminder` 每 60 秒跑一次，
+ *    而"今天写过没有"是一次 IPC —— 没有这个标记，一天会白发几百次。
+ * ⚠️ 存的是**日期**而不是一个布尔值：软件可能一直开着、跨过午夜，
+ *    存布尔值的话第二天就再也不判断了（永远停在"昨天已经看过"）。
+ * ⚠️ 置位时机是"**判断完成之后**（无论写没写）"，不是"真提醒了之后"：
+ *    已经写过的那天同样要停下来。
+ */
+let reminderCheckedOn: string | null = null;
+
+/**
+ * 上一次跑"看一眼"的时刻（内存值，**不落盘**）。模块加载时就是"现在"。
+ *
+ * ⭐ 它是"**错过不补**"那条规则的实现（用户 2026-09-23 定、2026-09-28 复核：
+ *    "没开机/被退出 ⇒ 那天作废、重开不补"）：
+ *    "到点"要求**提醒时间落在两次检查之间**，也就是"那一刻软件**确实在跑**"。
+ *    ⇒ 晚上 22:00 才打开软件（21:00 时它没在跑）⇒ 那天作废、不补提醒。
+ *    ⚠️ 少了它，"过了点才打开软件"会立刻弹一条 —— 那就成了"补提醒"，
+ *       与用户要的正好相反。
+ * ⚠️ 初值取"现在"而不是 `null`：启动那一刻算作"刚检查过一次"，
+ *    于是"启动时刻 < 提醒时间 ≤ 现在"在任何情况下都有**一致**的起点
+ *    （否则行为会取决于开机时焦点事件有没有触发过，太脆）。
+ */
+let reminderLastTickAt = new Date();
+
 const toast = ref("");
 let toastTimer: number | null = null;
 
@@ -467,9 +541,31 @@ async function loadSettings() {
     autoLockSecs.value = s.auto_lock_secs;
     autoLockEntries.value = s.auto_lock_entries;
     tripleClickUnlock.value = s.triple_click_unlock;
+    // 写作提醒与开机自启（【P2-13】）
+    reminderEnabled.value = s.reminder_enabled;
+    reminderMode.value = s.reminder_mode;
+    reminderTime.value = s.reminder_time;
+    reminderLastFired.value = s.reminder_last_fired;
+    autoStart.value = s.auto_start;
   } catch {
     // 保持默认值。不值得为这一项弹错误。
   }
+  // ⭐ 开机自启的**路径校正**（【P2-13】）：软件换过位置之后，注册表里
+  //    那条自启命令还指着旧 exe ⇒ 症状是"自启明明开着，开机却什么都没发生"。
+  //    ⚠️ 必须排在**读设置之后**：后端要先知道"用户确实开着自启"才肯动注册表，
+  //       否则"从别处的 exe 启动一次"就会把他的自启悄悄改到那个路径上。
+  //    ⚠️ 失败不吭声：这是每次解锁都跑的**背景动作**，用户没做错什么。
+  try {
+    await syncAutoStart();
+  } catch {
+    // 同上，静默。
+  }
+  // ⭐ 设置到位之后立刻看一眼该不该提醒（【P2-13】）。
+  //    ⚠️ 这一句不能省：`watch(unlocked)` 触发时设置**还没读回来**
+  //       （`loadSettings` 是异步的），那时 `reminderEnabled` 还是初值 `false`
+  //       ⇒ 定时器起了、但这一轮判断会被跳过。早上打开软件时如果已经过了
+  //       提醒时间，就该当场提醒，而不是等下一个 60 秒。
+  tickReminder();
 }
 
 function onUnlocked(s: AppStatus) {
@@ -742,6 +838,11 @@ function onBlur() {
 
 function onFocus() {
   clearLockTimer();
+  // 窗口重新获得焦点时顺便看一眼该不该提醒（【P2-13】）。
+  // ⚠️ 这条**不是锦上添花**：定时器在窗口隐藏时会被系统节流，
+  //    而且"合盖一夜、第二天打开电脑"时第一次 tick 最多要等 60 秒 ——
+  //    焦点事件能让它立刻判断。
+  tickReminder();
 }
 
 /**
@@ -765,8 +866,170 @@ watch(autoLockSecs, () => rearmLockTimer());
  * 手动锁定也会经过这里，不必在每个调用点都记得清一遍。
  */
 watch(unlocked, (ok) => {
-  if (!ok) clearLockTimer();
+  if (!ok) {
+    clearLockTimer();
+    // 提醒定时器同理：未解锁时它什么都判断不了（`isDateWritten` 会报错），
+    // 而且那会儿软件停在锁屏页、提醒没有意义。
+    stopReminderTimer();
+    // 横幅也得收掉 —— 它是"上一个解锁状态"留下的界面残留。
+    showReminder.value = false;
+    return;
+  }
+  startReminderTimer();
 });
+
+// ---------------------------------------------------------------------------
+// 写作提醒（【P2-13】）
+// ---------------------------------------------------------------------------
+
+/** 定时器句柄。`null` = 没在跑。 */
+let reminderTimer: number | null = null;
+
+/**
+ * 检查间隔：**每分钟**一次。
+ *
+ * ⚠️ 为什么不是"算出距离 21:00 还有多少毫秒、然后睡那么久"：
+ *    - 合盖 / 休眠 ⇒ 醒来时那一次早就过了，或者被系统时钟改动搞乱；
+ *    - 用户改了提醒时间 ⇒ 那个长定时器得**重算**，而"改时间"这条路径最容易漏；
+ *    - 长 `setTimeout` 还踩 int32 毫秒溢出那条老坑。
+ *    与后台自动备份线程同一套做法：**隔一阵醒一次、判断一下**。
+ */
+const REMINDER_TICK_MS = 60_000;
+
+/** 现在几点的 `HH:MM`（本地时间、两位补零）。 */
+function nowHHMM(d: Date): string {
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+function startReminderTimer() {
+  if (reminderTimer !== null) return;
+  reminderTimer = window.setInterval(tickReminder, REMINDER_TICK_MS);
+}
+
+function stopReminderTimer() {
+  if (reminderTimer === null) return;
+  window.clearInterval(reminderTimer);
+  reminderTimer = null;
+}
+
+/**
+ * 看一眼"该不该提醒"，该就提醒。
+ *
+ * 每 60 秒跑一次，另外两处各补跑一次：
+ *   - `onFocus`（窗口重新获得焦点）：合盖一夜后第一次 tick 最多要等 60 秒；
+ *   - `loadSettings` 末尾（设置刚读回来）：`watch(unlocked)` 触发那一刻
+ *     设置还没到位，判断会被跳过。
+ *
+ * ⚠️ **只在解锁后跑**：`isDateWritten` 未解锁会报错，锁屏页上提醒也没意义
+ *    （"锁着照常提醒"指的是**应用被锁定但人还在用**，不是停在锁屏页）。
+ */
+function tickReminder() {
+  const now = new Date();
+  // ⚠️ **先取旧值、再更新**，而且要把更新放在所有 `return` 之前：
+  //    后面有好几个提前返回，而"检查区间"必须连续 ——
+  //    漏更新会让区间断掉，下一次判断的 `prev` 还是很久以前，
+  //    可能凭空"跨过"一个早就过去的提醒时间。
+  const prev = reminderLastTickAt;
+  reminderLastTickAt = now;
+
+  if (!unlocked.value || !reminderEnabled.value) return;
+  if (reminderMode.value === "never") return;
+
+  const today = todayKey();
+  if (reminderCheckedOn === today) return;
+
+  if (reminderMode.value === "daily") {
+    // ⭐ 到点 = **提醒时间落在 (上次检查, 现在] 之间**，不是"现在过了提醒时间"。
+    //    两者只差一件事：**那一刻软件在不在跑**。
+    //    22:00 才打开软件时，"现在过了 21:00"成立，但"21:00 落在区间里"不成立
+    //    ⇒ 那天作废、**不补提醒**（用户定的）。
+    // ⚠️ 字符串比较就够：两边都是**定长**的 `HH:MM`（后端保证洗净成两位补零），
+    //    定长字符串的字典序就是时间序。
+    // ⚠️ 左边用 `<=` 而不是 `<`：`prev` 就是"上次检查的那一刻"，
+    //    它**等于**提醒时间时说明"那一刻软件在跑、而且已经到点"，
+    //    本来就不该排除。少了这一条，"启动时刻正好落在提醒时间那一分钟里"
+    //    （比如 21:00:40 打开软件）会被判成"错过"，而用户明明刚打开软件。
+    if (
+      !(
+        nowHHMM(prev) <= reminderTime.value &&
+        reminderTime.value <= nowHHMM(now)
+      )
+    ) {
+      return;
+    }
+    // 今天已经响过了。⚠️ 看的是**库里**那个标记，所以重启也认得 ——
+    //    这正是"一天一次"能兑现的原因。
+    if (reminderLastFired.value === today) return;
+  }
+
+  void isDateWritten(today)
+    .then((written) => {
+      // ⚠️ 无论写没写都记下"这一天看过了"：已经写过的那天也要停下来，
+      //    否则这一整天每分钟都会白发一次 IPC。
+      reminderCheckedOn = today;
+      if (written) return;
+      showReminder.value = true;
+      // Rust 侧：把窗口叫到前台 ＋ 抢不到前台时闪任务栏。
+      void presentReminder();
+      if (reminderMode.value === "daily") {
+        // ⭐ **真的提醒过之后**才记 —— 它是"一天一次"那个承诺的凭据。
+        //    提前记下去会让当天**再也不响**，那比多响一次糟得多。
+        reminderLastFired.value = today;
+        // 写失败就算了：最坏结果是当天多响一次。
+        void setReminderLastFired(today).catch(() => {});
+      }
+    })
+    .catch(() => {
+      // 读失败（库坏了之类）也记下：不该每分钟去撞一次坏掉的库。
+      reminderCheckedOn = today;
+    });
+}
+
+/**
+ * 设置页改了「写作提醒」。
+ *
+ * ⚠️ 这里必须**重读一次全部设置**（不是只改这一个 ref）：
+ *    「点击关闭时」显示的是后端**推导**出来的值（用户没设过时跟提醒走），
+ *    只改本地这一个 ref 会让那一行停在旧值上 ——
+ *    而那一行正是用户改完提醒之后接着要看的。
+ */
+function onReminderEnabled(on: boolean) {
+  reminderEnabled.value = on;
+  void loadSettings();
+}
+
+/** 设置页改了提醒策略（三档）。 */
+function onReminderMode(m: ReminderMode) {
+  reminderMode.value = m;
+}
+
+/** 设置页改了提醒时间（传过来的是后端洗净过的值）。 */
+function onReminderTime(t: string) {
+  reminderTime.value = t;
+}
+
+/** 设置页改了开机自启。 */
+function onAutoStart(on: boolean) {
+  autoStart.value = on;
+}
+
+/**
+ * 改完提醒设置立刻生效：重看一眼（不用重启软件）。
+ * ⚠️ 幂等 —— `reminderCheckedOn` 会挡住当天已经判断过的情况。
+ */
+watch([reminderEnabled, reminderMode, reminderTime], () => tickReminder());
+
+/** 横幅上的「去写」：切到写日记屏、日期定在今天，并收起横幅。 */
+function goWriteFromReminder() {
+  mode.value = "write";
+  selected.value = todayKey();
+  showReminder.value = false;
+}
+
+/** 横幅上的「×」：只收起横幅。**今天不会再响**（`reminderLastFired` 已置位）。 */
+function dismissReminder() {
+  showReminder.value = false;
+}
 
 // ---------------------------------------------------------------------------
 // 退出前的落库（【P2-21】）
@@ -1043,6 +1306,19 @@ onUnmounted(() => {
         </div>
       </main>
 
+      <!--
+        写作提醒横幅（【P2-13】）。
+        ⚠️ 它与 toast **同区域但不是 toast**：toast 是 3 秒就走掉的操作反馈，
+           而这一条要**一直挂到用户处理**（点「去写」或点「×」）。
+        ⚠️ 它**不抢输入焦点** —— 用户可能正在打字，抢走光标很讨厌
+           （所以这里不 autofocus、也不主动 focus 任何元素）。
+      -->
+      <div v-if="showReminder" class="reminder-bar">
+        <span>今天还没写日记</span>
+        <button class="go" @click="goWriteFromReminder">去写</button>
+        <button class="drop" title="今天不再提醒" @click="dismissReminder">×</button>
+      </div>
+
       <div v-if="toast" class="toast">{{ toast }}</div>
 
       <!--
@@ -1059,6 +1335,10 @@ onUnmounted(() => {
         :auto-lock-secs="autoLockSecs"
         :auto-lock-entries="autoLockEntries"
         :triple-click-unlock="tripleClickUnlock"
+        :reminder-enabled="reminderEnabled"
+        :reminder-mode="reminderMode"
+        :reminder-time="reminderTime"
+        :auto-start="autoStart"
         @close="showSettings = false"
         @backup="doBackup"
         @integrity="doIntegrity"
@@ -1066,6 +1346,10 @@ onUnmounted(() => {
         @auto-lock-secs="(s) => (autoLockSecs = s)"
         @auto-lock-entries="(on) => (autoLockEntries = on)"
         @triple-click-unlock="(on) => (tripleClickUnlock = on)"
+        @reminder-enabled="onReminderEnabled"
+        @reminder-mode="onReminderMode"
+        @reminder-time="onReminderTime"
+        @auto-start="onAutoStart"
         @password-changed="onPasswordChanged"
         @auto-login-changed="onAutoLoginChanged"
         @refresh-status="refreshStatus"
@@ -1237,6 +1521,53 @@ onUnmounted(() => {
     display: none;
   }
 }
+/*
+ * 写作提醒横幅（【P2-13】）。
+ * ⚠️ 独立于 .toast（理由见模板那段注释）：toast 会自己消失，这条不会。
+ */
+.reminder-bar {
+  position: fixed;
+  bottom: 22px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px 10px 18px;
+  font-size: 13px;
+  color: var(--text-1);
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 9px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.14);
+  max-width: 86vw;
+  /* 比弹窗的遮罩高：提醒要被看见。
+     ⚠️ 但**低于**遮蔽页（HiddenScreen 自己带更高的层级）—— 那是"人不在"
+        的状态，不该被一条提醒盖在上面。 */
+  z-index: 50;
+}
+.reminder-bar .go {
+  padding: 4px 11px;
+  font-size: 12px;
+  color: var(--bg);
+  background: var(--accent);
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.reminder-bar .drop {
+  padding: 2px 6px;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--text-3);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+.reminder-bar .drop:hover {
+  color: var(--text-1);
+}
+
 .toast {
   position: fixed;
   bottom: 22px;

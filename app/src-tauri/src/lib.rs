@@ -35,6 +35,7 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager};
 
+use crate::error::AppError;
 use commands::VaultState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -98,6 +99,11 @@ pub fn run() {
             // 它要把"托盘建起来了"记回 `VaultState`，那份状态得先注册好。
             // ⚠️ 它**没有返回值**：托盘建不起来也不该让软件起不来（见函数说明）。
             setup_tray(app.handle());
+            // ⭐ 窗口到底显不显示的责任**全落在这一句上**（理由见
+            //    `show_window_unless_silent`）——
+            //    `tauri.conf.json` 里窗口是 `"visible": false`，
+            //    ⚠️ 必须排在 `setup_tray` **之后**：它要问"托盘建起来了没有"。
+            show_window_unless_silent(app.handle());
             Ok(())
         })
         // ⭐ 关窗口时到底"藏进托盘"还是"真退出"，由设置决定（【P2-21】）。
@@ -218,6 +224,16 @@ pub fn run() {
             commands::get_close_action,
             commands::set_close_action,
             commands::quit_app,
+            // 写作提醒与开机自启（【P2-13】）。
+            // ⚠️ 提醒的**判断全在前端**（只有前端知道本地日期）：
+            //    这几条只负责"存设置"＋"把窗口叫出来"＋"把自启项写对"。
+            commands::set_reminder_enabled,
+            commands::set_reminder_time,
+            commands::set_reminder_mode,
+            commands::set_reminder_last_fired,
+            commands::present_reminder,
+            commands::set_auto_start,
+            commands::sync_auto_start,
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");
@@ -368,5 +384,97 @@ fn try_setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     // 记下"托盘真的建起来了"。**必须在 build 成功之后**：
     // 置早了，用户在"托盘没建成"的机器上点 ✕ 就会关不回来。
     state.set_tray_ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 启动方式与开机自启（【P2-13】）
+// ---------------------------------------------------------------------------
+
+/// 注册表里那个值的名字（`HKCU\...\Run` 下）。
+///
+/// ⚠️ **必须固定**：每次换个名字就会在注册表里堆一条新的，
+///    而用户关掉自启时只删得掉当前这个名字，老的那些全留下 ——
+///    下次开机照样会把软件拉起来，用户却找不到是从哪来的。
+const AUTO_START_VALUE_NAME: &str = "Diary";
+
+/// 这次启动是不是"开机自启"那条路径（系统带着 `--startup` 把我们拉起来的）。
+///
+/// 参数由注册表里那一条命令给出（见 `set_auto_start_impl`）：
+/// `"<exe 的完整路径>" --startup`。用户从开始菜单点开时**没有**这个参数。
+fn is_startup_launch() -> bool {
+    std::env::args().any(|a| a == "--startup")
+}
+
+/// 决定这次启动要不要把窗口显出来（【P2-13】§五-6）。
+///
+/// ⭐ **`tauri.conf.json` 里窗口是 `"visible": false`，所以"显示"这件事
+///    没有任何兜底 —— 漏掉它就是"双击图标什么都没发生"。**
+///    两条路径都在这里显式处理：
+///      - 正常启动（用户双击图标）⇒ **必须 show**，观感与改动前逐帧一致
+///        （`setup` 阶段就调，用户看不到多出来的等待）；
+///      - 开机自启（`--startup`）⇒ **不 show**，直接进托盘。
+///
+/// ⭐ **"托盘建不起来 ⇒ 自启那条路也要 show"**：否则托盘上没图标、窗口又不显，
+///    用户开机之后**彻底找不到这个软件**（只能靠任务管理器，还得先知道有它）。
+///    方向与 `close_action` 那边一致 —— **宁可多显一个窗口，
+///    也绝不能出现"什么都看不见"**。
+///
+/// ⚠️ 判断"托盘可用"**必须问 `VaultState::tray_ok()`**（由 `setup_tray` 置位），
+///    ⛔ 不要在这里再去问一次系统、更不要另建一个托盘 —— 那会变成第二份判定，
+///    而两份判定迟早不一致。
+fn show_window_unless_silent(app: &tauri::AppHandle) {
+    let silent = is_startup_launch() && app.state::<VaultState>().tray_ok();
+    if silent {
+        return;
+    }
+    show_main(app);
+}
+
+/// 写 / 删注册表里的开机自启项（【P2-13】）。
+///
+/// - `on == true`：往 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+///   写一个 `Diary` 值，内容是 `"<exe 的完整路径>" --startup`。
+///   ⚠️ **路径必须带引号**：安装目录里可能有空格（"Program Files"）或中文，
+///   不带引号系统会在空格处把命令截断 ⇒ 开机时报"找不到文件"，
+///   而用户只会看到"自启没生效"，查不出为什么。
+/// - `on == false`：删掉它。**值本来就不存在也算成功**（幂等）。
+///
+/// ⚠️ 只写 `HKCU`，**绝不写 `HKLM`**：后者要管理员权限，日记软件不该要。
+///
+/// ⚠️ 已经是目标值时**直接返回、不重复写**：`sync_auto_start` 每次解锁后
+///    都会跑一遍，没必要天天去动注册表。
+///
+/// ⚠️ 非 Windows 上是空操作（返回成功）：本机是 Windows，但别的平台
+///    编这一份代码时不该因为注册表而编不过。
+pub fn set_auto_start_impl(exe: &std::path::Path, on: bool) -> Result<(), AppError> {
+    #[cfg(windows)]
+    {
+        use winreg::enums::HKEY_CURRENT_USER;
+        use winreg::RegKey;
+
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let (run, _) = hkcu
+            .create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
+            .map_err(|e| AppError::State(format!("无法打开自启注册表项：{e}")))?;
+
+        if on {
+            let want = format!("\"{}\" --startup", exe.display());
+            if let Ok(cur) = run.get_value::<String, _>(AUTO_START_VALUE_NAME) {
+                if cur == want {
+                    return Ok(());
+                }
+            }
+            run.set_value(AUTO_START_VALUE_NAME, &want)
+                .map_err(|e| AppError::State(format!("无法写入自启注册表项：{e}")))?;
+        } else {
+            // 删一个不存在的值会返回 NotFound —— 那正是我们想要的结果，忽略它。
+            let _ = run.delete_value(AUTO_START_VALUE_NAME);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (exe, on);
+    }
     Ok(())
 }

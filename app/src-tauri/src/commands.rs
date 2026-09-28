@@ -14,15 +14,17 @@ use crate::crypto::{self, CryptoMeta, KdfParams, KEY_LEN};
 use crate::db::{
     count_written_entries_readonly, derive_and_verify, non_conflicting_path, parse_backup_stamp,
     prune_backups, AppSettings, Attachment, BackupResult, CloseAction, DayMood, Entry,
-    EntrySummary, ExportResult, FilterResult, IntegrityReport, PruneReport, Recap, SearchHit, Stats,
-    TagStat, Vault,
+    EntrySummary, ExportResult, FilterResult, IntegrityReport, PruneReport, Recap, ReminderMode,
+    SearchHit, Stats, TagStat, Vault,
 };
 use crate::error::{AppError, AppResult};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use tauri::State;
+// `Manager` 是 `get_webview_window()` 的来源（`present_reminder` 要用它）；
+// `State` 是命令参数的来源。两个都得在作用域里。
+use tauri::{Manager, State};
 
 /// 应用当前状态。前端用它决定显示解锁页还是日历页。
 #[derive(Debug, Clone, Serialize)]
@@ -252,6 +254,7 @@ pub fn default_export_dir(data_dir: &Path) -> PathBuf {
 /// | `list_backups` / `crypto_info` / `reveal_dir` | 只读**库外文件**或打开一个目录，不碰日记内容 |
 /// | `inspect_backup` / `restore_backup` / `copy_backups_to` | 见下面「备份恢复」那一段的说明 |
 /// | `quit_app`（【P2-21】） | 它就是"退出进程"，一字节数据都不读。**而且它恰恰必须在"读不到库"时也能用**：点 `✕` 的收尾路径上，库可能已经锁了、或设置读坏了 —— 那时若要求"先解锁"，软件就**关不掉了** |
+/// | `present_reminder`（【P2-13】） | 它连 `state` 参数都没有，只是把窗口叫到前台。⚠️ 提醒响的那一刻库**完全可能锁着**（"锁着照常提醒"是定过的行为）—— 它要是要求先解锁，提醒就永远响不了 |
 ///
 /// ⚠️ 新增例外时，**同时**把它加进这张表 —— 否则下一个人只能靠通读代码
 ///    来判断"这条为什么不持锁"，而最省事的猜测永远是"忘了写"。
@@ -1102,6 +1105,120 @@ pub fn set_auto_lock_entries(state: State<'_, VaultState>, on: bool) -> AppResul
 #[tauri::command]
 pub fn set_triple_click_unlock(state: State<'_, VaultState>, on: bool) -> AppResult<()> {
     with_vault(&state, |v| v.set_triple_click_unlock(on))
+}
+
+// ---------------------------------------------------------------------------
+// 写作提醒与开机自启（【P2-13】）
+// ---------------------------------------------------------------------------
+
+/// 打开 / 关掉写作提醒。
+///
+/// ⚠️ **不要在这里顺手写 `close_action`**：关闭行为的默认值要"跟提醒走"，
+///    那条推导在 `db::close_action()` 里**现算**（见那里的说明）。
+///    一旦把结果写进库，"用户从没设置过"这个状态就永远回不来了 ——
+///    用户之后再开/关提醒，关闭行为**再也不会跟着变**，
+///    而"跟着变"正是【P2-21】定下的行为。
+///
+/// ⚠️ 提醒是**纯前端在跑**的（只有前端知道本地日期）：这条命令只管存开关，
+///    定时器、判断"今天写过没有"、横幅，全在 `App.vue`。
+#[tauri::command]
+pub fn set_reminder_enabled(state: State<'_, VaultState>, on: bool) -> AppResult<()> {
+    with_vault(&state, |v| v.set_reminder_enabled(on))
+}
+
+/// 写提醒时间。**返回洗净后的值**（`"9:5"` ⇒ `"09:05"`）。
+///
+/// ⚠️ 前端要拿返回值**回填那个输入框** —— 这是"用户输了个怪东西"唯一的
+///    可见反馈：它**不报错**（任何输入都能得出一个合法结果），只会被修正。
+#[tauri::command]
+pub fn set_reminder_time(state: State<'_, VaultState>, time: String) -> AppResult<String> {
+    with_vault(&state, |v| v.set_reminder_time(&time))
+}
+
+/// 写提醒的重复策略（`daily` / `on_open` / `never`）。
+/// 参数是枚举 ⇒ 非法值在类型上进不来，没有白名单要校验。
+#[tauri::command]
+pub fn set_reminder_mode(state: State<'_, VaultState>, mode: ReminderMode) -> AppResult<()> {
+    with_vault(&state, |v| v.set_reminder_mode(mode))
+}
+
+/// 记下"今天已经响过提醒了"。
+///
+/// ⚠️ **只能在真的提醒过之后调**：这一格是 `daily` 档"一天一次"那个承诺的
+///    凭据，提前写下去会让当天**再也不响**（比多响一次糟得多）。
+/// ⚠️ 日期由**前端给**：只有前端知道本地日期（东八区凌晨 0~8 点会被
+///    UTC 算成前一天，见 `db::stats` 的说明）。
+#[tauri::command]
+pub fn set_reminder_last_fired(state: State<'_, VaultState>, date: String) -> AppResult<()> {
+    with_vault(&state, |v| v.set_reminder_last_fired(&date))
+}
+
+/// 把主窗口叫到前台 ＋ 闪任务栏。**提醒真的响了那一刻**调它。
+///
+/// ⚠️ 为什么放在 Rust 侧：前端也能 show / focus，但"抢前台"在 Windows 上
+///    经常被系统拦掉（焦点根本不给你）—— 那时要退成**闪任务栏**，
+///    而这一下只有 Rust 侧的 `request_user_attention` 做得到。
+///
+/// ⚠️ 返回 `()` 不是 `Result`：这条路径上**没有该报的错**。
+///    窗口找不到就算了（横幅已经挂上，用户照样看得见）；
+///    在这里抛错只会让"提醒响了"这件事半途而废。
+///
+/// ⚠️ 与 `quit_app` 同理**不走 `with_vault`**：它一字节数据都不读。
+///    （提醒响的那一刻库完全可能是锁着的 —— "锁着照常提醒"是定过的行为。）
+#[tauri::command]
+pub fn present_reminder(app: tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        // 三句与托盘菜单的「显示主窗口」**同序同义**：显示 → 取消最小化 → 聚焦。
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+        // 抢不到前台时的退路：闪任务栏，用户至少知道"有事发生"。
+        let _ = w.request_user_attention(Some(tauri::UserAttentionType::Informational));
+    }
+}
+
+/// 打开 / 关掉「开机自启」。
+///
+/// ⚠️ 它做**两件事**，顺序有讲究：
+///    1. **先写注册表**（系统真正认的是那一份）；
+///    2. 成了再写库（"用户的意图"，设置页显示它）。
+///    反过来的话，注册表写失败而库里已经记着"开着" ⇒
+///    设置页显示开着、开机却起不来，而用户完全查不出原因。
+///
+/// ⚠️ 注册表写失败**必须报上去**：这是用户亲手点的开关，
+///    "点了没反应"是最不能接受的结果。此时库里那个值保持原样。
+#[tauri::command]
+pub fn set_auto_start(state: State<'_, VaultState>, on: bool) -> AppResult<()> {
+    let exe = std::env::current_exe()
+        .map_err(|e| AppError::State(format!("无法确定程序位置：{e}")))?;
+    crate::set_auto_start_impl(&exe, on)?;
+    with_vault(&state, |v| v.set_auto_start(on))
+}
+
+/// 把注册表里的自启路径校正成**当前这个 exe**（幂等，已经对了就什么都不做）。
+///
+/// 为什么需要它：注册表里记的是**一个绝对路径**。软件换了位置
+/// （换目录 / 重新发布到别处）之后那个路径就指向了旧文件，
+/// 症状是"自启明明开着，开机却什么都没发生" —— 而这条线索**极难自查**
+/// （注册表不是用户会去看的地方）。
+///
+/// ⚠️ 方向由**库里的用户意图**决定（`auto_start == false` ⇒ 什么都不做）。
+///    少了这一层，"从别处的 exe 启动一次"就会把用户的自启悄悄改到那个路径上 ——
+///    那是在他背后改设置，比不校正更坏。
+///
+/// ⚠️ 未解锁时**读不到意图 ⇒ 不校正**。这是刻意接受的：
+///    宁可不做，也不凭猜测去改注册表。
+///
+/// 调用点：前端 `loadSettings()` 之后（＝每次解锁之后）。
+#[tauri::command]
+pub fn sync_auto_start(state: State<'_, VaultState>) -> AppResult<()> {
+    let wanted = with_vault(&state, |v| v.auto_start())?;
+    if !wanted {
+        return Ok(());
+    }
+    let exe = std::env::current_exe()
+        .map_err(|e| AppError::State(format!("无法确定程序位置：{e}")))?;
+    crate::set_auto_start_impl(&exe, true)
 }
 
 // ---------------------------------------------------------------------------

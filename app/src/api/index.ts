@@ -423,6 +423,30 @@ export interface AppSettings {
    * ⚠️ 它与下面 `CloseAction` 那两个值是**同一套**，别另立字符串。
    */
   close_action: CloseAction;
+  /**
+   * 写作提醒是否开启（【P2-13】）。默认 `false`。
+   *
+   * ⚠️ 默认关是**用户拍板的**：提醒会让窗口自己跳出来，这种事必须他亲手开。
+   */
+  reminder_enabled: boolean;
+  /** 提醒的重复策略（【P2-13】）。默认 `"daily"`。见 `ReminderMode`。 */
+  reminder_mode: ReminderMode;
+  /**
+   * 提醒时间，**洗净后**的 `"HH:MM"`（两位补零）。默认 `"21:00"`。
+   *
+   * ⚠️ 后端保证它一定是 `HH:MM`：前端可以直接拿它跟"现在的 HH:MM"
+   *    做**字符串比较**（定长字符串的字典序就是时间序），别再解析一遍。
+   */
+  reminder_time: string;
+  /**
+   * 最后一次真的响过提醒的日期（`YYYY-MM-DD`）；从没响过是**空串**。
+   *
+   * ⚠️ 它落盘是刻意的：`daily` 档承诺"一天一次"，只存内存的话
+   *    重启一次软件当天就会再响一次。
+   */
+  reminder_last_fired: string;
+  /** 开机自启（【P2-13】）。默认 `false`。 */
+  auto_start: boolean;
 }
 
 /**
@@ -433,6 +457,40 @@ export interface AppSettings {
  *    前端看到的**永远是推导之后的结果**，不需要知道"设过没有"。
  */
 export type CloseAction = "tray" | "quit";
+
+/**
+ * 提醒的重复策略（【P2-13】）。与后端 `db::ReminderMode` 一一对应。
+ *
+ * - `daily`   到点响一次；当天不再响（**重启也不再响**）。出厂默认。
+ * - `on_open` 不看到点：**软件一启动**就判断一次，当天还没写就提。
+ * - `never`   不提醒。
+ *
+ * ⚠️ 它与"提醒总开关"是**两件事**：开关管"要不要提醒"，
+ *    这一档管"报到的节奏"。开关关着时，三档一个都不生效。
+ */
+export type ReminderMode = "daily" | "on_open" | "never";
+
+/**
+ * 三档的选项。文案就是用户看到的文案。
+ *
+ * ⚠️ 顺序固定：`daily` 在前（出厂默认）。
+ */
+export const REMINDER_MODE_OPTIONS: { value: ReminderMode; label: string }[] = [
+  { value: "daily", label: "一天提醒一次" },
+  { value: "on_open", label: "每次打开都提醒" },
+  { value: "never", label: "永远不提醒" },
+];
+
+/**
+ * 提醒时间的出厂默认值。
+ *
+ * ⚠️ **只是默认值**：用户可以挑任意时:分（用户 2026-09-23 明确要求，
+ *    ⛔ 别做成"几个固定档位"），改完立即生效、不用重启软件。
+ */
+export const DEFAULT_REMINDER_TIME = "21:00";
+
+/** 提醒策略的出厂默认值：一天提醒一次（用户 2026-09-28 亲自选的）。 */
+export const DEFAULT_REMINDER_MODE: ReminderMode = "daily";
 
 /**
  * 「点击关闭时」的两个选项。文案就是用户看到的文案。
@@ -1010,6 +1068,74 @@ export const setCloseAction = (action: CloseAction) =>
  *    正常路径是：后端发 `app-quit-requested` → 前端 `flushNow()` → 这条。
  */
 export const quitApp = () => invoke<void>("quit_app");
+
+// ---------------------------------------------------------------------------
+// 写作提醒与开机自启（【P2-13】）
+// ---------------------------------------------------------------------------
+
+/**
+ * 打开 / 关掉写作提醒。
+ *
+ * ⚠️ 它**只管存开关**：判断"到点没有 / 今天写过没有"、挂横幅，
+ *    全在 `App.vue`（只有前端知道本地日期，后端只有 UTC）。
+ * ⚠️ 打开/关掉提醒会**改变「点击关闭时」的显示值**（没设过时跟提醒走），
+ *    所以改完要**重新 `getSettings()`**，否则设置页还显示旧值。
+ */
+export const setReminderEnabled = (on: boolean) =>
+  invoke<void>("set_reminder_enabled", { on });
+
+/**
+ * 写提醒时间。**返回洗净后的值**（`"9:5"` ⇒ `"09:05"`）。
+ *
+ * ⚠️ 前端要拿返回值**回填那个输入框** —— 这是"用户输了个怪东西"唯一的
+ *    可见反馈：它**不报错**（任何输入都能得出一个合法结果），只会被修正。
+ */
+export const setReminderTime = (time: string) =>
+  invoke<string>("set_reminder_time", { time });
+
+/** 写提醒的重复策略。参数是联合类型 ⇒ 非法值在类型层就进不来。 */
+export const setReminderMode = (mode: ReminderMode) =>
+  invoke<void>("set_reminder_mode", { mode });
+
+/**
+ * 记下"今天已经响过提醒了"。
+ *
+ * ⚠️ **只能在真的提醒过之后调**：它是 `daily` 档"一天一次"那个承诺的凭据，
+ *    提前写下去会让当天**再也不响**（比多响一次糟得多）。
+ * ⚠️ 日期由前端给（只有前端知道本地日期）。
+ */
+export const setReminderLastFired = (date: string) =>
+  invoke<void>("set_reminder_last_fired", { date });
+
+/**
+ * 把主窗口叫到前台 ＋ 闪任务栏。**提醒真的响了那一刻**调它。
+ *
+ * ⚠️ 它不返回错误、也不该失败：窗口找不到就算了 ——
+ *    横幅已经挂在界面上了，用户照样看得见。
+ * ⚠️ 放在 Rust 侧是因为"抢前台"常被 Windows 拦掉，那时要退成闪任务栏，
+ *    而闪任务栏只有 Rust 侧做得到。
+ */
+export const presentReminder = () => invoke<void>("present_reminder");
+
+/**
+ * 打开 / 关掉「开机自启」。
+ *
+ * ⚠️ 后端**先写注册表、再写库**；注册表那一步失败会**把错误报上来** ——
+ *    这是用户亲手点的开关，"点了没反应"是最不能接受的，界面上必须提示。
+ */
+export const setAutoStart = (on: boolean) => invoke<void>("set_auto_start", { on });
+
+/**
+ * 把注册表里的自启路径校正成**当前这个 exe**（幂等，已经对了就不动）。
+ *
+ * ⚠️ 调用时机：**每次解锁之后**（`loadSettings()` 之后）。
+ *    软件换了位置（换目录 / 重新发布到别处）之后，注册表里那条命令
+ *    还指着旧路径 ⇒ 症状是"自启明明开着，开机却什么都没发生"，
+ *    而这条线索**极难自查**（注册表不是用户会去看的地方）。
+ * ⚠️ 后端只在"用户确实开着自启"时才动注册表 —— 从别处的 exe 启动一次
+ *    不会把他的自启悄悄改到那个路径上。
+ */
+export const syncAutoStart = () => invoke<void>("sync_auto_start");
 
 // ---------------------------------------------------------------------------
 // 图片附件（P1 #10）

@@ -70,6 +70,16 @@ tauri-build = { version = "2", features = [] }
 thiserror = "2"
 directories = "6"
 
+# 开机自启（【P2-13】）：往 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+# 写一个值，开机时由系统带着 `--startup` 参数把软件拉起来。
+#
+# ⚠️ 与上面 sha2 / base64 同一条理由：本机**拉不到任何新依赖**（出网被拦），
+#    而 `winreg 0.55.0` 本来就在 Cargo.lock 里（Cargo.lock 第 5186 行，
+#    是别的依赖的传递依赖），.crate 也已躺在本地 registry 缓存里 ——
+#    所以声明为直接依赖是**零下载**的。
+# ⚠️ 只写 `HKCU`：写 `HKLM` 要管理员权限，日记软件不该要。
+winreg = "0.55"
+
 # Release profile: balanced on purpose.
 #
 # The Tauri template ships lto = true + codegen-units = 1 for the smallest
