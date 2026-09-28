@@ -1381,6 +1381,20 @@ defineExpose({ flushNow: () => flush() });
 
 <template>
   <section class="editor" :class="{ wide }">
+    <!--
+      ⭐ 【P2-3】第 1 步：正文区限宽。
+      做法：**里面套一层 .measure，用 `max-width: var(--editor-measure)` ＋ `margin: 0 auto`**
+      —— ⛔ 不用"给 .editor 加百分比 padding"那条路（本轮踩过、已实测）：
+      CSS 里**百分比 padding 是按"包含块"的宽度算的**，而 `.editor` 的包含块是
+      `.body`（整行、含日历栏那 268px）⇒ 日历栏展开时算出来是"按 833px 算的 106.5px"，
+      落到实际只有 565px 宽的编辑器上 ⇒ **正文被压成 352px（每行才 22 字）**。
+      用 max-width ＋ margin:auto 是**相对自身可用宽度**算的，折叠 / 展开**都对**。
+      ⚠️ 里面所有东西（日期行 / 正文 / 缩略图条）一起挪，天然对齐 —— 这也是
+         原来选 padding 的理由，这里换了个实现把同一个效果做对。
+      ⚠️ 行宽只有 `--editor-measure` 一个变量（global.css 的 :root，620px ≈ 38 字）。
+         P2-3 第 2 步的"每行 N 字"设置**必须复用这一个变量**，⛔ 不许另立第二个。
+    -->
+    <div class="measure">
     <header class="bar">
       <div class="bar-main">
         <div class="left">
@@ -1781,6 +1795,7 @@ defineExpose({ flushNow: () => flush() });
         ← → 翻页，Esc 或点空白处关闭
       </p>
     </div>
+    </div>
   </section>
 </template>
 
@@ -1790,18 +1805,39 @@ defineExpose({ flushNow: () => flush() });
   min-width: 0;
   display: flex;
   flex-direction: column;
+  /*
+    ⭐ 【P2-3】第 1 步：正文区限宽。
+       ⚠️ 这里**故意只留普通左右内边距（28px）**，限宽交给里面的 `.measure` ——
+          原因见模板里那段注释（百分比 padding 按"包含块"算，日历栏展开时会把正文压扁）。
+       ⚠️ 最小值 28px 就是原来的边距 ⇒ 窗口窄的时候自动退回原样，不会挤到贴边。
+  */
   padding: 20px 28px 24px;
 }
-/* 沉浸态（左侧日历栏收起来了，P2-22）：正文收窄到舒适行宽并居中。
-   ⭐ **用 padding 不用 max-width ＋ margin: 0 auto** —— 上面那条日期行和正文
-      在**同一个 padding 里**，会一起内移、天然对齐；给 textarea 加 max-width
-      则会让它自己居中、日期行留在最左边，两处错位。
-   ⚠️ 最小值 28px 就是原来的边距 ⇒ 窗口窄的时候自动退回原样，不会挤到贴边。
-   ⚠️ 这个值将来会跟 P2-3 的"每行 N 字"设置统一，所以收敛成 `--editor-measure`
-      一个变量（定义在 global.css 的 :root，深浅主题同一个值）。 */
+/*
+  ⭐ 【P2-3】正文区的"行宽闸门"（620px ≈ 38 字，超宽时整块居中）。
+  可以把它想成：.editor 是整页纸边距，.measure 是**稿纸的书写区**。
+  ⭐ **用 max-width ＋ `margin: 0 auto`（不是百分比 padding）** —— 这两条是
+     "相对自身可用宽度"算的，所以**折叠态和展开态都对**；
+     `.editor` 的百分比 padding 会按 `.body`（含日历栏）算，展开态下把正文压扁
+     （实测：只 352px、每行 22 字）。
+  ⚠️ 最小值靠 `.editor` 那 28px 内边距兜底 ⇒ 窄窗口下不会挤到贴边、也不会横向溢出。
+  ⚠️ 里面所有东西（日期行 / 正文 / 缩略图条）**一起**被限宽并居中，天然对齐。
+*/
+.measure {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: var(--editor-measure);
+  margin: 0 auto;
+}
+/*
+  `.wide`（P2-22 折叠日历栏）现在**只剩"缩略图条要重量"这一个作用** ——
+  限宽已由 `.measure` 常态承担（两种状态都生效，P2-3 拍板第 3 条）。
+  ⚠️ 保留这个类（DOM 上仍挂着 `wide`）：将来若要给沉浸态加别的差异，改这里。
+*/
 .editor.wide {
-  padding-left: max(28px, calc(50% - var(--editor-measure) / 2));
-  padding-right: max(28px, calc(50% - var(--editor-measure) / 2));
 }
 .bar {
   display: flex;
@@ -2221,17 +2257,28 @@ defineExpose({ flushNow: () => flush() });
   filter: brightness(1.05);
 }
 
+/*
+  ⭐ 【P2-3】第 1 步：正文从"直接铺在背景上"变成**一张纸**。
+     - 字体：等宽 `--mono` → 阅读字体 `--reading-font`（中英混排不再跳）；
+     - 字号 15px → 16px、行高 1.9 保持；
+     - 纸面：`--surface` 底 ＋ 圆角 ＋ 内边距。
+  ⚠️ **后端一行没动、存储格式一个字没动** —— 这一步只改"字"和"纸"。
+  ⚠️ 纸面用 padding 撑出来，所以原来那个 `padding: 0` 要去掉；
+     但它仍在 `.editor` 的限宽 padding 里面 ⇒ 限的是"纸的宽度"，不是"纸上的字"。
+  ⚠️ `min-height: 0` ＋ `flex: 1` 保持 —— 正文要能自己滚动、不吃掉下方缩略图条。
+*/
 .content-input {
   flex: 1;
   width: 100%;
   min-height: 0;
-  padding: 0;
-  font-family: var(--mono);
-  font-size: 15px;
+  padding: 20px 24px;
+  font-family: var(--reading-font);
+  font-size: 16px;
   line-height: 1.9;
   color: var(--text-1);
-  background: transparent;
-  border: none;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
   outline: none;
   resize: none;
   tab-size: 2;

@@ -40,6 +40,15 @@
   --mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", Consolas,
     "Courier New", monospace;
 
+  /* 日记正文的阅读字体（【P2-3】第 1 步）。
+     ⚠️ 正文**不再用等宽**（--mono 是给代码 / Markdown 用的）：中文日记用等宽，
+        中英混排时字宽一跳一跳 —— 这正是"写多了显乱"的第一条病。
+     选型：**系统 UI 字体**（最稳、中英混排不跳），与 body 用的是同一套。
+     ⚠️ P2-3 第 2 步的"字体 ▾"（宋体 / 黑体 / 楷体 / 系统默认）会让用户覆盖它，
+        届时**覆盖的是这一个变量**，⛔ 不要在组件里另写一份字体栈。 */
+  --reading-font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei",
+    "PingFang SC", "Hiragino Sans GB", sans-serif;
+
   color-scheme: light;
 }
 
