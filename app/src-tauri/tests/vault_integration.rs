@@ -145,6 +145,8 @@ fn one_entry_per_day_is_enforced() {
 
     // 同一天保存两次应更新同一条，而不是产生两条。
     vault.save_entry("2026-09-11", "第一版", "第一次写。").unwrap();
+    let first = vault.find_entry_by_date("2026-09-11").unwrap().unwrap();
+
     vault.save_entry("2026-09-11", "第二版", "改了一下。").unwrap();
 
     let list = vault.list_month("2026-09").unwrap();
@@ -153,9 +155,20 @@ fn one_entry_per_day_is_enforced() {
     let entry = vault.find_entry_by_date("2026-09-11").unwrap().unwrap();
     assert_eq!(entry.title, "第二版");
     assert_eq!(entry.content_md, "改了一下。");
+    assert_eq!(entry.id, first.id, "同一天两次保存必须落在同一行（id 不许变）");
     // 创建时间应保持第一次的值，更新时间应被刷新 ——
     // 这样"这篇是什么时候开始写的"这个事实不会被后续编辑抹掉。
-    assert_eq!(entry.created_at, entry.updated_at);
+    //
+    // ⚠️ 判据必须是"第一次保存后读到的 created_at"，**不能**写
+    //    `created_at == updated_at`：两个时间戳都取"此刻"，同一次
+    //    `save_entry` 内部必然相等 ⇒ 那条断言**永远为真、什么也没验**；
+    //    而两次保存一旦跨过 1 秒边界（时间戳只到秒），它还会反过来假红
+    //    —— 曾因此在全量测试里偶发红过一次。
+    assert_eq!(
+        entry.created_at, first.created_at,
+        "创建时间不应被后续保存刷新（第一次 {}，现在 {}）",
+        first.created_at, entry.created_at
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
