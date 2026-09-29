@@ -22,6 +22,10 @@
 *.db-wal  binary
 *.db-shm  binary
 
+# 单独点名：这是 PowerShell `*>` 重定向落盘的 **UTF-16LE** 文件
+# （有 999 个 NUL 字节、开头是 BOM FF FE）—— 不是文本，别当文本转
+probe/probe-result.txt  -text
+
 # ── 这几类必须保持 LF，单独点名 ─────────────────────────────────────────
 # （脚本在 Git Bash / Linux 下跑；`.ps1` 的 LF 在 PowerShell 5.1 下也正常）
 *.cjs  text eol=lf
