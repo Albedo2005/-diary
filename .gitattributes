@@ -1,0 +1,28 @@
+# 换行符统一 —— 全部文本文件一律 LF
+#
+# 为什么有这份文件（2026-09-29 定案）：
+#   本机 `core.autocrlf = true`，原先又没有 `.gitattributes` ⇒ 出了两个真问题：
+#     ① 同一次交付里，文件有的 CRLF 有的 LF。改文档的 Python 脚本若照脑子里的
+#        字符串按 `\n` 拼锚点，遇到 CRLF 文件会**静默命中 0 次**（已真坑过一次）；
+#     ② 检出时 git 还会把 LF 再改回 CRLF，等于工作副本的字节数每次都在变。
+#   ⇒ 钉死 LF。**改这条之前先读 `生产\README.md`。**
+#
+# 注意：本文件的规则**优先于** `core.autocrlf`（属性盖过全局配置）。
+#      机器上那个 `core.autocrlf = true` 不用去动。
+
+* text=auto eol=lf
+
+# ── 二进制：明确声明，别让上面的 eol 规则碰它们 ────────────────────────────
+# （`text=auto` 本来就会按 NUL 字节认出二进制，这里是第二重保险）
+*.exe     binary
+*.ico     binary
+*.icns    binary
+*.png     binary
+*.db      binary
+*.db-wal  binary
+*.db-shm  binary
+
+# ── 这几类必须保持 LF，单独点名 ─────────────────────────────────────────
+# （脚本在 Git Bash / Linux 下跑；`.ps1` 的 LF 在 PowerShell 5.1 下也正常）
+*.cjs  text eol=lf
+*.ps1  text eol=lf
