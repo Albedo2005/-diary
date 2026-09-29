@@ -1,0 +1,574 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark" data-motion="full" data-wind="on">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>生命树 · 风与花瓣 — 技术样张</title>
+<style>
+/* =====================================================================
+   主题变量：深浅两套。页面里任何一个颜色都不允许写死 —— 这条规矩
+   是从"热力图两行都是白的"那两轮事故换来的。
+   ===================================================================== */
+html{
+  color-scheme: dark;
+  --bg:#0f1216; --panel:#161a20; --panel-2:#1c2129; --panel-3:#232932;
+  --ink:#e9e7e2; --ink-soft:#959dab; --ink-dim:#6a7280;
+  --line:#2a3038; --line-soft:#222833;
+  --bark:#8b6b4f; --bark-dim:#5f4a37;
+  --accent:#e2b04f;
+  --core:#f7e6b6;
+  --petal-a:#ffc6d6; --petal-b:#ffdbe5;
+  --m-1:#c4493f; --m-2:#5b7fb5; --m-3:#8b93a4; --m-4:#d0854f; --m-5:#e2b04f;
+}
+html[data-theme="light"]{
+  color-scheme: light;
+  --bg:#f6f4f0; --panel:#fffefb; --panel-2:#f2efe8; --panel-3:#eae6dd;
+  --ink:#25282d; --ink-soft:#6b7280; --ink-dim:#949aa4;
+  --line:#ddd8ce; --line-soft:#e8e4db;
+  --bark:#a5805f; --bark-dim:#c0a184;
+  --accent:#bf8417;
+  --core:#fff3d0;
+  --petal-a:#f4a3bb; --petal-b:#fbcddb;
+  --m-1:#c0492f; --m-2:#4f76ad; --m-3:#8b93a4; --m-4:#cf7f43; --m-5:#c9922a;
+}
+
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--ink);
+  font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+  min-height:100vh; padding:22px 18px 40px;
+}
+.wrap{max-width:940px;margin:0 auto}
+
+/* ---------- 顶栏 ---------- */
+.bar{
+  display:flex;flex-wrap:wrap;gap:12px;align-items:center;
+  background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:12px 14px;margin-bottom:14px;
+}
+h1{margin:0;font-size:15px;font-weight:650;letter-spacing:.3px}
+h1 .sub{display:block;font-size:11px;font-weight:400;color:var(--ink-dim);letter-spacing:0;margin-top:2px}
+.tabs{display:flex;gap:4px;margin-left:auto;background:var(--panel-2);padding:3px;border-radius:9px}
+.tabs button{
+  font:inherit;font-size:12.5px;border:0;background:transparent;color:var(--ink-soft);
+  padding:5px 12px;border-radius:7px;cursor:pointer;white-space:nowrap;
+}
+.tabs button.on{background:var(--panel-3);color:var(--ink);font-weight:600}
+.sw{display:flex;gap:6px;flex-wrap:wrap}
+.sw button{
+  font:inherit;font-size:12px;border:1px solid var(--line);background:var(--panel-2);
+  color:var(--ink-soft);padding:4px 10px;border-radius:7px;cursor:pointer;white-space:nowrap;
+}
+.sw button.on{border-color:var(--accent);color:var(--accent)}
+
+/* ---------- 面板 ---------- */
+.pane{
+  background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:16px;margin-bottom:12px;
+}
+.pane[hidden]{display:none}
+.hint{margin:0 0 14px;color:var(--ink-soft);font-size:12.5px}
+.hint b{color:var(--ink)}
+.stage{display:flex;justify-content:center}
+
+/* ---------- 年轮 ---------- */
+#ring{width:100%;max-width:400px;height:auto}
+.ring-stroke{fill:none;stroke-linecap:butt}
+.rg-label{font-size:11.5px;fill:var(--ink-dim)}
+.rg-val{font-size:11.5px;fill:var(--ink-soft)}
+.legend{display:flex;flex-wrap:wrap;gap:10px 18px;justify-content:center;margin-top:10px}
+.legend span{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-soft)}
+.dot{width:10px;height:10px;border-radius:3px;display:inline-block}
+.legend .n{color:var(--ink);font-weight:600}
+.legend .zero{opacity:.42;text-decoration:line-through;text-decoration-thickness:1px}
+
+/* ---------- 树 ---------- */
+#tree{width:100%;max-width:520px;height:auto}
+.bark{stroke:var(--bark);fill:none}
+.bark-main{stroke:var(--bark-dim)}
+/* ⚠️ 摆动不用 CSS transform，用 SMIL 的 <animateTransform>（在 JS 里生成）。
+   原因：CSS 的旋转中心由 transform-origin 决定，而 SVG 元素上它默认参考"整块画布"；
+   想摆正得靠 transform-box:fill-box，但实测在 <g> 上不生效 —— 整棵树会被甩出画面。
+   SMIL 的 rotate(a cx cy) 直接写死旋转中心，而每根枝条的坐标原点就是它的根部，零歧义。 */
+.sway{}
+.fnum{font-size:11px;fill:var(--ink-dim);font-weight:600}
+/* 图例里的圆点直径 = 花的真实比例，这样"哪朵对应哪条"能直接对上 */
+.flower-dot{background:var(--petal-a);border-radius:50%;flex:0 0 auto}
+
+/* ---------- 花瓣粒子 ---------- */
+.field{
+  position:relative;width:100%;max-width:640px;height:400px;overflow:hidden;
+  border-radius:10px;border:1px dashed var(--line);
+}
+.gust{position:absolute;inset:0;animation:gust 8.5s ease-in-out infinite alternate}
+@keyframes gust{from{transform:translateX(-10px)}to{transform:translateX(10px)}}
+.petal{
+  position:absolute;top:-16px;left:var(--x);
+  width:var(--s);height:calc(var(--s) * .82);
+  border-radius:52% 4% 52% 4%;
+  background:linear-gradient(135deg,var(--petal-a),var(--petal-b));
+  opacity:.92;
+  animation:fall var(--d) linear var(--delay) infinite;
+  animation-play-state:var(--play, running);
+  will-change:transform;
+}
+@keyframes fall{
+  from{transform:translate3d(0,0,0) rotate(0deg) scale(1)}
+  to{transform:translate3d(var(--drift), var(--fall), 0) rotate(var(--spin)) scale(var(--sc))}
+}
+/* 树的摆动走 SMIL，CSS 管不到它 ⇒ 它的暂停由 JS 调 svg.pauseAnimations() 实现。
+   下面这两条只管"花瓣"和"阵风"这两个纯 CSS 动画。 */
+html[data-motion="reduce"] .petal,
+html[data-motion="reduce"] .gust{animation-play-state:paused}
+@media (prefers-reduced-motion: reduce){
+  .petal,.gust{animation-play-state:paused !important}
+}
+#pane-petals.idle .petal,#pane-petals.idle .gust{animation-play-state:paused}
+
+/* ---------- 脚注 ---------- */
+.note{margin-top:12px;font-size:11.5px;color:var(--ink-dim);line-height:1.75}
+.note b{color:var(--ink-soft);font-weight:600}
+.src{background:var(--panel-2);border:1px solid var(--line-soft);border-radius:10px;padding:12px 14px;margin-top:14px}
+.src h3{margin:0 0 8px;font-size:12px;color:var(--ink-soft);font-weight:600;letter-spacing:.4px}
+.src ul{margin:0;padding-left:18px;color:var(--ink-dim);font-size:11.5px;line-height:1.85}
+.src a{color:var(--accent);text-decoration:none;border-bottom:1px solid color-mix(in srgb,var(--accent) 40%,transparent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="bar">
+    <h1>生命树 · 风与花瓣
+      <span class="sub">技术样张 · 零依赖 · 纯 SVG ＋ CSS · 不在项目里</span>
+    </h1>
+    <nav class="tabs">
+      <button data-pane="ring" class="on">年轮</button>
+      <button data-pane="tree">生命树 · 风</button>
+      <button data-pane="petals">花瓣粒子</button>
+    </nav>
+    <div class="sw">
+      <button id="btn-shuffle">重新长一次</button>
+      <button id="btn-wind" class="on">风：开</button>
+      <button id="btn-motion" class="on">动效：全</button>
+      <button id="btn-theme">换成浅色</button>
+    </div>
+  </div>
+
+  <!-- ================= 年轮 ================= -->
+  <section class="pane" data-pane="ring">
+    <p class="hint">
+      环的<b>粗细</b>＝那种心情写过多少天；环从里往外＝从最早那档往最新那档排。
+      <b>0 天的那档不画环</b>，只在图例里写明 —— 画一圈看不见的线等于骗人。
+    </p>
+    <div class="stage"><svg id="ring" viewBox="0 0 400 400" role="img" aria-label="心情年轮"></svg></div>
+    <div class="legend" id="legend"></div>
+    <p class="note">
+      <b>借自</b>：CSS 多重同心圆环（多层 <code>border-radius:50%</code> 叠圆／<code>conic-gradient</code> 切环形）
+      这一类做法。这里用 SVG 的 <code>&lt;circle&gt;</code> ＋ 不同 <code>stroke-width</code>，
+      比叠 div 更好控制（线宽是真的按数据算出来的，不是视觉凑的）。
+    </p>
+  </section>
+
+  <!-- ================= 生命树 ================= -->
+  <section class="pane" data-pane="tree" hidden>
+    <p class="hint">
+      <b>风</b>不是把整棵树一起摇 —— 是<b>每一级枝条各自摇，而且周期都不同</b>，
+      越靠梢头摆得越厉害。父枝动，子枝跟着动（坐标是叠着算的），这才是"风"而不是"晃动"。
+    </p>
+    <div class="stage"><svg id="tree" viewBox="0 0 500 430" role="img" aria-label="生命树"></svg></div>
+    <div class="legend" id="tree-legend"></div>
+    <p class="note">
+      <b>花的直径按「倍数的平方根」长</b> —— 想让"看起来大 7 倍"真的是 7 倍那么大，半径就得开平方（面积感知）。<br>
+      <b>借自</b>：SVG 递归分形树（枝条 ＝ 一条线，每一级继承上一级的坐标系再旋转、缩短）。
+      ⚠️ <b>"摆动"这里没用 CSS，用的是 SMIL 的 <code>animateTransform</code></b>：
+      CSS 的旋转中心得靠 <code>transform-origin</code> 指定，而它在 SVG 上默认参考"整块画布"，
+      实测对嵌套的 <code>&lt;g&gt;</code> 摆不正（整棵树会被甩出画面）；SMIL 直接写死旋转中心，反而干净。
+    </p>
+  </section>
+
+  <!-- ================= 花瓣 ================= -->
+  <section class="pane" data-pane="petals" hidden>
+    <p class="hint">
+      每一片花瓣的<b>起点、大小、下落时长、横飘距离、旋转圈数</b>都是随机的，
+      但随机值只算<b>一次</b>，写进 CSS 变量里 —— 不是每帧用脚本去挪。
+    </p>
+    <div class="field" id="field"><div class="gust" id="gust"></div></div>
+    <p class="note">
+      <b>为什么不用纯 CSS 的 <code>random()</code></b>：网上那些"纯 CSS 随机花瓣"教程大多用了它，
+      但它<b>目前的浏览器里根本还不支持</b>（Chromium 计划到 155 版才上）。
+      照抄会直接跑不起来。正解就是这里的做法：<b>随机数在 JS 里算一次，塞进 CSS 变量</b>。<br>
+      ⚠️ <b>切到别的面板时，动画是"暂停"而不是"删掉"</b> —— 不这样，你在写日记的时候它会在后台一直烧显卡。
+    </p>
+  </section>
+
+  <div class="src">
+    <h3>这一页里每一招的出处（都能点开看）</h3>
+    <ul>
+      <li>纯 CSS 三维摇摆树（嵌套 div ＋ rotateX/Y/Z）：<a href="https://codepen.io/YusukeNakaya/pen/ooGPGW" target="_blank" rel="noopener">codepen.io/YusukeNakaya/pen/ooGPGW</a></li>
+      <li>SVG 递归分形树（20 行核心，可生长动画）：<a href="https://graphery.org/svg/examples/fractal-tree.html" target="_blank" rel="noopener">graphery.org/svg/examples/fractal-tree.html</a></li>
+      <li>分形树 ＋ 参数面板（深度／角度／长度比，另附"深度别超过 20"的警告）：<a href="http://mwskirpan.com/FractalTree/" target="_blank" rel="noopener">mwskirpan.com/FractalTree</a></li>
+      <li>anime.js 版的生长树（讲清了"SVG 坐标系叠加"这个原理）：<a href="https://github.com/canmom/fathersdaytree" target="_blank" rel="noopener">github.com/canmom/fathersdaytree</a></li>
+      <li>花瓣飘落（思路最完整，含随机与三维旋转）：<a href="https://polypane.app/blog/experimenting-with-random-in-css/" target="_blank" rel="noopener">polypane.app／实验 CSS random()</a></li>
+      <li>现成的花瓣粒子插件（MIT，npm 可装，可换成叶子）：<a href="https://github.com/leoska/sakura" target="_blank" rel="noopener">github.com/leoska/sakura</a></li>
+      <li>通用粒子引擎（体积可裁剪，雪／星／萤火等预设）：<a href="https://particles.js.org/" target="_blank" rel="noopener">particles.js.org</a></li>
+      <li>叶片摇摆的 <code>skew ＋ rotate</code> 写法：<a href="https://juejin.cn/post/7320426329164496935" target="_blank" rel="noopener">juejin.cn/post/7320426329164496935</a></li>
+      <li>减少动效的规范做法：<a href="https://web.dev/articles/prefers-reduced-motion" target="_blank" rel="noopener">web.dev／prefers-reduced-motion</a></li>
+    </ul>
+  </div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  var NS = "http://www.w3.org/2000/svg";
+  function el(t){ return document.createElementNS(NS, t); }
+  function attr(node, o){ for(var k in o) node.setAttribute(k, o[k]); return node; }
+  var $ = function(s){ return document.querySelector(s); };
+  var $$ = function(s){ return Array.prototype.slice.call(document.querySelectorAll(s)); };
+
+  /* =================================================================
+     一、年轮
+     环宽 ∝ 篇数；半径为"累加"算出来的，不是视觉凑的。
+     ================================================================= */
+  var MOODS = [
+    { key:"m-1", label:"愤怒", n:0 },
+    { key:"m-2", label:"悲伤", n:1 },
+    { key:"m-3", label:"茫然", n:3 },
+    { key:"m-4", label:"受伤", n:2 },
+    { key:"m-5", label:"开心", n:9 }
+  ];
+
+  function drawRing(){
+    var svg = $("#ring");
+    while(svg.firstChild) svg.removeChild(svg.firstChild);
+    var total = MOODS.reduce(function(a,b){ return a + b.n; }, 0) || 1;
+    var W = 26;                       // 最粗那环的线宽
+    var R0 = 44;                      // 第一环的半径
+    var r = R0;
+
+    var g = el("g");
+    attr(g, { transform:"translate(200 200)" });
+    svg.appendChild(g);
+
+    MOODS.forEach(function(m){
+      if(m.n === 0) return;                       // 0 天不画环
+      // 环宽 ∝ 篇数（用户要的就是"粗 = 写得多"），但放大系数别太大，
+      // 否则最多那一档会吃掉整张图、其余几环挤成一堆。
+      var w = Math.max(3, W * (m.n / total) * 1.8);
+      r += w / 2;
+      var c = el("circle");
+      attr(c, { r: r.toFixed(2), "stroke-width": w.toFixed(2), class:"ring-stroke" });
+      c.style.stroke = "var(--" + m.key + ")";
+      g.appendChild(c);
+      r += w / 2 + 2.2;                           // 环之间留一道缝，否则糊成一坨
+    });
+
+    // 一道径向裂缝，让它像木头的年轮而不是靶子
+    var crack = el("path");
+    attr(crack, {
+      d: "M 0 0 L 0 " + (-(r + 6)).toFixed(1),
+      stroke: "var(--line)", "stroke-width": 1.4, opacity:.7, fill:"none"
+    });
+    crack.style.stroke = "var(--line)";
+    g.appendChild(crack);
+
+    // 中心与说明
+    var t1 = el("text");
+    attr(t1, { y:-2, "text-anchor":"middle", class:"rg-val" });
+    t1.textContent = total + " 天";
+    g.appendChild(t1);
+    var t2 = el("text");
+    attr(t2, { y:14, "text-anchor":"middle", class:"rg-label" });
+    t2.textContent = "写过的";
+    g.appendChild(t2);
+
+    // 图例（HTML，方便换行）
+    var lg = $("#legend");
+    lg.innerHTML = "";
+    MOODS.slice().reverse().forEach(function(m){
+      var s = document.createElement("span");
+      if(m.n === 0) s.className = "zero";
+      var d = document.createElement("i");
+      d.className = "dot";
+      d.style.background = "var(--" + m.key + ")";
+      s.appendChild(d);
+      s.appendChild(document.createTextNode(m.label + " "));
+      var b = document.createElement("b");
+      b.className = "n";
+      b.textContent = m.n + " 天";
+      s.appendChild(b);
+      if(m.n === 0){
+        var z = document.createElement("em");
+        z.style.fontStyle = "normal";
+        z.textContent = "（没标过，不画环）";
+        s.appendChild(z);
+      }
+      lg.appendChild(s);
+    });
+  }
+
+  /* =================================================================
+     二、生命树
+     递归：每一级枝条都是"一根朝上的线"＋"末端接一个旋转过的坐标系"。
+     摆动：给每一级挂一个 .sway，各自周期不同；父级动，子级全跟着动。
+     ================================================================= */
+  var TREE = { maxLevel:7, baseLen:74, shrink:.74, spread:24, jitter:9 };
+
+  /* 风：用 SMIL 的 animateTransform。
+     它绕"元素自己的坐标原点 (0,0)"转 —— 而每根枝条的坐标原点，正好就是它的根部。
+     ⛔ 不用 CSS 的 transform：旋转中心由 transform-origin 决定，SVG 上默认参考整块画布，
+        对嵌套的 <g> 摆不正（实测会把整棵树甩出画面）。 */
+  var SWAY = [ { a:.55, d:6.8 }, { a:1.15, d:4.6 }, { a:1.9, d:3.1 } ];
+
+  function smil(node, o){
+    var at = document.createElementNS(NS, "animateTransform");
+    attr(at, o);
+    node.appendChild(at);
+  }
+
+  function appendSway(g, level){
+    if(level > SWAY.length) return;          // 只挂最上面三级，更深的靠父级带动
+    var c = SWAY[level - 1];
+    smil(g, {
+      attributeName:"transform", type:"rotate",
+      values: "-" + c.a + " 0 0; " + c.a + " 0 0; -" + c.a + " 0 0",
+      dur: c.d + "s", repeatCount:"indefinite",
+      calcMode:"spline", keyTimes:"0; 0.5; 1",
+      keySplines:"0.45 0 0.55 1; 0.45 0 0.55 1"
+    });
+  }
+
+  function appendBreathe(g, seed){
+    smil(g, {
+      attributeName:"transform", type:"scale",
+      values:"0.97 0.97; 1.04 1.04; 0.97 0.97",
+      dur:(5 + (seed % 3) * .9).toFixed(1) + "s", repeatCount:"indefinite",
+      calcMode:"spline", keyTimes:"0; 0.5; 1",
+      keySplines:"0.45 0 0.55 1; 0.45 0 0.55 1"
+    });
+  }
+
+  function growTree(){
+    var svg = $("#tree");
+    while(svg.firstChild) svg.removeChild(svg.firstChild);
+
+    var root = el("g");
+    attr(root, { transform:"translate(250 400)" });
+    svg.appendChild(root);
+
+    var tips = [];
+
+    function node(parent, len, level, acc){
+      var turn = el("g");
+      var dir = level === 1 ? 0 : acc.dirLast;      // 由调用方给方向
+      attr(turn, { transform:"rotate(" + dir.toFixed(2) + ")" });
+      parent.appendChild(turn);
+
+      var sway = el("g");
+      sway.setAttribute("class", "sway");
+      appendSway(sway, level);
+      turn.appendChild(sway);
+
+      var ln = el("line");
+      attr(ln, {
+        x1:0, y1:0, x2:0, y2:(-len).toFixed(2),
+        "stroke-width": Math.max(1.1, 9 * Math.pow(.76, level - 1)).toFixed(2),
+        "stroke-linecap":"round",
+        class: level <= 2 ? "bark bark-main" : "bark"
+      });
+      sway.appendChild(ln);
+
+      var tip = el("g");
+      attr(tip, { transform:"translate(0 " + (-len).toFixed(2) + ")" });
+      sway.appendChild(tip);
+
+      if(level >= TREE.maxLevel){ tips.push({ g:tip, acc:acc.deg }); return; }
+
+      var n = 2, i;
+      for(i = 0; i < n; i++){
+        var sign = (i === 0 ? -1 : 1);
+        var spread = TREE.spread + (Math.random() * 2 - 1) * TREE.jitter;
+        node(tip, len * (TREE.shrink + (Math.random() * 2 - 1) * .04), level + 1, {
+          dirLast: sign * spread,
+          deg: acc.deg + sign * spread
+        });
+      }
+    }
+    node(root, TREE.baseLen, 1, { dirLast:0, deg:0 });
+
+    /* --- 花：先按累计角度排序，再等距挑三朵，保证分散在树冠四周 --- */
+    tips.sort(function(a, b){ return a.acc - b.acc; });
+    var pick = [];
+    if(tips.length >= 3){
+      [0, Math.round(tips.length / 2), tips.length - 1].forEach(function(i){
+        if(pick.indexOf(tips[i]) < 0) pick.push(tips[i]);
+      });
+    } else pick = tips.slice();
+
+    var meta = [
+      { title:"写得最长的一篇", value:"2180 字", ratio:4.5 },
+      { title:"照片最多的一天", value:"9 张",   ratio:6.9 },
+      { title:"连续同一种心情", value:"9 天",   ratio:5.6 }
+    ];
+    var ratios = meta.map(function(m){ return m.ratio; });
+    var mx = Math.max.apply(null, ratios), mn = Math.min.apply(null, ratios);
+
+    var legendRows = [];
+    pick.forEach(function(t, i){
+      var m = meta[i % meta.length];
+      // 直径按"倍数的平方根"长，再映射到 20~64
+      var k = mx === mn ? 1 : (Math.sqrt(m.ratio) - Math.sqrt(mn)) / (Math.sqrt(mx) - Math.sqrt(mn));
+      var dia = 20 + k * 44;
+      var fg = el("g");
+      fg.setAttribute("class", "f-petal");
+      appendBreathe(fg, i + 1);
+      t.g.appendChild(fg);
+
+      var colors = ["var(--petal-a)", "var(--petal-b)", "var(--petal-a)", "var(--petal-b)", "var(--petal-a)"];
+      for(var j = 0; j < 5; j++){
+        var pe = el("ellipse");
+        attr(pe, {
+          cx:0, cy:-(dia * .33).toFixed(2),
+          rx:(dia * .21).toFixed(2), ry:(dia * .33).toFixed(2),
+          transform:"rotate(" + (j * 72) + ")"
+        });
+        pe.style.fill = colors[j];
+        fg.appendChild(pe);
+      }
+      var core = el("circle");
+      attr(core, { r:(dia * .12).toFixed(2) });
+      core.style.fill = "var(--core)";
+      fg.appendChild(core);
+
+      // 序号标在花的正上方；文字说明统一挪到 SVG 下面的图例里。
+      // （第一版把说明直接画在树上，结果跟枝条、别的花叠成一坨，读不出来）
+      var tag = el("text");
+      attr(tag, { x:0, y:-(dia * .5 + 11), "text-anchor":"middle", class:"fnum" });
+      tag.textContent = String(i + 1);
+      fg.appendChild(tag);
+      legendRows.push({ n:i + 1, m:m, dia:dia });
+    });
+
+    legendRows.sort(function(a, b){ return b.dia - a.dia; });
+    var lg = $("#tree-legend");
+    lg.innerHTML = "";
+    legendRows.forEach(function(r){
+      var s = document.createElement("span");
+      var dotEl = document.createElement("i");
+      dotEl.className = "dot flower-dot";
+      dotEl.style.width = (r.dia / 2.4).toFixed(1) + "px";
+      dotEl.style.height = (r.dia / 2.4).toFixed(1) + "px";
+      s.appendChild(dotEl);
+      var num = document.createElement("b");
+      num.className = "n";
+      num.textContent = r.n + " · " + r.m.title;
+      s.appendChild(num);
+      s.appendChild(document.createTextNode(r.m.value + " · 约平均的 " + r.m.ratio + " 倍"));
+      lg.appendChild(s);
+    });
+  }
+
+  /* =================================================================
+     三、花瓣粒子
+     随机值只算一次 → 写进 CSS 变量；动画交给 CSS 跑（挤在合成层，不动主线程）。
+     ================================================================= */
+  function rand(a, b){ return a + Math.random() * (b - a); }
+
+  function seedPetals(){
+    var field = $("#field"), gust = $("#gust");
+    while(gust.nextSibling) field.removeChild(gust.nextSibling);
+    var h = field.clientHeight || 400;
+    var COUNT = 26;
+
+    for(var i = 0; i < COUNT; i++){
+      var p = document.createElement("i");
+      p.className = "petal";
+      var s = rand(7, 14);
+      p.style.setProperty("--x", rand(-4, 98).toFixed(2) + "%");
+      p.style.setProperty("--s", s.toFixed(1) + "px");
+      p.style.setProperty("--d", rand(7, 15).toFixed(2) + "s");
+      p.style.setProperty("--delay", rand(-15, 0).toFixed(2) + "s");
+      p.style.setProperty("--drift", rand(24, 150).toFixed(0) + "px");   // 全为正：风往右吹
+      p.style.setProperty("--fall", (h + 60).toFixed(0) + "px");
+      p.style.setProperty("--spin", rand(240, 900).toFixed(0) + "deg");
+      p.style.setProperty("--sc", rand(.7, 1.25).toFixed(2));
+      field.appendChild(p);
+    }
+  }
+
+  /* =================================================================
+     开关
+     ================================================================= */
+  var treeSvg = $("#tree");
+  var reduceMQ = window.matchMedia("(prefers-reduced-motion: reduce)");
+
+  function treePlay(on){
+    try{ if(on) treeSvg.unpauseAnimations(); else treeSvg.pauseAnimations(); }catch(e){}
+  }
+
+  /* 树该不该动 ＝ 风开着 且 动效没减弱 且 这个面板正看得见。
+     ⚠️ "看不见就不跑"是底线，不是优化 —— 不然用户写一晚上日记，它在后台烧一晚上显卡。 */
+  function syncMotion(){
+    var root = document.documentElement;
+    var wind = root.getAttribute("data-wind") !== "off";
+    var full = root.getAttribute("data-motion") !== "reduce";
+    var shown = $('.pane[data-pane="tree"]').hidden === false;
+    treePlay(wind && full && shown);
+  }
+
+  $$(".tabs button").forEach(function(b){
+    b.onclick = function(){
+      $$(".tabs button").forEach(function(x){ x.classList.toggle("on", x === b); });
+      $$(".pane").forEach(function(p){ p.hidden = (p.dataset.pane !== b.dataset.pane); });
+      // 看不见就暂停：不让它在后台烧显卡
+      $("#pane-petals").classList.toggle("idle", b.dataset.pane !== "petals");
+      syncMotion();
+    };
+  });
+
+  $("#btn-shuffle").onclick = function(){ growTree(); seedPetals(); syncMotion(); };
+
+  $("#btn-wind").onclick = function(){
+    var root = document.documentElement;
+    var off = root.getAttribute("data-wind") === "off";
+    root.setAttribute("data-wind", off ? "on" : "off");
+    this.classList.toggle("on", off);
+    this.textContent = "风：" + (off ? "开" : "关");
+    syncMotion();
+  };
+
+  $("#btn-motion").onclick = function(){
+    var root = document.documentElement;
+    var full = root.getAttribute("data-motion") === "full";
+    root.setAttribute("data-motion", full ? "reduce" : "full");
+    this.classList.toggle("on", !full);
+    this.textContent = "动效：" + (full ? "减弱" : "全");
+    syncMotion();
+  };
+
+  $("#btn-theme").onclick = function(){
+    var root = document.documentElement;
+    var dark = root.getAttribute("data-theme") === "dark";
+    root.setAttribute("data-theme", dark ? "light" : "dark");
+    this.textContent = dark ? "换成深色" : "换成浅色";
+  };
+
+  // 系统层面开了"减少动效"，一进来就该是减弱状态
+  if(reduceMQ.matches){
+    document.documentElement.setAttribute("data-motion", "reduce");
+    var bm = $("#btn-motion");
+    bm.classList.remove("on");
+    bm.textContent = "动效：减弱";
+  }
+  if(reduceMQ.addEventListener) reduceMQ.addEventListener("change", syncMotion);
+
+  drawRing();
+  growTree();
+  seedPetals();
+  syncMotion();
+  window.addEventListener("resize", function(){ seedPetals(); });
+})();
+</script>
+</body>
+</html>
