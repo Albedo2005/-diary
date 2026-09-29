@@ -978,6 +978,39 @@ export const rebuildIndexes = () => invoke<number>("rebuild_indexes");
 export const exportMarkdown = (destDir: string) =>
   invoke<ExportResult>("export_markdown", { destDir });
 
+/** 导出格式（【P2-8】）：Markdown 还是网页。两个都产出文件，只是给谁读不同。 */
+export type ExportFormat = "md" | "html";
+
+/**
+ * 导出格式在设置页里的选项。
+ *
+ * ⚠️ 它是**界面偏好**，住 `localStorage`（与"折叠日历栏"同一类）——
+ *    ⛔ 不进加密库的 `app_settings`：那样要动后端四处（db / commands / lib.rs / api），
+ *    而它既不是日记内容、也不需要加密。
+ */
+export const EXPORT_FORMAT_OPTIONS: { value: ExportFormat; label: string }[] = [
+  { value: "md", label: "Markdown（.md）" },
+  { value: "html", label: "网页（.html）" },
+];
+
+/**
+ * 把整个库导出成**网页**文件树（【P2-8】）。
+ *
+ * 产物：`<destDir>/index.html` + `<destDir>/YYYY/MM/YYYY-MM-DD.html`。
+ * 每个 `.html` 都能**脱离本软件、断网双击打开**（样式内嵌、零外部依赖）。
+ *
+ * ⚠️ 与 `exportMarkdown` 是同一件事的两种格式，**产物形状、不覆盖规则、
+ *    返回结构完全一致** —— 区别只有"给谁读"：Markdown 给编辑器，网页给浏览器。
+ *
+ * ⚠️ 导出的目录页是**倒序**（最近的在上），与 `index.md` 的升序刻意不同。
+ * ⚠️ 图片附件**不导出**（那是明文副本），只在头部写一句"另有 N 张图片"。
+ *
+ * @param destDir 目标目录，可以不存在（会自动创建）。界面用
+ *   `AppStatus.export_default_dir` 预填。
+ */
+export const exportHtml = (destDir: string) =>
+  invoke<ExportResult>("export_html", { destDir });
+
 /**
  * 导出**单篇**日记为 Markdown 文本（不落盘）。给"复制为 Markdown"用。
  *

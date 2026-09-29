@@ -11,7 +11,7 @@
  *
  * 已接线的项：
  *   - 数据与备份 三项 —— 逻辑留在 App.vue，这里只发信号
- *   - **Markdown 导出**（指令 7）—— 报表式的项，自己调后端拿结果，见下面 doExport
+ *   - **导出**（指令 7 的 Markdown ＋【P2-8】的网页）—— 报表式的项，自己调后端拿结果，见下面 doExport
  *   - **自动锁定时长**（指令 11）—— 见下面 onChangeAutoLock 的说明
  *   - **离开日记时自动锁定**（指令 14）—— 见下面 onToggleAutoLockEntries 的说明
  *   - **三击左键快速解锁**（指令 15）—— 见下面 onToggleTripleClickUnlock 的说明
@@ -35,12 +35,14 @@ import pkg from "../../package.json";
 import {
   AUTO_LOCK_OPTIONS,
   CLOSE_ACTION_OPTIONS,
+  EXPORT_FORMAT_OPTIONS,
   MAX_DAILY_WORD_GOAL,
   REMINDER_MODE_OPTIONS,
   changePassword,
   copyBackupsTo,
   disableAutoLogin,
   enableAutoLogin,
+  exportHtml,
   exportMarkdown,
   getCloseAction,
   pruneOrphanAttachments,
@@ -61,6 +63,7 @@ import {
   type CloseAction,
   type CopyBackupsResult,
   type CryptoInfo,
+  type ExportFormat,
   type ExportResult,
   type PruneReport,
   type ReminderMode,
@@ -662,7 +665,7 @@ async function submitAutoLogin() {
 }
 
 // ---------------------------------------------------------------------------
-// Markdown 导出（指令 7，已接线）
+// 导出（指令 7 的 Markdown ＋ 【P2-8】的网页，已接线）
 // ---------------------------------------------------------------------------
 
 /**
@@ -678,6 +681,51 @@ const exportError = ref("");
 const exportDone = ref<ExportResult | null>(null);
 
 /**
+ * 上一次**实际导出**用的格式。
+ *
+ * ⚠️ 结果那行文案靠它，**不读当前的 select** —— 用户完全可能导完 Markdown
+ *    之后把下拉拨到"网页"，那时这行若跟着拨，就是在骗人。
+ */
+const exportDoneFormat = ref<ExportFormat>("md");
+
+/** localStorage 的键。只存"导出成哪种格式"这一个串，不含任何日记内容。 */
+const EXPORT_FORMAT_KEY = "diary.export-format";
+
+/**
+ * 读上次选的导出格式。
+ *
+ * ⚠️ **兜底方向 ＝ Markdown** —— 只有精确的 `"html"` 才算网页，其它一切
+ *    （`null` / 垃圾值 / 抛异常）都退回 Markdown（＝加上本件之前的行为）。
+ *    ⛔ 别写成 `=== "md" ? … : "html"` 这类反向判断。
+ */
+function readExportFormat(): ExportFormat {
+  try {
+    return localStorage.getItem(EXPORT_FORMAT_KEY) === "html" ? "html" : "md";
+  } catch {
+    return "md"; // localStorage 被禁（配额满 / 隐私模式）⇒ 退回默认
+  }
+}
+
+/**
+ * 导出成哪种格式（【P2-8】）。
+ *
+ * ⚠️ 存 `localStorage` 而不是加密库：它是**界面偏好**（与"折叠日历栏"同一类），
+ *    不是日记内容、也不需要加密；⛔ 进加密库要动后端四处，不值当。
+ *    用户 2026-09-29 拍板"记住，存 localStorage"。
+ */
+const exportFormat = ref<ExportFormat>(readExportFormat());
+
+/** 切换格式。⚠️ 写失败**不许打断选择**（界面照切，只是下次记不住）。 */
+function onChangeExportFormat(e: Event) {
+  exportFormat.value = (e.target as HTMLSelectElement).value === "html" ? "html" : "md";
+  try {
+    localStorage.setItem(EXPORT_FORMAT_KEY, exportFormat.value);
+  } catch {
+    /* 存不下就算了 —— 它只是个偏好 */
+  }
+}
+
+/**
  * 导出全部日记。
  *
  * 与备份三项（emit 给 App.vue）不同，这一项**自己调后端**：得拿到
@@ -686,6 +734,9 @@ const exportDone = ref<ExportResult | null>(null);
  *
  * 日记多时后端会跑几秒，所以期间按钮变文案为「正在导出…」并禁用 ——
  * 不这么做用户会以为点坏了，然后连点，然后又导一遍。
+ *
+ * ⚠️ 两种格式的**返回结构完全相同**（都是 `ExportResult`）⇒ 下面那段回填
+ *    与结果文案不必分叉，只有"调哪条命令"这一个岔路口（【P2-8】）。
  */
 async function doExport() {
   if (exportBusy.value) return;
@@ -700,8 +751,12 @@ async function doExport() {
   exportError.value = "";
   exportDone.value = null;
   try {
-    const res = await exportMarkdown(dir);
+    const res =
+      exportFormat.value === "html"
+        ? await exportHtml(dir)
+        : await exportMarkdown(dir);
     exportDone.value = res;
+    exportDoneFormat.value = exportFormat.value;
     // 用后端**实际写入**的目录回填输入框：用户填的可能是相对路径或带 `..`，
     // 后端已把它归一化成绝对路径 —— 这样输入框和「打开文件夹」指向同一处。
     exportDir.value = res.dest_dir;
@@ -1214,18 +1269,30 @@ async function doCopyBackups() {
             </div>
 
             <!--
-              导出全部日记（指令 7）。
+              导出全部日记（指令 7 ＋【P2-8】）。
               与上面「立即备份」正好是一对：备份是**密文**副本（防丢，还得用本软件打开），
-              导出是**明文** Markdown（防被这个软件锁死，任何编辑器都能读）。
+              导出是**明文**（防被这个软件锁死）—— 而导出有两种格式，选哪个只看
+              "给谁读"：Markdown 给别的编辑器，网页给浏览器双击。
             -->
             <div class="row stacked">
               <div class="label">
                 <div class="t">导出全部日记</div>
                 <div class="d">
-                  导出成 Markdown 纯文本 —— 换台电脑、换个软件也读得出来
+                  导出成明文 —— Markdown 换台电脑、换个软件也读得出来；
+                  网页则双击就能在浏览器里看，格式（粗体 / 高亮）也保留
                 </div>
               </div>
-              <div class="ctl">
+              <div class="ctl export-ctl">
+                <select
+                  :value="exportFormat"
+                  :disabled="exportBusy"
+                  aria-label="导出格式"
+                  @change="onChangeExportFormat"
+                >
+                  <option v-for="o in EXPORT_FORMAT_OPTIONS" :key="o.value" :value="o.value">
+                    {{ o.label }}
+                  </option>
+                </select>
                 <input
                   v-model="exportDir"
                   class="path-input"
@@ -1256,7 +1323,12 @@ async function doCopyBackups() {
               <div class="label">
                 <div class="t">已导出 {{ exportDone.entry_count }} 篇</div>
                 <div class="d">
-                  一篇一个 .md，另有 index.md 汇总
+                  <template v-if="exportDoneFormat === 'html'">
+                    一篇一个 .html，另有 index.html 目录页（双击就能打开）
+                  </template>
+                  <template v-else>
+                    一篇一个 .md，另有 index.md 汇总
+                  </template>
                   <template v-if="exportDone.renamed > 0">
                     ；{{ exportDone.renamed }} 个重名已加后缀，原有文件没被覆盖
                   </template>
@@ -1653,6 +1725,14 @@ async function doCopyBackups() {
 }
 .row.stacked .ctl {
   width: 100%;
+}
+
+/*
+ * 导出那一行有三件控件（格式 / 目录 / 按钮），窄栏里允许换行 ——
+ * 否则目录输入框会被挤到只剩几十像素，用户根本没法核对路径。
+ */
+.export-ctl {
+  flex-wrap: wrap;
 }
 
 /* 路径输入框：等宽字体，便于用户核对盘符与目录层级 */

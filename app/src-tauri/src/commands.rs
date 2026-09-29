@@ -1949,6 +1949,17 @@ pub fn export_entry_markdown(state: State<'_, VaultState>, date: String) -> AppR
     with_vault(&state, |v| v.export_entry_markdown(&date))
 }
 
+/// 把整个库导出成**网页**文件树（`index.html` + `年/月/日期.html`，【P2-8】）。
+///
+/// 与 `export_markdown` 是同一行的两种格式、共用同一个目录输入框：
+/// 前端的格式选择只决定调这一条还是那一条。返回结构完全一样
+/// （`ExportResult`），所以界面上那套"导了几篇 / 有没有重名 / 打开文件夹"
+/// 一个字都不用改。
+#[tauri::command]
+pub fn export_html(state: State<'_, VaultState>, dest_dir: String) -> AppResult<ExportResult> {
+    with_vault(&state, |v| v.export_html(&dest_dir))
+}
+
 /// 在系统文件管理器里打开一个目录 —— 导出完成后让用户点一下就能看到产物。
 ///
 /// 为什么用已有的 `tauri-plugin-opener` 而不是新装 dialog 插件：opener 本来

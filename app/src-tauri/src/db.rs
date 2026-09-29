@@ -3468,16 +3468,137 @@ impl Vault {
             }
             // 链接里一律用 `/`：Markdown 链接是给别的编辑器/渲染器读的，
             // Windows 的反斜杠在那边不是路径分隔符。
-            let rel_written = written
-                .strip_prefix(&dest)
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_else(|_| rel.to_string_lossy().replace('\\', "/"));
-            index_rows.push((date, title, rel_written));
+            index_rows.push((date, title, export_rel_link(&dest, &written, &rel)));
         }
 
         let index_text = render_index_md(&index_rows);
         let index_path = self.write_export_file(dest.join("index.md"), &index_text)?;
         if index_path != dest.join("index.md") {
+            renamed += 1;
+        }
+
+        Ok(ExportResult {
+            dest_dir: dest.to_string_lossy().to_string(),
+            entry_count: index_rows.len(),
+            renamed,
+            index_path: index_path.to_string_lossy().to_string(),
+        })
+    }
+
+    /// 把整个库导出成**网页**文件树（【P2-8】）。
+    ///
+    /// 产物形状：
+    /// ```text
+    /// <dest>/
+    ///   index.html                  全部日记的日期 + 标题 + 链接（**倒序**，最近的在上）
+    ///   2026/09/2026-09-18.html     单篇（头部一行元信息 + 正文）
+    /// ```
+    ///
+    /// 与 `export_markdown` 的关系：**两条并行的出口，共守同一套规矩** ——
+    /// 同样的目录分层、同样的"只导写过的"、同样的"绝不覆盖"、同样的相对链接。
+    /// 不同的只有"给谁读"：Markdown 给编辑器，网页给浏览器（双击就能看）。
+    ///
+    /// ⚠️ 正文**不是**从 Markdown 转过来的 —— 库里存的本就是 HTML，所以这一条
+    ///    几乎白送。但必须过 `sanitize_export_html()`（手打的 `<script>` 会真的执行）。
+    ///
+    /// ⚠️ 目录页排序**与 `index.md` 相反**（那个是升序）：用户 2026-09-29 拍板
+    ///    "倒序，最近的在上" —— 网页是要用浏览器**翻阅**的入口页，第一眼该落在
+    ///    最新一篇上；`index.md` 是存档，读起来像一本书。
+    pub fn export_html(&self, dest_dir: &str) -> AppResult<ExportResult> {
+        if dest_dir.trim().is_empty() {
+            return Err(AppError::Validation("导出目录不能为空".into()));
+        }
+        let dest = Path::new(dest_dir.trim());
+        std::fs::create_dir_all(dest)?;
+        let dest = std::fs::canonicalize(dest).unwrap_or_else(|_| dest.to_path_buf());
+
+        // 标签：一次取齐并按 entry_id 归组（同 export_markdown，别做成 N+1 次查询）。
+        let mut tags_by_entry: HashMap<i64, Vec<String>> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT et.entry_id, t.name
+                 FROM entry_tag et
+                 JOIN tag t ON t.id = et.tag_id
+                 ORDER BY t.name COLLATE NOCASE ASC",
+            )?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (entry_id, name) = row?;
+                tags_by_entry.entry(entry_id).or_default().push(name);
+            }
+        }
+
+        // 每篇的图片张数：头部那句"〔此篇另有 N 张图片…〕"要用。
+        // 同样一次取齐 —— 逐篇调 `list_attachments` 又是一次 N+1。
+        // ⚠️ 附件**一个都不复制进导出目录**（那是明文副本，见指令 §六-3），
+        //    所以这里只要**数量**。
+        let mut photos_by_entry: HashMap<i64, i64> = HashMap::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT entry_id, count(*) FROM attachment GROUP BY entry_id")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+            for row in rows {
+                let (entry_id, n) = row?;
+                photos_by_entry.insert(entry_id, n);
+            }
+        }
+
+        // ⚠️ **先把目录页要占的文件名定下来，再写每一篇** ——
+        //    每篇页脚那个「← 回到目录」得指对文件，而"重名加后缀"是在写入时才
+        //    决定的。重复导出到同一目录时，这一批会变成 `… (1).html`，
+        //    页脚也必须跟着指向 `index (1).html`，否则点回去看到的是上一批。
+        // ⚠️ 这里**只预定名字、不建文件**：真正的写入仍在最后，
+        //    "绝不覆盖"的检查由 `write_export_file()` 自己独立做一遍。
+        let index_target = non_conflicting_path(&dest.join("index.html"))?;
+        let index_name = index_target
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "index.html".to_string());
+        // 单篇在 `<dest>/年/月/日期.html`，回目录要上两级。
+        let back_href = format!("../../{index_name}");
+
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, entry_date, title, content_md, mood
+             FROM entry
+             WHERE {}
+             ORDER BY entry_date ASC",
+            has_content_sql()
+        ))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+            ))
+        })?;
+
+        let mut renamed = 0usize;
+        let mut index_rows: Vec<(String, String, String)> = Vec::new();
+        for row in rows {
+            let (id, date, title, content_md, mood) = row?;
+            let (year, month) = (&date[0..4], &date[5..7]);
+            let rel = Path::new(year).join(month).join(format!("{date}.html"));
+            let tags = tags_by_entry.get(&id).cloned().unwrap_or_default();
+            let photos = photos_by_entry.get(&id).copied().unwrap_or(0);
+            let body =
+                render_entry_html(&date, &title, mood, &tags, &content_md, photos, &back_href);
+            let written = self.write_export_file(dest.join(&rel), &body)?;
+            if written != dest.join(&rel) {
+                renamed += 1;
+            }
+            index_rows.push((date, title, export_rel_link(&dest, &written, &rel)));
+        }
+
+        // 目录页倒序：最近的在上（用户 2026-09-29 拍板）。
+        index_rows.reverse();
+
+        let index_text = render_index_html(&index_rows);
+        let index_path = self.write_export_file(dest.join("index.html"), &index_text)?;
+        if index_path != dest.join("index.html") {
             renamed += 1;
         }
 
@@ -4468,7 +4589,7 @@ fn render_index_md(entries: &[(String, String, String)]) -> String {
     out.push_str("# 日记索引\n\n");
     out.push_str(&format!("共 {} 篇。\n\n", entries.len()));
     for (date, title, rel) in entries {
-        let flat = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        let flat = flat_title(title);
         if flat.is_empty() {
             out.push_str(&format!("- [{date}]({rel})\n"));
         } else {
@@ -4513,6 +4634,382 @@ fn yaml_scalar(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+// ---------------------------------------------------------------------------
+// HTML 导出（P2-8）：渲染与净化
+// ---------------------------------------------------------------------------
+//
+// 与上面那套 Markdown 渲染是**两条并行的出口**：同一批数据、同一套落盘规矩，
+// 但产物面向不同的读者 ——
+//   * Markdown —— 给别的**编辑器**读（还能接着改）
+//   * HTML     —— 给**浏览器**双击就能看（排版在、零依赖）
+//
+// ⚠️ 两边最不一样的地方：Markdown 那边要把 HTML **翻译成标记**（有损）；
+//    HTML 这边**库里存的本就是 HTML**，几乎白送 —— 但正文必须过
+//    `sanitize_export_html()`，理由见那个函数（这是安全边界，不是可选项）。
+//
+// ⚠️ **⛔ 不给导出的 HTML 做深色主题**：它是**文件**、不是本软件的界面，
+//    不该跟着软件主题变。本项目"颜色绝不硬编码"那条约束管的是**软件界面**；
+//    这是一个独立文件，一套干净的浅色（白纸黑字）是**刻意**的选择。
+
+/// 导出网页用的内嵌样式。
+///
+/// ⛔ **绝不引外部文件 / CDN / 外部字体**：导出的目录要能整个搬到 U 盘、
+///    断网双击也一模一样（验收里专门有一条）。
+///
+/// `.content` 上的 `white-space: pre-wrap` 是给**旧日记**（纯文本那批）的：
+/// 换行由 `sanitize_export_html()` 转成 `<br>`，但连续空格只能靠这条保住。
+/// 对新的富文本正文没有影响 —— 它本来就不含裸空白。
+const EXPORT_HTML_CSS: &str = r#"*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{background:#f5f4f1;color:#26231f;padding:40px 18px 64px;
+ font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;
+ font-size:16px;line-height:1.85;-webkit-text-size-adjust:100%}
+article,main{max-width:660px;margin:0 auto;background:#fff;
+ padding:34px 38px 42px;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.07)}
+header{border-bottom:1px solid #e9e6e0;padding-bottom:14px;margin-bottom:22px}
+h1{font-size:1.3rem;line-height:1.55;margin:0 0 10px;font-weight:600}
+.meta{margin:0;color:#7d7770;font-size:.85rem}
+.content{white-space:pre-wrap;overflow-wrap:break-word}
+.content p{margin:0 0 .9em}
+.content p:last-child{margin-bottom:0}
+mark{background:#fdf0a3;color:inherit}
+footer{max-width:660px;margin:20px auto 0}
+footer a{color:#8a6a34;font-size:.88rem;text-decoration:none}
+footer a:hover{text-decoration:underline}
+.count{margin:0 0 18px;color:#7d7770;font-size:.85rem}
+ul.idx{list-style:none;margin:0;padding:0}
+ul.idx li{padding:7px 0;border-bottom:1px solid #f0eeea}
+ul.idx li:last-child{border-bottom:none}
+ul.idx a{color:#2c4a6b;text-decoration:none}
+ul.idx a:hover{text-decoration:underline}
+ul.idx .dt{font-variant-numeric:tabular-nums;margin-right:10px}
+ul.idx .tt{color:#57524c;font-size:.92rem}
+"#;
+
+/// 导出时放行的**标签名**（口径的那一份）。
+///
+/// ⚠️ **必须与 `app/src/utils/richText.ts::ALLOWED_TAGS` 一字不差** ——
+///    有单测**直接读那个文件**比对，并且逐个验证 `take_export_tag()` 真的认得出
+///    它们（`export_whitelist_matches_and_recognizes_frontend_tags`）。
+/// ⚠️ 下面那串 `EXPORT_LITERAL_TAGS` 是**按这份名单手写的**确切写法 ——
+///    两处都得改时，上面的单测会把漏掉的那一半揪出来。
+// 运行时那条路走的是 `EXPORT_LITERAL_TAGS`；这一份是"口径的书面版本"，
+// 由单测读前端源码比对，所以在非测试构建里没有调用方。
+#[allow(dead_code)]
+const EXPORT_ALLOWED_TAG_NAMES: [&str; 8] = [
+    "p", "br", "strong", "em", "u", "s", "span", "mark",
+];
+
+/// 导出时放行的**确切标签写法**（无属性的那些）。
+///
+/// ⚠️ 只有这几个字符串会被当成标签，**别的一律转义成文字** ——
+///    这就是"白名单制"，也是 `sanitize_export_html()` 的全部判据。
+const EXPORT_LITERAL_TAGS: [&str; 15] = [
+    "<p>",
+    "</p>",
+    "<strong>",
+    "</strong>",
+    "<em>",
+    "</em>",
+    "<u>",
+    "</u>",
+    "<s>",
+    "</s>",
+    "<mark>",
+    "</mark>",
+    "<br>",
+    "<br/>",
+    "<br />",
+];
+
+/// 导出时保留下来的 `span` 样式属性。
+///
+/// ⚠️ **与 `app/src/utils/richText.ts::ALLOWED_STYLE_PROPS` 是同一份口径**
+///    （那边管"落库前洗一遍"，这边管"导出前再洗一遍"）。
+const EXPORT_ALLOWED_STYLE_PROPS: [&str; 5] = [
+    "font-family",
+    "font-size",
+    "font-weight",
+    "font-style",
+    "text-decoration",
+];
+
+const SPAN_OPEN: &str = "<span";
+const SPAN_STYLE_OPEN: &str = " style=\"";
+
+/// 渲染一篇日记为**一个能独立打开的网页**（`<dest>/年/月/日期.html`）。
+///
+/// 四件必须做到的事（指令 §五-3）：
+///   1. `<meta charset="utf-8">` **必须在最前面** —— 否则中文在有些浏览器里是乱码；
+///   2. `<title>` 要转义（标题里可能有 `<`）；
+///   3. **正文要过 `sanitize_export_html()`**（安全边界）；
+///   4. 那天有附件时，元信息后面加一句"另有 N 张图片"——
+///      ⚠️ 图片**本来就不在正文里**（图片是"挂在这一天"上的），所以这句放**头部**，
+///      而不是"正文里图片的位置"。`photos = 0` 时整句不出现（不写"0 张图片"）。
+///
+/// ⚠️ `back_href` 由调用方给（形如 `../../index.html`）：重复导出到同一目录时
+///    目录页会变成 `index (1).html`，页脚必须跟着它走。
+/// ⚠️ 没标题时 `h1` 就是日期，此时元信息里**不再重复一遍日期**。
+fn render_entry_html(
+    date: &str,
+    title: &str,
+    mood: Option<i64>,
+    tags: &[String],
+    content: &str,
+    photos: i64,
+    back_href: &str,
+) -> String {
+    let flat = flat_title(title);
+    let has_title = !flat.is_empty();
+    let heading = if has_title { flat.clone() } else { date.to_string() };
+
+    let mut meta = String::new();
+    if has_title {
+        meta.push_str(date);
+    }
+    if let Some(e) = mood.and_then(mood_emoji) {
+        if !meta.is_empty() {
+            meta.push_str(" · ");
+        }
+        meta.push_str(e);
+    }
+    if !tags.is_empty() {
+        if !meta.is_empty() {
+            meta.push_str(" · ");
+        }
+        meta.push_str(
+            &tags
+                .iter()
+                .map(|t| format!("#{}", flat_title(t)))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    if photos > 0 {
+        if !meta.is_empty() {
+            meta.push_str(" · ");
+        }
+        meta.push_str(&format!("〔此篇另有 {photos} 张图片，未包含在导出里〕"));
+    }
+
+    let mut out = String::with_capacity(content.len() + EXPORT_HTML_CSS.len() + 512);
+    out.push_str("<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n");
+    out.push_str("<meta charset=\"utf-8\">\n");
+    out.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n");
+    out.push_str("<title>");
+    out.push_str(&escape_html_text(&heading));
+    out.push_str("</title>\n<style>");
+    out.push_str(EXPORT_HTML_CSS);
+    out.push_str("</style>\n</head>\n<body>\n<article>\n<header>\n<h1>");
+    out.push_str(&escape_html_text(&heading));
+    out.push_str("</h1>\n");
+    if !meta.is_empty() {
+        out.push_str("<p class=\"meta\">");
+        out.push_str(&escape_html_text(&meta));
+        out.push_str("</p>\n");
+    }
+    out.push_str("</header>\n<div class=\"content\">");
+    out.push_str(&sanitize_export_html(content));
+    out.push_str("</div>\n</article>\n<footer><a href=\"");
+    out.push_str(&escape_html_attr(back_href));
+    out.push_str("\">← 回到目录</a></footer>\n</body>\n</html>\n");
+    out
+}
+
+/// 渲染 `index.html`：全部日记的日期 ＋ 标题 ＋ 链接，**倒序**（最近的在上）。
+///
+/// 与 `render_index_md` 共用 `flat_title()` 的"标题折叠成一行"规则；
+/// 链接一律用 `/` 分隔、且是**相对路径**（整个目录搬到 U 盘也照样能用）。
+fn render_index_html(entries: &[(String, String, String)]) -> String {
+    let mut out = String::with_capacity(EXPORT_HTML_CSS.len() + entries.len() * 96 + 512);
+    out.push_str("<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n");
+    out.push_str("<meta charset=\"utf-8\">\n");
+    out.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n");
+    out.push_str("<title>日记索引</title>\n<style>");
+    out.push_str(EXPORT_HTML_CSS);
+    out.push_str("</style>\n</head>\n<body>\n<main>\n<h1>日记索引</h1>\n");
+    out.push_str(&format!(
+        "<p class=\"count\">共 {} 篇。</p>\n<ul class=\"idx\">\n",
+        entries.len()
+    ));
+    for (date, title, rel) in entries {
+        out.push_str("<li><a class=\"dt\" href=\"");
+        out.push_str(&escape_html_attr(rel));
+        out.push_str("\">");
+        out.push_str(&escape_html_text(date));
+        out.push_str("</a>");
+        let flat = flat_title(title);
+        if !flat.is_empty() {
+            out.push_str("<span class=\"tt\">");
+            out.push_str(&escape_html_text(&flat));
+            out.push_str("</span>");
+        }
+        out.push_str("</li>\n");
+    }
+    out.push_str("</ul>\n</main>\n</body>\n</html>\n");
+    out
+}
+
+/// 把库里的正文转成"**可以安全嵌进一个 HTML 文件**"的形式。
+///
+/// ⚠️ **这不是 `utils/richText.ts::sanitizeHtml()` 的复制品** —— 两者面对的
+///    对象和方向都不同：
+///      * `sanitizeHtml()` 面对"编辑器刚吐出来的任意 DOM"，用浏览器原生的
+///        DOMParser 判定，做的是**清洗**（危险节点整块丢掉）；
+///      * 本函数面对"**库里已经存着的那串字符**"，Rust 侧没有 DOM，而且
+///        **不能丢东西** —— 用户手打的 `<` 是**他写的字**，只能转义成文字。
+///        所以判据是保守的白名单：**只认我们自己那 8 个标签的确切写法**
+///        （`EXPORT_LITERAL_TAGS` / `take_export_tag`），其余 `<` `>` 一律转义。
+///
+/// 为什么必须做（这是**安全边界**，不是洁癖）：导出的 `.html` 会被**浏览器**
+/// 打开，正文里能被当成标签执行的东西**真的会执行**。而本项目【P2-3】拍板
+/// "手打的 `<` `>` 原样存" ⇒ 他敲过 `<script>alert(1)</script>` 的那一天，
+/// 导出的目录里就会多一个**会弹窗**的网页文件。
+///
+/// 两类输入各走各的、但共用同一条扫描：
+///   * **旧日记（纯文本）**：`<` `>` 转义、`\n` → `<br>` ⇒ 与他在软件里看到的
+///     一模一样（换行照旧保留，用户 2026-09-29 拍板）；
+///   * **新日记（HTML）**：白名单标签原样放行，其余照转义
+///     （新正文里的 `\n` 早就变成了 `<p>` / `<br>`，所以那条对它是空操作）。
+fn sanitize_export_html(content: &str) -> String {
+    let mut out = String::with_capacity(content.len() + 32);
+    let mut rest = content;
+    while !rest.is_empty() {
+        if let Some((n, tag)) = take_export_tag(rest) {
+            out.push_str(&tag);
+            rest = &rest[n..];
+            continue;
+        }
+        let ch = rest.chars().next().expect("rest 非空");
+        match ch {
+            // ⭐ 本函数存在的理由：正文里手打的 `<script>` 导出后只是一行字。
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            // ⚠️ **`&` 故意不动**：新正文里的 `&` 落库前已经被 `sanitizeHtml()`
+            //    转成 `&amp;` 了，这里再转一次，用户看到的就是"`&amp;` 六个字符"。
+            //    而旧日记里的裸 `&`，浏览器照样显示成 `&`。
+            '&' => out.push('&'),
+            // 旧日记的换行照旧保留。
+            '\n' => out.push_str("<br>"),
+            _ => out.push(ch),
+        }
+        rest = &rest[ch.len_utf8()..];
+    }
+    out
+}
+
+/// 若 `s` 开头正好是"**我们自己写的**"一个标签，返回 (消耗的字节数, 要输出的标签)。
+///
+/// ⛔ 认不出的一律返回 `None` ⇒ 调用方把那个 `<` 转义成文字。
+///    宁可漏认（多转义一个 `<`，用户看到 `2 &lt; 3` 的**原文**）
+///    也不能错认（把一个 `<script` 当标签放行）。
+fn take_export_tag(s: &str) -> Option<(usize, String)> {
+    for t in EXPORT_LITERAL_TAGS {
+        if s.starts_with(t) {
+            return Some((t.len(), t.to_string()));
+        }
+    }
+    if s.starts_with("</span>") {
+        return Some((7, "</span>".to_string()));
+    }
+
+    let after = s.strip_prefix(SPAN_OPEN)?;
+    if after.starts_with('>') {
+        return Some((SPAN_OPEN.len() + 1, "<span>".to_string()));
+    }
+    // `<span style="…">` —— Tiptap 的字体 / 字号就存在这个 style 上。
+    let rest = after.strip_prefix(SPAN_STYLE_OPEN)?;
+    let end = rest.find('"')?;
+    let cleaned = clean_export_style(&rest[..end]);
+    // 到闭合引号后面的 `>` 为止。
+    let n = SPAN_OPEN.len() + SPAN_STYLE_OPEN.len() + end + 1;
+    if !s[n..].starts_with('>') {
+        return None;
+    }
+    let tag = if cleaned.is_empty() {
+        "<span>".to_string()
+    } else {
+        format!("<span style=\"{cleaned}\">")
+    };
+    Some((n + 1, tag))
+}
+
+/// 过滤 `span` 上的 `style` 串 —— 只留字体 / 字号那五个属性。
+///
+/// ⚠️ 库里那串 style 正常是前端 `sanitizeHtml()` 洗过的；这里**再洗一遍**是
+///    纵深防御：导出的文件会被浏览器打开，而"手改过数据库 / 老版本残留 /
+///    以后某次迁移写歪了"这些**绕过前端**的路径是真实存在的。
+/// ⚠️ 值里含 `"` 的**必须丢** —— 否则它会把我们拼的属性串提前闭合，
+///    后面的内容就随他写了（经典属性注入）。
+fn clean_export_style(raw: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for piece in raw.split(';') {
+        let Some(idx) = piece.find(':') else { continue };
+        let prop = piece[..idx].trim().to_ascii_lowercase();
+        let value = piece[idx + 1..].trim();
+        if value.is_empty() || value.contains('"') {
+            continue;
+        }
+        if !EXPORT_ALLOWED_STYLE_PROPS.contains(&prop.as_str()) {
+            continue;
+        }
+        let low = value.to_ascii_lowercase();
+        if low.contains("url(") || low.contains("expression(") || low.contains("javascript:") {
+            continue;
+        }
+        out.push(format!("{prop}: {value}"));
+    }
+    out.join("; ")
+}
+
+/// 转义一段文字，好放进 HTML 的**正文**里。
+fn escape_html_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// 同 `escape_html_text()`，另加双引号 —— 给**属性值**（`href="…"`）用。
+fn escape_html_attr(s: &str) -> String {
+    escape_html_text(s).replace('"', "&quot;")
+}
+
+/// 心情编号 → emoji。
+///
+/// ⚠️ **必须与 `app/src/api/index.ts::MOODS` 一字不差** —— 有单测**直接读那个
+///    文件**比对（`mood_emoji_matches_frontend_table`），改一边不改另一边会红。
+fn mood_emoji(mood: i64) -> Option<&'static str> {
+    match mood {
+        1 => Some("😭"),
+        2 => Some("🤕"),
+        3 => Some("😶‍🌫️"),
+        4 => Some("😡"),
+        5 => Some("🥰"),
+        _ => None,
+    }
+}
+
+/// 标题折叠成**一行**：换行 / 连续空白压成一个空格。
+///
+/// 用它的地方是"一行一项"的列表（Markdown 的 `- ` 项、HTML 的 `<li>`）——
+/// 一个带换行的标题会把列表切碎成好几行。
+/// ⛔ 只是折叠空白，**不做长度截断**（截断会让两个导出文件里的标题不一样）。
+fn flat_title(title: &str) -> String {
+    title.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 把一个**实际写入**的绝对路径转成"写进索引里的那串相对路径"。
+///
+/// ⚠️ 一律用 `/`：它是 Markdown 链接与 HTML `href` 的路径分隔符，
+///    Windows 的反斜杠在浏览器和别的编辑器里都**不是**分隔符。
+///    两个导出（md / html）共用这一份 —— 各写一份就等着两边慢慢分叉。
+fn export_rel_link(dest: &Path, written: &Path, fallback: &Path) -> String {
+    written
+        .strip_prefix(dest)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| fallback.to_string_lossy().replace('\\', "/"))
 }
 
 /// 目标文件已存在时，在扩展名前追加 ` (1)`、` (2)`… —— **绝不覆盖**。
@@ -5254,6 +5751,265 @@ mod tests {
         assert_eq!(make_preview("今天下雨了"), "今天下雨了");
         // 纯图片日记：正文空 ⇒ 空串（`make_preview_line` 会换成"有 N 张图片"）。
         assert_eq!(make_preview("<p></p>"), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // 【P2-8】HTML 导出
+    // -----------------------------------------------------------------------
+
+    /// ⭐ **安全边界**：正文里手打的 `<script>` 导出去必须只是一行字。
+    ///
+    /// 导出的 `.html` 会被**浏览器**打开，能被当成标签执行的东西真的会执行 ——
+    /// 而本项目【P2-3】拍板"手打的 `<` `>` 原样存"，所以这条不是假想威胁。
+    #[test]
+    fn export_html_escapes_typed_script_tags() {
+        assert_eq!(
+            sanitize_export_html("<script>alert(1)</script>"),
+            "&lt;script&gt;alert(1)&lt;/script&gt;"
+        );
+        // 大小写、带属性、伪闭合写法一律照转（白名单只认确切写法）。
+        assert_eq!(
+            sanitize_export_html("<Script src=x>"),
+            "&lt;Script src=x&gt;"
+        );
+        assert_eq!(
+            sanitize_export_html("<img src=x onerror=alert(1)>"),
+            "&lt;img src=x onerror=alert(1)&gt;"
+        );
+        assert_eq!(
+            sanitize_export_html("</p><script>x</script><p>"),
+            "</p>&lt;script&gt;x&lt;/script&gt;<p>"
+        );
+    }
+
+    /// 白名单那 8 个标签原样放行 —— 粗体 / 高亮在浏览器里要看得见。
+    #[test]
+    fn export_html_keeps_whitelist_tags() {
+        assert_eq!(
+            sanitize_export_html("<p>今天<strong>下雨</strong>了</p>"),
+            "<p>今天<strong>下雨</strong>了</p>"
+        );
+        assert_eq!(sanitize_export_html("上<br>下"), "上<br>下");
+        assert_eq!(sanitize_export_html("a<br />b"), "a<br />b");
+        assert_eq!(
+            sanitize_export_html("<p><mark>亮</mark></p>"),
+            "<p><mark>亮</mark></p>"
+        );
+        assert_eq!(
+            sanitize_export_html(r#"<p><em>斜</em><s>划</s><u>线</u></p>"#),
+            r#"<p><em>斜</em><s>划</s><u>线</u></p>"#
+        );
+        // 字体 / 字号：`span` 带 style 也要放行。
+        // ⚠️ 尾部分号会被**归一化掉**（`1.25em;` ⇒ `1.25em`）—— 这与前端
+        //    `richText.ts::cleanStyle()` 的行为**完全一致**（都是"按 `;` 切开再
+        //    `; ` 拼回"），而且落库时就已经是归一化过的写法，所以导出看到的
+        //    通常原样就是它。
+        assert_eq!(
+            sanitize_export_html(r#"<p><span style="font-size: 1.25em;">大字</span></p>"#),
+            r#"<p><span style="font-size: 1.25em">大字</span></p>"#
+        );
+    }
+
+    /// 旧日记（纯文本）：换行照旧保留（用户 2026-09-29 拍板）、角括号变文字。
+    #[test]
+    fn export_html_keeps_plain_text_newlines_and_escapes_angles() {
+        assert_eq!(sanitize_export_html("第一行\n第二行"), "第一行<br>第二行");
+        assert_eq!(sanitize_export_html("2 < 3"), "2 &lt; 3");
+        assert_eq!(sanitize_export_html("<- 箭头"), "&lt;- 箭头");
+        // 没闭合的 `<` 也是他打的字，`3` 一个字都不许丢（与 `strip_html` 同口径）
+        assert_eq!(sanitize_export_html("<p>2 < 3</p>"), "<p>2 &lt; 3</p>");
+    }
+
+    /// ⛔ **不许把 `&` 二次转义**：新正文里本来就是 `&amp;`，再转一次
+    /// 用户看到的就是"`&amp;` 六个字符"。
+    #[test]
+    fn export_html_does_not_double_escape_ampersand() {
+        assert_eq!(sanitize_export_html("<p>a &amp; b</p>"), "<p>a &amp; b</p>");
+        assert_eq!(sanitize_export_html("a & b"), "a & b");
+    }
+
+    /// `span` 的样式只留字体 / 字号那五个属性；危险值 / 含 `"` 的一律丢。
+    #[test]
+    fn export_html_sanitizes_span_style() {
+        assert_eq!(
+            sanitize_export_html(r#"<span style="font-family: KaiTi; color: red;">x</span>"#),
+            r#"<span style="font-family: KaiTi">x</span>"#
+        );
+        // 危险值丢掉 ⇒ 退化成没有属性的 `<span>`
+        assert_eq!(
+            sanitize_export_html(r#"<span style="background: url(javascript:alert(1))">x</span>"#),
+            "<span>x</span>"
+        );
+        // ⚠️ 想在 `style` 后面再塞一个新属性的写法：**开标签整个不再被认作标签**
+        //    （` style="…"` 之后必须紧跟 `>`），一律转义成文字 —— 宁可多转义，
+        //    也不能让属性注入溜出去。
+        //    ⚠️ 末尾那个 `</span>` 仍然是**放行的**：它认出来也无害 —— 一个没有
+        //    对应开标签的孤立结束标签在 HTML 里**完全是惰性的**（浏览器直接忽略），
+        //    既不能带属性、也不能执行任何东西。
+        assert_eq!(
+            sanitize_export_html(r#"<span style="font-size: 1em" onmouseover="alert(1)">x</span>"#),
+            "&lt;span style=\"font-size: 1em\" onmouseover=\"alert(1)\"&gt;x</span>"
+        );
+    }
+
+    /// 标题里的 `<` 在 `<title>` 与 `<h1>` 里都必须是转义后的。
+    #[test]
+    fn render_entry_html_escapes_title() {
+        let html = render_entry_html(
+            "2026-09-18",
+            "a<b>&c",
+            None,
+            &[],
+            "<p>正文</p>",
+            0,
+            "../../index.html",
+        );
+        assert!(html.contains("<title>a&lt;b&gt;&amp;c</title>"), "{html}");
+        assert!(html.contains("<h1>a&lt;b&gt;&amp;c</h1>"), "{html}");
+        assert!(!html.contains("<title>a<b>"), "标题不许原样进 <title>");
+        // `charset` 必须排在最前面（否则部分浏览器里中文乱码）
+        assert!(html.starts_with("<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">"));
+    }
+
+    /// ⭐ 图片提示：有图才出现，**0 张时整句不出现**（不是显示"0 张图片"）；
+    /// 图片文件一个都不复制进导出目录（这里只出现"张数"）。
+    #[test]
+    fn render_entry_html_photo_note_only_when_has_photos() {
+        let args = |photos: i64| {
+            render_entry_html(
+                "2026-09-18",
+                "标题",
+                Some(5),
+                &["旅行".into()],
+                "<p>x</p>",
+                photos,
+                "../../index.html",
+            )
+        };
+        let two = args(2);
+        assert!(two.contains("〔此篇另有 2 张图片，未包含在导出里〕"), "{two}");
+        let none = args(0);
+        assert!(!none.contains("图片"), "没图时整句都不该出现");
+        // 心情 emoji ＋ 标签在这行里
+        assert!(none.contains("🥰"), "{none}");
+        assert!(none.contains("#旅行"), "{none}");
+    }
+
+    /// 没标题时 `h1` 就是日期，元信息里**不再重复一遍日期**；
+    /// 什么都没有时整行元信息干脆不出现（不留一条空白）。
+    #[test]
+    fn render_entry_html_falls_back_to_date_without_repeating_it() {
+        let html = render_entry_html("2026-09-18", "   ", None, &[], "x", 0, "../../index.html");
+        assert!(html.contains("<h1>2026-09-18</h1>"), "{html}");
+        assert!(!html.contains("class=\"meta\""), "没标题没心情没标签没图 ⇒ 元信息整行不出现");
+    }
+
+    /// 目录页：链接是**相对路径**、用 `/` 分隔、标题折叠成一行。
+    #[test]
+    fn render_index_html_uses_relative_slash_links() {
+        let rows = vec![
+            (
+                "2026-09-18".to_string(),
+                "带\n换行的 标题".to_string(),
+                "2026/09/2026-09-18.html".to_string(),
+            ),
+            (
+                "2026-09-17".to_string(),
+                String::new(),
+                "2026/09/2026-09-17.html".to_string(),
+            ),
+        ];
+        let html = render_index_html(&rows);
+        assert!(html.contains(r#"href="2026/09/2026-09-18.html""#), "{html}");
+        assert!(!html.contains('\\'), "链接里不许出现反斜杠");
+        assert!(html.contains("共 2 篇。"), "{html}");
+        assert!(html.contains("带 换行的 标题"), "标题要折叠成一行: {html}");
+        assert!(html.contains("<meta charset=\"utf-8\">"), "{html}");
+    }
+
+    /// ⭐ 把前端的两张表**当作数据源**读进来比对 —— 这是"同一个口径只许一份"的
+    ///    机器化保证：改了 `richText.ts` / `api/index.ts` 而不改这边，测试会红。
+    #[test]
+    fn mood_emoji_matches_frontend_table() {
+        let front = parse_frontend_mood_emojis();
+        let mine: Vec<String> = (1..=5)
+            .map(|m| mood_emoji(m).expect("1~5 都该有 emoji").to_string())
+            .collect();
+        assert_eq!(mine, front, "心情 emoji 必须与 api/index.ts::MOODS 一致");
+        // 越界一律 `None`（不 panic、也不瞎猜一个）
+        assert_eq!(mood_emoji(0), None);
+        assert_eq!(mood_emoji(6), None);
+        assert_eq!(mood_emoji(-1), None);
+    }
+
+    /// ⭐ 导出白名单必须与 `richText.ts::ALLOWED_TAGS` **一字不差**，
+    ///    而且每一个都真的被 `take_export_tag()` 认得出。
+    #[test]
+    fn export_whitelist_matches_and_recognizes_frontend_tags() {
+        let front = parse_frontend_allowed_tags();
+        let mine: Vec<String> = EXPORT_ALLOWED_TAG_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            mine, front,
+            "导出白名单必须与 richText.ts::ALLOWED_TAGS 一字不差"
+        );
+        for name in EXPORT_ALLOWED_TAG_NAMES {
+            let open = format!("<{name}>");
+            assert!(take_export_tag(&open).is_some(), "{open} 没被放行");
+            // ⚠️ `br` 是空元素，**没有 `</br>` 这种写法** —— 它本来就该认不出
+            //    （认出来才奇怪）。
+            if name != "br" {
+                let close = format!("</{name}>");
+                assert!(take_export_tag(&close).is_some(), "{close} 没被放行");
+            }
+        }
+        assert!(take_export_tag("<br/>").is_some());
+        assert!(take_export_tag("<br />").is_some());
+        assert!(take_export_tag("<span style=\"font-size: 1.25em\">").is_some());
+        // 反向：白名单之外的必须认不出（认出了就等于放行）
+        assert!(take_export_tag("<script>").is_none());
+        assert!(take_export_tag("<div>").is_none());
+        assert!(take_export_tag("<a href=\"x\">").is_none());
+    }
+
+    /// 从 `api/index.ts` 里把 `MOODS` 各项的 `emoji:` 按顺序抠出来。
+    fn parse_frontend_mood_emojis() -> Vec<String> {
+        let src = include_str!("../../src/api/index.ts");
+        let start = src.find("MOODS = [").expect("api/index.ts 里找不到 MOODS = [");
+        let tail = &src[start..];
+        let end = tail.find("] as const").expect("MOODS 数组没闭合");
+        let block = &tail[..end];
+        let marker = "emoji: \"";
+        let mut out = Vec::new();
+        let mut rest = block;
+        while let Some(i) = rest.find(marker) {
+            let after = &rest[i + marker.len()..];
+            let Some(j) = after.find('"') else { break };
+            out.push(after[..j].to_string());
+            rest = &after[j + 1..];
+        }
+        out
+    }
+
+    /// 从 `richText.ts` 里把 `ALLOWED_TAGS` 数组的成员抠出来。
+    fn parse_frontend_allowed_tags() -> Vec<String> {
+        let src = include_str!("../../src/utils/richText.ts");
+        let marker = "ALLOWED_TAGS = [";
+        let start = src.find(marker).expect("richText.ts 里找不到 ALLOWED_TAGS = [");
+        let tail = &src[start..];
+        let end = tail.find(']').expect("ALLOWED_TAGS 数组没闭合");
+        let block = &tail[..end];
+        let mut out = Vec::new();
+        let mut rest = block;
+        while let Some(i) = rest.find('"') {
+            let after = &rest[i + 1..];
+            let Some(j) = after.find('"') else { break };
+            out.push(after[..j].to_string());
+            rest = &after[j + 1..];
+        }
+        out
     }
 
     /// v1 -> v2 的真实升级路径。

@@ -199,6 +199,8 @@ pub fn run() {
             // 导出全部 / 导出单篇文本 / 在文件管理器里打开导出目录。
             commands::export_markdown,
             commands::export_entry_markdown,
+            // 网页导出（P2-8）—— 同一条路的第二种格式：产物双击就能在浏览器里看。
+            commands::export_html,
             commands::reveal_dir,
             // 图片附件（P1 #10）
             // 附件是**明文**文件、放在库外的 <数据目录>/attachments/，但"有哪几张

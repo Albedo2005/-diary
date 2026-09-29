@@ -2627,6 +2627,302 @@ fn export_rejects_an_empty_destination() {
 }
 
 // ---------------------------------------------------------------------------
+// HTML 导出（P2-8）
+//
+// 这一组对着【P2-8】§八 的验收标准写，重点是四件**只有真开库才看得见**的事：
+//   1. 目录结构（`index.html` + `年/月/日期.html`）与相对链接
+//   2. ⭐ 正文里手打的 `<script>` 导出去**只是一行字**（安全边界）
+//   3. ⭐ 重复导出 ⇒ 加后缀、原文件没被改、页脚指回**这一批**的目录页
+//   4. ⭐ 有图那天头部写"另有 N 张图片"，但图片**一个都没被复制进导出目录**
+// ---------------------------------------------------------------------------
+
+/// 造一份**合法**的小 PNG（`save_attachment` 会验魔数）。
+fn tiny_png(tag: u8) -> Vec<u8> {
+    let mut v = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    v.extend_from_slice(&[tag; 32]);
+    v
+}
+
+/// 递归列出一个目录下的**所有文件**（用来验证"图片一张都没被复制"）。
+fn list_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(list_files(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+#[test]
+fn export_html_writes_one_page_per_written_entry_plus_index() {
+    let dir = temp_dir("export-html-basic");
+    let out = dir.join("导出");
+    {
+        let v = Vault::create(&dir, PIN, None).unwrap();
+        seed_exportable(&v);
+
+        let res = v.export_html(out.to_str().unwrap()).unwrap();
+        assert_eq!(res.entry_count, 2, "两篇写过 → 导出两页");
+        assert_eq!(res.renamed, 0, "首次导出到空目录不该有重名");
+        assert!(res.index_path.ends_with("index.html"), "{}", res.index_path);
+        assert!(std::path::Path::new(&res.index_path).exists());
+
+        let page = out.join("2026").join("09").join("2026-09-18.html");
+        assert!(page.exists(), "单篇应落在 年/月/日期.html：{}", page.display());
+
+        let html = std::fs::read_to_string(&page).unwrap();
+        // ⭐ `<meta charset>` 必须排在最前面 —— 否则部分浏览器里中文乱码
+        assert!(
+            html.starts_with(
+                "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">"
+            ),
+            "{html}"
+        );
+        assert!(html.contains("<title>第一天</title>"), "{html}");
+        assert!(html.contains("<h1>第一天</h1>"), "{html}");
+        // 元信息里有日期、心情 emoji、标签
+        assert!(html.contains("2026-09-18 · 😶‍🌫️ · #旅行 #青海"), "{html}");
+        // ⭐ 页脚指回**导出根目录**的目录页（单篇在 年/月/ 下，要上两级）
+        assert!(html.contains("href=\"../../index.html\""), "{html}");
+        // 没有任何外部依赖（验收：断网 / 搬到别处也能打开）
+        assert!(!html.contains("http://"), "不许引外部资源：{html}");
+        assert!(!html.contains("https://"), "不许引外部资源：{html}");
+
+        let idx = std::fs::read_to_string(out.join("index.html")).unwrap();
+        assert!(idx.contains("共 2 篇。"), "{idx}");
+        // 链接是**相对路径**、用 `/` 分隔（搬到 U 盘也能用）
+        assert!(idx.contains("href=\"2026/09/2026-09-18.html\""), "{idx}");
+        assert!(!idx.contains('\\'), "链接里不许出现反斜杠：{idx}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ⭐ 目录页**倒序**：最近的在上（用户 2026-09-29 拍板；与 `index.md` 的升序不同）。
+#[test]
+fn export_html_index_lists_newest_first() {
+    let dir = temp_dir("export-html-order");
+    let out = dir.join("导出");
+    {
+        let v = Vault::create(&dir, PIN, None).unwrap();
+        v.save_entry("2026-09-18", "早", "早").unwrap();
+        v.save_entry("2026-09-19", "中", "中").unwrap();
+        v.save_entry("2026-09-20", "晚", "晚").unwrap();
+
+        v.export_html(out.to_str().unwrap()).unwrap();
+        let idx = std::fs::read_to_string(out.join("index.html")).unwrap();
+
+        let late = idx.find("2026-09-20").expect("最新的那篇必须在");
+        let mid = idx.find("2026-09-19").expect("中间那篇必须在");
+        let early = idx.find("2026-09-18").expect("最早那篇必须在");
+        assert!(late < mid && mid < early, "目录页必须倒序：{idx}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ⭐ **安全边界**：正文里手打的 `<script>` 导出后只是一行字，没有可执行的东西。
+#[test]
+fn export_html_escapes_dangerous_content() {
+    let dir = temp_dir("export-html-xss");
+    let out = dir.join("导出");
+    {
+        let v = Vault::create(&dir, PIN, None).unwrap();
+        v.save_entry(
+            "2026-09-18",
+            "手打的标签",
+            "这一行是我打的：<script>alert(1)</script>\n还有 2 < 3 这种",
+        )
+        .unwrap();
+
+        v.export_html(out.to_str().unwrap()).unwrap();
+        let html = std::fs::read_to_string(out.join("2026").join("09").join("2026-09-18.html"))
+            .unwrap();
+
+        assert!(!html.contains("<script"), "不许原样放行 script：{html}");
+        assert!(
+            html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "{html}"
+        );
+        // 没闭合的 `<` 也是他打的字，`3` 不许丢
+        assert!(html.contains("2 &lt; 3 这种"), "{html}");
+        // 旧日记（纯文本）的换行照旧保留（用户 2026-09-29 拍板）
+        assert!(html.contains("&lt;/script&gt;<br>"), "换行要保留：{html}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 富文本正文（库里存的就是 HTML）导出去要**保留格式**。
+#[test]
+fn export_html_keeps_rich_formatting() {
+    let dir = temp_dir("export-html-rich");
+    let out = dir.join("导出");
+    {
+        let v = Vault::create(&dir, PIN, None).unwrap();
+        v.save_entry(
+            "2026-09-18",
+            "带格式",
+            "<p>今天<strong>很好</strong>，<mark>这句要亮</mark></p><p>第二段</p>",
+        )
+        .unwrap();
+
+        v.export_html(out.to_str().unwrap()).unwrap();
+        let html = std::fs::read_to_string(out.join("2026").join("09").join("2026-09-18.html"))
+            .unwrap();
+        assert!(
+            html.contains(
+                "<div class=\"content\"><p>今天<strong>很好</strong>，<mark>这句要亮</mark></p><p>第二段</p></div>"
+            ),
+            "{html}"
+        );
+        // 内嵌样式里带着高亮的底色（不是靠外部 CSS）
+        assert!(html.contains("mark{background:"), "样式必须内嵌：{html}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ⭐ 重复导出到同一目录：加后缀、**原文件一字未改**，且这一批的页脚
+/// 指回**这一批的**目录页（`index (1).html`），不是上一批的。
+#[test]
+fn export_html_never_overwrites_and_backlink_follows_index() {
+    let dir = temp_dir("export-html-no-overwrite");
+    let out = dir.join("导出");
+    {
+        let v = Vault::create(&dir, PIN, None).unwrap();
+        v.save_entry("2026-09-18", "原稿", "<p>第一次</p>").unwrap();
+
+        let first = v.export_html(out.to_str().unwrap()).unwrap();
+        assert_eq!(first.renamed, 0);
+
+        let mine = out.join("2026").join("09").join("2026-09-18.html");
+        let before = std::fs::read_to_string(&mine).unwrap();
+
+        let second = v.export_html(out.to_str().unwrap()).unwrap();
+        assert!(second.renamed > 0, "重名必须被计数并回报");
+        assert_eq!(
+            std::fs::read_to_string(&mine).unwrap(),
+            before,
+            "已存在的文件必须一字未动"
+        );
+
+        let copy = out.join("2026").join("09").join("2026-09-18 (1).html");
+        assert!(copy.exists(), "重名的单篇应改成「日期 (1).html」");
+        assert!(out.join("index (1).html").exists(), "index.html 同理不覆盖");
+        // ⭐ 第二批的页脚必须指回第二批的目录页
+        let html = std::fs::read_to_string(&copy).unwrap();
+        assert!(html.contains("href=\"../../index (1).html\""), "{html}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ⭐ 有图那天：头部写"另有 N 张图片"，但图片**一个都没被复制进导出目录**；
+/// 没图那天整句不出现。
+#[test]
+fn export_html_notes_photos_without_copying_them() {
+    let dir = temp_dir("export-html-photos");
+    let out = dir.join("导出");
+    {
+        let v = Vault::create(&dir, PIN, None).unwrap();
+        v.save_entry("2026-09-18", "有图", "<p>配了两张</p>").unwrap();
+        v.save_entry("2026-09-19", "没图", "<p>只是文字</p>").unwrap();
+        v.save_attachment("2026-09-18", "图一.png", "image/png", &tiny_png(1))
+            .unwrap();
+        v.save_attachment("2026-09-18", "图二.png", "image/png", &tiny_png(2))
+            .unwrap();
+
+        let res = v.export_html(out.to_str().unwrap()).unwrap();
+        assert_eq!(res.entry_count, 2);
+
+        let with = std::fs::read_to_string(out.join("2026").join("09").join("2026-09-18.html"))
+            .unwrap();
+        assert!(
+            with.contains("〔此篇另有 2 张图片，未包含在导出里〕"),
+            "{with}"
+        );
+
+        let without =
+            std::fs::read_to_string(out.join("2026").join("09").join("2026-09-19.html")).unwrap();
+        assert!(!without.contains("图片"), "没图时整句都不该出现：{without}");
+
+        // ⭐ 导出目录里**只有 .html**（一张图片都不许被复制过来 —— 那是明文副本）
+        let files = list_files(&out);
+        assert!(!files.is_empty());
+        for f in &files {
+            assert_eq!(
+                f.extension().and_then(|s| s.to_str()),
+                Some("html"),
+                "导出目录里不该有非网页文件：{}",
+                f.display()
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn export_html_counts_only_written_entries() {
+    let dir = temp_dir("export-html-written-only");
+    let out = dir.join("导出");
+    {
+        let v = Vault::create(&dir, PIN, None).unwrap();
+        v.save_entry("2026-09-18", "写了", "有正文").unwrap();
+        v.save_entry("2026-09-20", "只有空白", "   \n\t ").unwrap();
+
+        let res = v.export_html(out.to_str().unwrap()).unwrap();
+        assert_eq!(res.entry_count, 1);
+        // 与统计的"共 N 篇"严格一致（与 Markdown 导出同一口径）
+        assert_eq!(
+            res.entry_count as i64,
+            v.stats(TEST_TODAY).unwrap().total_entries
+        );
+        assert!(!out.join("2026").join("09").join("2026-09-20.html").exists());
+        let idx = std::fs::read_to_string(out.join("index.html")).unwrap();
+        assert!(idx.contains("共 1 篇"), "{idx}");
+        assert!(!idx.contains("2026-09-20"), "{idx}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn export_html_rejects_an_empty_destination() {
+    let dir = temp_dir("export-html-empty-dest");
+    {
+        let v = Vault::create(&dir, PIN, None).unwrap();
+        v.save_entry("2026-09-18", "t", "c").unwrap();
+        assert!(matches!(
+            v.export_html("   ").unwrap_err(),
+            AppError::Validation(_)
+        ));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 锁定**不影响**导出（与 Markdown 导出同一条规矩：锁定是防改，不是防读）。
+#[test]
+fn export_html_ignores_the_lock_flag() {
+    let dir = temp_dir("export-html-locked");
+    let out = dir.join("导出");
+    {
+        let v = Vault::create(&dir, PIN, None).unwrap();
+        v.save_entry("2026-09-18", "锁着的", "<p>锁定是防改，不是防读</p>")
+            .unwrap();
+        v.set_entry_locked("2026-09-18", true).unwrap();
+
+        let res = v.export_html(out.to_str().unwrap()).unwrap();
+        assert_eq!(res.entry_count, 1);
+        let html = std::fs::read_to_string(out.join("2026").join("09").join("2026-09-18.html"))
+            .unwrap();
+        assert!(html.contains("<p>锁定是防改，不是防读</p>"), "{html}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
 // 备份恢复（P2-5）
 // ---------------------------------------------------------------------------
 //
