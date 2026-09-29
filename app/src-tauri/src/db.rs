@@ -701,9 +701,89 @@ pub fn has_content_sql() -> String {
 /// （写死了 `list_tags` 那条就会在运行时报 "no such column: entry.id"）。
 pub fn has_content_sql_for(entry_ref: &str) -> String {
     format!(
-        "(trim(coalesce({entry_ref}.content_md, ''), {TRIM_CHARS}) <> '' \
-         OR EXISTS(SELECT 1 FROM attachment a WHERE a.entry_id = {entry_ref}.id))"
+        "({} OR EXISTS(SELECT 1 FROM attachment a WHERE a.entry_id = {entry_ref}.id))",
+        plain_text_sql_for(entry_ref)
     )
+}
+
+/// ⭐【P2-3】第 2 步：SQL 版的"这篇有可见文字吗"。
+///
+/// 为什么不能直接在 SQL 里用 `content_md <> ''`：
+///   正文现在是带格式的 HTML，编辑器清空后留下的典型值是 `<p></p>` ——
+///   它在 SQL 看来**非空**，于是"删空了正文"会被判成"还写过"，
+///   日历上留下一个点进去是空的幽灵标记。
+///
+/// 又为什么不在 SQL 里"真的剥标签"：
+///   SQLite 没有正则、没有循环，写不出可靠的 HTML 剥离；
+///   硬凑一个 `replace` 链既难读又必然漏（标签带属性、大小写、嵌套）。
+///   所以这里只做一件**保守但够用**的事 ——
+///   **把"只由标签和空白组成"的内容判为空**，用的是"剥掉 `<` 和 `>` 之间的
+///   内容后还剩不剩东西"这个近似。它**对合法输入是精确的**
+///   （正文永远由我们自己的 `sanitizeHtml` 产出，不会有畸形嵌套），
+///   对畸形输入则**偏保守**（宁可判"有内容"，也不误删用户的日记）。
+///
+/// 具体做法（三条替换，覆盖所有标签形态）：
+///   1. `<...>`（含带属性的开闭标签）→ 去掉；
+///   2. `&nbsp;` → 一个空格（否则"只有 nbsp"会被判成有内容）；
+///   3. 去空白后判空。
+///
+/// ⚠️ 与 `has_content()`（Rust 侧）**必须结论一致**：那边剥得干净，
+///    这边是近似 —— 两者在**合法输入**上结论相同，这是可接受的
+///    （不一致只可能出现在手改数据库塞进畸形 HTML 的情况下）。
+///    `has_content_sql()` 是日历 / 统计的口径，`has_content()` 是索引的口径，
+///    它们本来就服务不同问题（见各自说明），所以不要求实现相同、只要求
+///    "对同一篇合法数据给出同一个是否标记的结论"。
+pub fn plain_text_sql_for(entry_ref: &str) -> String {
+    // SQLite 的 replace 没有正则，所以这里列出**本项目实际会产出的**标签形态。
+    // ⚠️ 用 replace 逐个消标签是 O(标签种类)，而标签种类由白名单钉死（8 个），
+    //    所以这个做法是**有界**的 —— 白名单不加新标签，这里就不用改。
+    //    这是"白名单制"换来的好处：连 SQL 都能写穷尽。
+    //
+    // 每种标签要消三种形态（这三种覆盖 HTML 的全部写法）：
+    //   ① `<p>`              裸开标签
+    //   ② `<span style="...">` 带属性开标签 —— 只有 span 会带属性（承载字体/字号）
+    //   ③ `</p>`             闭标签
+    //
+    // ⚠️ **带属性的 span 必须用 `instr` 精确切掉**，不能偷懒写成
+    //    "把 `<span ` 替换成 `<span`" —— 那会把 `<span style="x">` 变成
+    //    `<spanstyle="x">`，看着像消掉了其实还留着半截，字数照错。
+    //    做法：把 `<span` 到**其后第一个 `>`** 之间的整段切掉（前段 + 后段）。
+    //
+    // ⚠️⚠️ **`>` 的位置必须在 `<span` 之后找，不能用全局第一个**！
+    //    踩过：正文是 `<p><span style="…">字</span></p>` 时，
+    //    全局第一个 `>` 属于 `<p>`，于是"切到第一个 `>`"把整段切错，
+    //    结果是 `<span` 的 `style="…"` 那截留了下来（判成"有内容"）。
+    //    SQLite 没有"从第 N 位开始找"的 instr，所以用
+    //    `instr(substr(c, p+1), '>') + p` 换算成绝对位置。
+    //
+    // ⚠️ 另外**一个 replace 只能切掉第一处 span** —— 一篇日记里可能有多个
+    //    字体/字号 span。所以要**循环展开**（这里固定 4 轮，覆盖"一句话里
+    //    换了五次以上字体"这种极端情况；再多也不会错，只是那几处没被切到，
+    //    而 `visible_text` 的 Rust 侧仍然给出精确答案 —— 影响面仅限 SQL 判定，
+    //    对合法输入不会发生）。
+    let col = format!("coalesce({entry_ref}.content_md, '')");
+    let mut cleaned = col;
+    // 循环 4 轮：每轮切掉**一处**带属性的 span（一处 span 对应一次字体/字号设置）。
+    for _ in 0..4 {
+        cleaned = format!(
+            "case when instr({c}, '<span') > 0 \
+                  and instr(substr({c}, instr({c}, '<span') + 5), '>') > 0 \
+             then substr({c}, 1, instr({c}, '<span') - 1) || \
+                  substr({c}, instr({c}, '<span') + 5 + \
+                              instr(substr({c}, instr({c}, '<span') + 5), '>')) \
+             else {c} end",
+            c = cleaned
+        );
+    }
+    for tag in ["p", "br", "strong", "em", "u", "s", "span", "mark"] {
+        cleaned = format!(
+            "replace(replace({c}, '<{t}>', ''), '</{t}>', '')",
+            c = cleaned,
+            t = tag
+        );
+    }
+    cleaned = format!("replace({cleaned}, '&nbsp;', ' ')");
+    format!("trim({cleaned}, {TRIM_CHARS}) <> ''")
 }
 
 /// 判断一段正文里**有没有文本**。
@@ -719,7 +799,11 @@ pub fn has_content_sql_for(entry_ref: &str) -> String {
 pub fn has_content(content_md: &str) -> bool {
     // char::is_whitespace 覆盖空格、制表、换行、回车、垂直制表、换页，
     // 与上面的 SQL 字符集一一对应。
-    content_md.chars().any(|c| !c.is_whitespace())
+    //
+    // ⭐【P2-3】第 2 步：先剥掉 HTML 标签再判。
+    //    否则编辑器清空后留下的 `<p></p>` 会让这里判成"有内容" ——
+    //    表现为"删空了正文，日历上却还有标记"。
+    strip_html(content_md).chars().any(|c| !c.is_whitespace())
 }
 
 /// 标签名的长度上限（**字符数**，不是字节数）。
@@ -867,8 +951,146 @@ fn unix_to_rfc3339(secs: u64) -> String {
 ///    目前读这一列的有：统计页（总字数 / 每月趋势）、导出、列表。
 ///    ⚠️ 前端编辑器右上角那个实时「N 字」走的是 `utils/text.ts::visibleText()`，
 ///       与这里**不是同一套口径**（emoji 差 1~2 个），该差异**照旧保留**。
+///
+/// ⭐【P2-3】第 2 步起正文是**带格式的 HTML**：`<p>` `<strong>`
+///    `style="font-family: …"` 这些**都不是字**，必须先剥掉再数。
+///    不剥的话一行加粗就会让字数凭空多出十几个，而且**错得很隐蔽**
+///    （数字看着像是合理的，只是偏大）。
 fn count_words(text: &str) -> i64 {
-    text.chars().filter(|c| !c.is_whitespace()).count() as i64
+    strip_html(text).chars().filter(|c| !c.is_whitespace()).count() as i64
+}
+
+/// 把正文 HTML 剥成"看得见的文字" —— **后端剥标签的唯一入口**。
+///
+/// 与前端 `utils/richText.ts::htmlToPlainText()` 是**同一套规则的两份实现**：
+/// 前端负责实时显示，后端负责落库与统计，两边跑在不同语言里，
+/// 没法共用一份代码（这是 Rust + 前端的固有限制）。
+/// ⚠️ 改这里的规则时**必须同步改前端那一份**，否则"编辑器显示 62 字、
+///    统计页却按 75 字算"这类矛盾会静默出现（而且没有测试能同时覆盖两端）。
+///
+/// 规则（与前端保持一致）：
+///   - `<br>` 与 `</p>` 换成换行（否则两段会粘成一个词，字数仍然对，
+///     但如果有"按行"的逻辑就会出错）；
+///   - 其余标签只去掉标签本身；
+///   - 常见 HTML 实体还原（`&amp;` `&lt;` `&gt;` `&quot;` `&#39;` `&nbsp;`）；
+///   - 纯文本（不含 `<`）**原样返回** —— 旧日记全走这条，
+///     保证"旧日记的字数与改前完全一致"。
+///
+/// ⚠️ 用简单的状态机扫描，**不用正则**（Rust 标准库没有正则，
+///    引 `regex` crate 要改 `Cargo.toml` 且后端**零新依赖**是本项目的硬约束）。
+///    状态机也更容易读懂：无非是"在标签里"和"在文字里"两个状态。
+fn strip_html(html: &str) -> String {
+    // ⚠️ 纯文本也要**过一遍实体还原**再返回 —— 不能直接 `return html`。
+    //    踩过：`<p>a&amp;b</p>` 剥完标签剩 `a&amp;b`，直接返回就漏了这一步，
+    //    导出时于是输出 `a&amp;b`（用户看到的是五个字符而不是 `a&b`）。
+    //    纯文本里出现实体的原因很实在：**粘贴**——从网页复制的文字带着实体进来。
+    if !html.contains('<') {
+        return decode_entities(html);
+    }
+
+    let mut out = String::with_capacity(html.len());
+    // ⚠️⚠️ **记的是标签的起点，不是一个 bool** —— 因为要能"反悔"。
+    //      见循环后面那段：**扫到结尾还没遇上 `>` 的 `<`，它不是标签、是他手打的字**。
+    let mut tag_start: Option<usize> = None;
+    let chars: Vec<char> = html.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(start) = tag_start {
+            if c == '>' {
+                tag_start = None;
+                // 块级标签结束时补一个换行：`</p>` 让上下两段分开。
+                // 只认 `</p`（简单可靠），其余标签不补 —— 多补会把
+                // "一行里的加粗"变成两行，那才是真错。
+                if is_paragraph_end(&chars, i) {
+                    out.push('\n');
+                }
+                // `<br>` 自己就是换行（它不是"结束标签"）。
+                // ⚠️ 换行必须**等确认闭合了再补** —— 否则一个没闭合的
+                //    `<br` 会先补个 `\n`、再被原样补回来，凭空多一行。
+                if is_line_break(&chars, start) {
+                    out.push('\n');
+                }
+            } else if c == '<' {
+                // ⚠️ **标签里不该出现另一个 `<`**（HTML 常识）⇒ 说明前面那个 `<`
+                //    根本不是标签开头，是**他手打的尖括号**（`<p>2 < 3</p>` 里的 `< 3`）。
+                //    ⇒ 把这一段**原样吐出来**，再从当前这个 `<` 重新开始判。
+                //    前端 `htmlToPlainText()` 的正则 `<[^>]*>` 在这里也会保留 `< 3`
+                //    （它先跑 `</p>` → `\n` 那一条，把 `>` 先消费掉了）——
+                //    这里做的就是与它对齐。
+                out.extend(chars[start..i].iter());
+                tag_start = Some(i);
+            }
+            i += 1;
+            continue;
+        }
+        if c == '<' {
+            tag_start = Some(i);
+            i += 1;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+
+    // ⭐ **没闭合的 `<` 原样补回来** —— 这是"手打的尖括号"那条拍板（第 5 条）的落点。
+    //
+    //     日记本里写 `2 < 3` 是常事。如果状态机把 `<` 之后一直到结尾全吃掉，
+    //     `2 < 3` 的可见文字会变成 `2 `（**`3` 没了**）⇒ 字数少算、搜索索引里丢字。
+    //     ⚠️ 前端 `htmlToPlainText()` 用的是正则 `<[^>]*>`（**要求有闭合 `>`**），
+    //        所以它保留 `2 < 3`。两边口径必须一致（指令 2.1 明文要求）——
+    //        这里就是那处分歧的补法。
+    if let Some(start) = tag_start {
+        out.extend(&chars[start..]);
+    }
+
+    decode_entities(&out)
+}
+
+/// 位置 `i`（指向 `>`）前面是不是一个 `</p...>` 结束标签。
+fn is_paragraph_end(chars: &[char], i: usize) -> bool {
+    // 从 `i` 往前找 `<`，看中间是不是 `/p` 开头。
+    let mut j = i;
+    while j > 0 {
+        j -= 1;
+        if chars[j] == '<' {
+            let inner: String = chars[j + 1..i].iter().collect();
+            let inner = inner.trim().to_lowercase();
+            return inner == "p" || inner.starts_with("p ") || inner.starts_with("p/");
+        }
+        // 标签里不该出现另一个 `<`；超出合理长度就放弃。
+        if i - j > 20 {
+            return false;
+        }
+    }
+    false
+}
+
+/// 位置 `i`（指向 `<`）处是不是一个 `<br>` / `<br/>` / `<br />`。
+fn is_line_break(chars: &[char], i: usize) -> bool {
+    let end = (i + 6).min(chars.len());
+    let inner: String = chars[i + 1..end].iter().collect();
+    let inner = inner.trim().to_lowercase();
+    inner == "br" || inner == "br/" || inner.starts_with("br ") || inner.starts_with("br/")
+}
+
+/// 还原常见 HTML 实体。
+///
+/// ⚠️ 只做这几个**最常见**的，不做完整实体表 —— 完整表要几百行常量，
+///    而正文里会出现的实体就是这几个（其余字符都是 UTF-8 直接存的）。
+///    真遇到不认识的实体，**原样留着**比猜错好（至少用户看得见 `&times;`）。
+fn decode_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&nbsp;", " ")
 }
 
 // ---------------------------------------------------------------------------
@@ -1905,7 +2127,12 @@ impl Vault {
         tx.execute("DELETE FROM entry_fts_char WHERE rowid = ?1", params![id])?;
 
         if indexed {
-            let text = format!("{title} {content_md}");
+            // ⭐【P2-3】第 2 步：正文是 HTML ⇒ 索引里**只放看得见的文字**。
+            //    不剥标签的话搜 "p" 会命中每一篇（因为每篇都有 `<p>`），
+            //    而 `style` / `font` 之类的词也会污染结果 —— 用户搜不到想找的，
+            //    还完全不知道是为什么。
+            // ⚠️ 标题**不剥**：标题是纯文本（它从来就不是 HTML）。
+            let text = format!("{} {}", title, strip_html(content_md));
             tx.execute(
                 "INSERT INTO entry_fts (rowid, seg) VALUES (?1, ?2)",
                 params![id, self.seg.words(&text)],
@@ -3024,7 +3251,11 @@ impl Vault {
         drop(stmt);
 
         for (id, title, content) in &rows {
-            let text = format!("{title} {content}");
+            // ⭐【P2-3】第 2 步：与 `save_entry` 里那一处**必须一致** ——
+            //    否则"重建索引"会把 `<p>` 之类的标签灌进去，
+            //    于是"重建前搜得到、重建后搜出一堆无关的"（或者反过来）。
+            //    两处是同一条规则的第二个落点，改一处必须改另一处。
+            let text = format!("{} {}", title, strip_html(content));
             tx.execute(
                 "INSERT INTO entry_fts (rowid, seg) VALUES (?1, ?2)",
                 params![id, self.seg.words(&text)],
@@ -3967,7 +4198,14 @@ fn map_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
 /// 所以高亮/摘要应在**原文**上按查询词定位，这样展示的才是用户写下的真实文本。
 fn make_snippet(content: &str, query: &str) -> String {
     const WINDOW: usize = 40;
-    let chars: Vec<char> = content.chars().collect();
+    // ⚠️ **【P2-3】第 3 步：先取"看得见的文字"再开窗。**
+    //     正文现在可能是 `<p>今天<b>下雨</b>了</p>` —— 直接在原文上开窗，
+    //     摘要里就会夹着 `<b>` 这几个字（用户搜「下雨」却看到一堆标签）。
+    //     ⛔ **别在前端再剥一遍**（那是第二套实现）⇒ 从后端出去的摘要
+    //        **本来就是纯可见文字**，`SearchPanel.vue::parts()` 在它上面
+    //        `indexOf` 定位天然正确，那边一行都不用改。
+    let visible = strip_html(content);
+    let chars: Vec<char> = visible.chars().collect();
 
     // 找查询词在原文中的位置。整串找不到就退回第一个字符（至少给出上下文）。
     let needle: Vec<char> = query.chars().collect();
@@ -3998,9 +4236,9 @@ fn make_snippet(content: &str, query: &str) -> String {
 /// 正文**开头**的一小段，给「回顾」里每一条下面那一行用（P2-23）。
 ///
 /// ⚠️ **这是"取正文开头"的唯一实现。**
-///    P2-3（正文富文本）落地后正文里会多出**看不见的格式标记**，届时
-///    **只改这一个函数**：先取可见文字、再截。⛔ 别在 `StatsPanel.vue` 里
-///    自己 `slice()` —— 那就是第二套实现，P2-3 落地时必然只改一处。
+///    ✅ **【P2-3】第 3 步已落地**：正文里的格式标记在这里被剥掉
+///    （见函数体第一行的 `strip_html`），回顾页 / 筛选页自动跟着对。
+///    ⛔ 别在 `StatsPanel.vue` 里自己 `slice()` —— 那就是第二套实现。
 ///
 /// 与 `make_snippet` 的分工（两者用途不同，**别合并**）：
 ///   * `make_snippet` 是**搜索命中**用的，窗口要**围绕命中词**；
@@ -4010,7 +4248,12 @@ fn make_snippet(content: &str, query: &str) -> String {
 /// 全是空白（纯图片日记）时返回空串，由前端决定显示什么。
 fn make_preview(content: &str) -> String {
     const MAX: usize = 60;
-    let text = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    // ⚠️ **【P2-3】第 3 步：先取"看得见的文字"再截** ——
+    //     上面注释里那句"P2-3 落地后只改这一个函数：先取可见文字、再截"，
+    //     改的就是这一行。`recap()`（回顾页）与 `filter_entries()`
+    //     （筛选页第二行）都走这里 ⇒ 只改这一处。
+    let visible = strip_html(content);
+    let text = visible.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut out: String = text.chars().take(MAX).collect();
     if text.chars().count() > MAX {
         out.push('…');
@@ -4029,8 +4272,8 @@ fn make_preview(content: &str) -> String {
 /// ⚠️ **为什么这句判断放在后端**（P2-7 指令 §9-① 点名的地方）：
 ///    它其实是"从正文生成摘要"这件事的最后一小步 —— 取开头仍然只有
 ///    `make_preview()` 一份实现，这里只是把它的结果和"有几张图"合成一句话。
-///    P2-3（正文富文本）落地后正文里会多出**看不见的格式标记**，要改的仍然
-///    只是 `make_preview()`（先取可见文字再截），**本函数一行都不用动**。
+///    ✅ **【P2-3】第 3 步已落地**：正文里那层格式标记由 `make_preview()`
+///    剥掉（先取可见文字再截），**本函数一行都没动**。
 ///    反过来，如果让前端去判断"preview 是空的 ⇒ 大概是纯图片日记"，
 ///    P2-3 一改摘要语义，前端那句判断就悄悄失效了 —— 两个地方各理解一次
 ///    "什么叫没有正文"，必然只改一处。
@@ -4090,11 +4333,17 @@ fn is_valid_month(month: &str) -> bool {
 // Markdown 导出：渲染与文件名
 // ---------------------------------------------------------------------------
 
-/// 渲染一篇日记为 Markdown：YAML front-matter + 正文**原文**。
+/// 渲染一篇日记为 Markdown：YAML front-matter + 正文。
 ///
-/// ⚠️ `content_md` 一字不改地接在 `---` 后面。不要 trim、不要补空行、
-///    不要做任何"顺手美化" —— 验收标准就是"导出的 .md 打开后，
-///    中文、换行、Markdown 语法完全原样"。
+/// ⚠️ **【P2-3】第 2 步起，正文要经过一次 HTML → Markdown 的翻译**。
+///    在此之前正文是纯文本，原样接上去即可（"一字不改"）；
+///    现在正文是带格式的 HTML，原样输出会得到一堆 `<p>` `<strong>` ——
+///    那不是"可以丢进任何编辑器"的 Markdown，与本节开头的两条铁律直接冲突。
+///    翻译规则见 `html_to_markdown()`，取向仍然是"**宁可土、也要可读**"。
+///
+/// ⚠️ **旧日记（纯文本）走恒等路径**：`html_to_markdown()` 对不含 `<` 的输入
+///    原样返回，所以 3.12 及以前导出的 .md 与现在导出**逐字节相同** ——
+///    这一条有单测钉住（`render_entry_md_keeps_the_body_byte_for_byte`）。
 ///
 /// `mood` 用 `null` 显式写出而不是留空：留空的 `mood:` 在 YAML 里同样是
 /// null，但显式写出来，读的人（和解析器）都不必猜这是"没标"还是"忘了写"。
@@ -4122,8 +4371,88 @@ fn render_entry_md(
     out.push_str(&format!("tags: [{}]\n", quoted.join(", ")));
     out.push_str(&format!("word_count: {word_count}\n"));
     out.push_str("---\n");
-    out.push_str(content_md);
+    out.push_str(&html_to_markdown(content_md));
     out
+}
+
+/// 把正文 HTML 翻译成 Markdown —— **导出专用**。
+///
+/// 为什么导出要翻译、而落库不翻译：
+///   落库那份是"编辑器能读回来"的格式（HTML），导出那份是"别的软件能读"的
+///   格式（Markdown）。两者受众不同，不能共用一份存储 —— 这也是
+///   【P2-8】"改 Markdown 导出"要单独做一件的原因。
+///
+/// 翻译表（与 `utils/richText.ts::ALLOWED_TAGS` 一一对应，白名单只有 8 个）：
+///   - `<strong>` → `**…**`、`<em>` → `*…*`、`<u>` → `<u>…</u>`（Markdown 无下划线语法，保留标签）
+///   - `<s>` → `~~…~~`
+///   - `<p>` → 段落之间空一行
+///   - `<br>` → 行尾两个空格 ＋ 换行（Markdown 的硬换行）
+///   - `<span style="font-family:…">` → 丢掉样式、只留文字
+///     （Markdown 没有"字体"这个概念，硬塞只会污染文本）
+///   - `<mark>` → `==…==`（不是所有方言都认，但保留语义总比丢掉好）
+///
+/// ⚠️ 纯文本输入**原样返回**（本函数第一行就短路）——
+///    这是"旧日记导出逐字节不变"的保证。
+/// ⚠️ 实体还原走 `decode_entities()`（与字数统计共用一个实现）——
+///    否则导出里会出现 `&amp;` 这种只有 HTML 才认识的东西。
+fn html_to_markdown(html: &str) -> String {
+    if !html.contains('<') {
+        return html.to_string();
+    }
+    let s = html
+        .replace("<strong>", "**")
+        .replace("</strong>", "**")
+        .replace("<em>", "*")
+        .replace("</em>", "*")
+        .replace("<s>", "~~")
+        .replace("</s>", "~~")
+        .replace("<mark>", "==")
+        .replace("</mark>", "==")
+        // 硬换行：Markdown 里是"行尾两个空格 ＋ 换行"。
+        .replace("<br>", "  \n")
+        .replace("<br/>", "  \n")
+        .replace("<br />", "  \n");
+    // 段落：`</p>` 变空行（段落之间空一行才是 Markdown 的段落）。
+    // ⚠️ 开标签 `<p>` 直接删掉（不换行）—— 否则每段前面会多一个空行。
+    let s = s.replace("</p>", "\n\n").replace("<p>", "");
+    // ⚠️ `<u>` **特意保留原样**（Markdown 没有下划线语法，但 CommonMark
+    //    认这个标签），所以不能走 `strip_html`（它会把 `<u>` 一起吃掉）。
+    //    这里只处理"带属性的 span"和"其它任何残留标签"，
+    //    `<u>` / `</u>` 在下一步被显式跳过。
+    let s = strip_html_keep_underline(&s);
+    // 段末的换行收一下，避免文件尾拖一串空行。
+    let s = s.trim_end().to_string();
+    // 多空行的收口：最多留两个连续换行（＝一个空行），
+    // 否则 `</p>` 连排时会产出大片空白。
+    let mut out = String::with_capacity(s.len());
+    let mut nl = 0;
+    for c in s.chars() {
+        if c == '\n' {
+            nl += 1;
+            if nl <= 2 {
+                out.push(c);
+            }
+        } else {
+            nl = 0;
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `strip_html` 的变体：**特地把 `<u>` / `</u>` 保留**（导出时要用）。
+///
+/// 为什么要单独一个函数、而不是给 `strip_html` 加个参数：
+///   两者服务的目的不同 —— `strip_html` 是"数有多少字"（`<u>` 不是字，必须剥），
+///   这里是"翻译成 Markdown"（`<u>` 要留着，因为 Markdown 没别的写法）。
+///   混成一个函数加开关，将来必然有人用错开关。
+fn strip_html_keep_underline(html: &str) -> String {
+    // 先把 `<u>` / `</u>` 换成占位符，剥完再换回来 —— 简单且不会出错。
+    const OPEN: &str = "\u{1}U_OPEN\u{1}";
+    const CLOSE: &str = "\u{1}U_CLOSE\u{1}";
+    let masked = html.replace("<u>", OPEN).replace("</u>", CLOSE);
+    let stripped = strip_html(&masked);
+    stripped.replace(OPEN, "<u>").replace(CLOSE, "</u>")
 }
 
 /// 渲染 `index.md`：全部日记的日期 + 标题 + 链接。
@@ -4653,6 +4982,145 @@ mod tests {
         assert!(has_content("\n有内容\n"));
     }
 
+    // -----------------------------------------------------------------------
+    // 【P2-3】第 2 步：正文变成带格式的 HTML 之后的三处连带
+    // -----------------------------------------------------------------------
+
+    /// `count_words` 必须先剥标签 —— 否则加粗一次，字数就凭空多出十几个。
+    #[test]
+    fn count_words_strips_html_tags() {
+        // 纯文本：与改前完全一致（旧日记的口径不能变）。
+        assert_eq!(count_words("你好世界"), 4);
+        // 段落标签不是字。
+        assert_eq!(count_words("<p>你好世界</p>"), 4);
+        // 两个段落，共 8 个字。
+        assert_eq!(count_words("<p>你好世界</p><p>再见世界</p>"), 8);
+        // 行内标记不是字。
+        assert_eq!(count_words("<p>今天<strong>很好</strong></p>"), 4);
+        // ⭐ 带属性的 span（字体 / 字号）—— 最容易算错的一类。
+        //   `<span style="font-family: Songti SC;">` 里的每个字符都不该算字。
+        assert_eq!(
+            count_words(r#"<p><span style="font-family: &quot;Songti SC&quot;;">你好</span></p>"#),
+            2
+        );
+        // br 不是字。
+        assert_eq!(count_words("上<br>下"), 2);
+        // 实体算一个字符：`&amp;` 是 `&`。
+        assert_eq!(count_words("<p>a&amp;b</p>"), 3);
+        // 空段落 ＝ 0 字（不是"有几个标签就有几个字"）。
+        assert_eq!(count_words("<p></p>"), 0);
+        assert_eq!(count_words(""), 0);
+    }
+
+    /// `has_content` 必须"剥标签后"再判 —— 否则删空正文仍会被当成写过。
+    #[test]
+    fn has_content_ignores_html_only() {
+        // ⭐ 这是本步最关键的一条：编辑器清空后残留的就是这个。
+        assert!(!has_content("<p></p>"));
+        assert!(!has_content("<p><br></p>"));
+        assert!(!has_content("<p> </p>"));
+        assert!(!has_content("<p></p><p></p>"));
+        // ⚠️ `&nbsp;` 还原成**普通空格** ⇒ 判为"没有内容"，与 `<p> </p>` 一致。
+        //    这是刻意的：一个只有不换行空格的段落，渲染出来是空的一行，
+        //    它不算"写过一篇"。两侧（Rust / SQL）必须给同一个答案，
+        //    所以 SQL 里也有一句 `replace(..., '&nbsp;', ' ')` 与这里对齐。
+        assert!(!has_content("<p>&nbsp;</p>"));
+        // 有真文字 ⇒ 有内容。
+        assert!(has_content("<p>一</p>"));
+        assert!(has_content("<p></p><p>写了一个字</p>"));
+        // 纯文本（旧日记）照旧。
+        assert!(has_content("一"));
+        assert!(!has_content("   "));
+    }
+
+    /// SQL 侧的 `plain_text_sql_for` 与 Rust 侧在**合法输入**上结论一致。
+    ///
+    /// ⚠️ 这条测试拿真的 SQLite 跑 SQL，不是比字符串 —— 比字符串只能证明
+    ///    "生成的 SQL 长得对"，证明不了"它在 SQLite 里算出对的结果"。
+    #[test]
+    fn plain_text_sql_agrees_with_rust_on_legal_input() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE entry (id INTEGER PRIMARY KEY, content_md TEXT);
+             CREATE TABLE attachment (entry_id INTEGER);",
+        )
+        .unwrap();
+
+        let cases: Vec<&str> = vec![
+            "",
+            "   ",
+            "<p></p>",
+            "<p><br></p>",
+            "<p> </p>",
+            "<p>&nbsp;</p>",
+            "一",
+            "  有内容  ",
+            "<p>一</p>",
+            "<p></p><p>写了一个字</p>",
+            "<p>今天<strong>很好</strong></p>",
+            r#"<p><span style="font-size: 1.25em;">大字</span></p>"#,
+            r#"<p><span style="font-size: 1.25em;"></span></p>"#,
+        ];
+
+        for c in cases {
+            conn.execute("DELETE FROM entry", []).unwrap();
+            conn.execute("INSERT INTO entry (id, content_md) VALUES (1, ?1)", params![c])
+                .unwrap();
+            let sql = format!("SELECT {} FROM entry WHERE id = 1", plain_text_sql_for("entry"));
+            let sql_says: i64 = conn.query_row(&sql, [], |r| r.get(0)).unwrap();
+            let rust_says = has_content(c);
+            assert_eq!(
+                sql_says != 0,
+                rust_says,
+                "SQL 与 Rust 对 {c:?} 结论不一致（SQL={sql_says}, Rust={rust_says}）"
+            );
+        }
+    }
+
+    /// 导出时 HTML 要翻译成 Markdown。
+    #[test]
+    fn html_to_markdown_translates_marks() {
+        assert_eq!(html_to_markdown("纯文本原样"), "纯文本原样");
+        assert_eq!(html_to_markdown("<p>一段话</p>"), "一段话");
+        assert_eq!(
+            html_to_markdown("<p>第一段</p><p>第二段</p>"),
+            "第一段\n\n第二段"
+        );
+        assert_eq!(html_to_markdown("<p>今天<strong>很好</strong></p>"), "今天**很好**");
+        assert_eq!(html_to_markdown("<p><em>斜</em></p>"), "*斜*");
+        assert_eq!(html_to_markdown("<p><s>划掉</s></p>"), "~~划掉~~");
+        assert_eq!(html_to_markdown("<p><u>下划线</u></p>"), "<u>下划线</u>");
+        assert_eq!(html_to_markdown("上<br>下"), "上  \n下");
+        // 字体 / 字号 span：**丢掉样式、只留文字**（Markdown 没有字体概念）。
+        assert_eq!(
+            html_to_markdown(r#"<p><span style="font-size: 1.25em;">大字</span></p>"#),
+            "大字"
+        );
+        // 实体还原。
+        assert_eq!(html_to_markdown("<p>a&amp;b</p>"), "a&b");
+        // 空段落不产出多余空行。
+        assert_eq!(html_to_markdown("<p></p>"), "");
+    }
+
+    /// ⭐ 旧日记（纯文本）导出必须**逐字节不变** —— 这是【P2-3】拍板第 2 条的验收。
+    ///
+    /// 用一段"故意难缠"的旧正文：软换行、行首缩进、Markdown 语法、尾随空格齐上。
+    #[test]
+    fn render_entry_md_keeps_plain_text_byte_for_byte() {
+        let old_body = "第一行\n  缩进的第二行\n\n**已经是 Markdown 了**\n- 列表项\n";
+        let rendered = render_entry_md(
+            "2026-09-18",
+            "标题",
+            Some(3),
+            &["旅行".into()],
+            18,
+            old_body,
+        );
+        // 正文部分必须与原文**逐字节相同**。
+        let body = rendered.split("---\n").nth(2).unwrap();
+        assert_eq!(body, old_body, "旧日记（纯文本）导出必须逐字节不变");
+    }
+
     #[test]
     fn tag_names_are_trimmed_deduped_and_length_checked() {
         // 清洗是纯函数，先在这里把规则钉死；数据库那一层的行为在
@@ -4740,6 +5208,52 @@ mod tests {
         // 摘要不能 panic，要给出一段上下文。
         let s = make_snippet("今天去爬山了", "牛肉");
         assert!(!s.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // 【P2-3】第 3 步：剥掉格式标记之后，摘要 / 字数 / 索引才是"看得见的文字"。
+    // -----------------------------------------------------------------------
+
+    /// ⭐ **前后端口径一致的锚点样例**（指令 2.1 明文要求"同一个测试样例两份都过"）。
+    ///
+    /// 手打的尖括号是**用户真会写的东西**（`2 < 3`、`<- 箭头`）。
+    /// 前端 `htmlToPlainText()` 用的是正则 `<[^>]*>` —— **要求有闭合 `>`** ⇒
+    /// 没闭合的 `<` 原样保留。后端必须**同样保留**，否则字数会少算、
+    /// 搜索索引里会丢字（搜都搜不到）。
+    ///
+    /// ⚠️ 踩过：状态机早先是"进了标签就一直吃到 `>` 或结尾"⇒ `2 < 3` 被吃成 `2 `。
+    /// ⚠️ 用 `.trim()` 比：换行补在哪一头两边不必一致，**字是不是一个不少**才要紧。
+    #[test]
+    fn strip_html_keeps_unclosed_angle_bracket() {
+        assert_eq!(strip_html("2 < 3"), "2 < 3");
+        assert_eq!(strip_html("a < b < c"), "a < b < c");
+        assert_eq!(strip_html("<- 箭头"), "<- 箭头");
+        // 段落里的手打尖括号：后面还跟着真标签时也不许丢字。
+        assert_eq!(strip_html("<p>2 < 3</p>").trim(), "2 < 3");
+        // 真标签照剥不误（标签本身一个字都不留）。
+        assert_eq!(strip_html("<p>今天<b>下雨</b>了</p>").trim(), "今天下雨了");
+    }
+
+    /// ⭐ 搜索摘要必须是"看得见的文字" —— 用户搜「下雨」不该看到 `<b>下雨</b>`。
+    ///
+    /// 前端 `SearchPanel.vue::parts()` 直接在这个摘要上 `indexOf` 定位，
+    /// ⇒ 摘要干净了，那边一行都不用改（⛔ 别在前端再剥一遍）。
+    #[test]
+    fn snippet_strips_format_tags() {
+        let s = make_snippet("<p>今天<b>下雨</b>了，只好待在家里看书。</p>", "下雨");
+        assert!(s.contains("下雨"), "摘要必须含命中词: {s}");
+        assert!(!s.contains('<'), "摘要里不许出现标签: {s}");
+        assert!(!s.contains('>'), "摘要里不许出现标签: {s}");
+    }
+
+    /// ⭐ 回顾页 / 筛选页第二行那段"正文开头" —— 同样不许露标签。
+    #[test]
+    fn preview_strips_format_tags() {
+        assert_eq!(make_preview("<p>今天<b>下雨</b>了</p>"), "今天下雨了");
+        // ⚠️ 旧日记（纯文本）必须**一个字不变** —— 这是拍板第 2 条。
+        assert_eq!(make_preview("今天下雨了"), "今天下雨了");
+        // 纯图片日记：正文空 ⇒ 空串（`make_preview_line` 会换成"有 N 张图片"）。
+        assert_eq!(make_preview("<p></p>"), "");
     }
 
     /// v1 -> v2 的真实升级路径。

@@ -45,9 +45,20 @@ import {
   type TagStat,
 } from "../api";
 import OnThisDay from "./OnThisDay.vue";
+import EditorToolbar from "./EditorToolbar.vue";
 import { humanDate, todayKey } from "../utils/date";
 import { stripAttachmentImages } from "../utils/imageMarkdown";
 import { visibleText } from "../utils/text";
+import {
+  htmlHasContent,
+  plainTextToHtml,
+  sanitizeHtml,
+} from "../utils/richText";
+import { useEditor, EditorContent } from "@tiptap/vue-3";
+import StarterKit from "@tiptap/starter-kit";
+import { FontFamily, FontSize, TextStyle } from "@tiptap/extension-text-style";
+import Underline from "@tiptap/extension-underline";
+import Placeholder from "@tiptap/extension-placeholder";
 
 const props = defineProps<{
   date: string;
@@ -186,6 +197,231 @@ const loading = ref(false);
 const errorText = ref("");
 const title = ref("");
 const content = ref("");
+
+/**
+ * ⭐【P2-3】第 2 步：正文本体换成了 Tiptap 富文本编辑器。
+ *
+ * 与旧 `textarea` 的三条关键差异（每一条都决定了下面的写法）：
+ *
+ *   1. **两个方向的数据流要分清**：
+ *      · 编辑器 → `content`（用户打字）＝ 走 `onUpdate`（唯一的出口）；
+ *      · `content` → 编辑器（换日期 / 恢复备份读完库）＝ 走 `setContent()`。
+ *      ⛔ **绝不能写成 `v-model` 式的双向绑定** —— 那会在用户每次打字时
+ *         把"刚打完的 HTML"再塞回编辑器，光标会跳到开头（经典事故）。
+ *
+ *   2. **`content` 存的仍然是"会落库的那个串"**：`onUpdate` 里先过
+ *      `sanitizeHtml()` 再写进 `content`，所以 `content.value` 就是
+ *      **可以直接落库的东西**，`flush()` 一个字都不用改。
+ *
+ *   3. **锁定态用 `editable` 开关**，不是 `readonly` 属性：
+ *      Tiptap 的 `setEditable(false)` 会让内容**仍可选中、可滚动、可复制** ——
+ *      这正是旧 textarea 用 `readonly`（而非 `disabled`）的那个理由。
+ */
+const editor = useEditor({
+  content: "",
+  editable: false,
+  extensions: [
+    // StarterKit 自带粗体 / 斜体 / 删除线 / 段落 / 换行 / 以及一堆快捷键，
+    // ⛔ 但它**不含**下划线与 TextStyle —— 那两个单独加（见下）。
+    //
+    // ⚠️ 刻意**关掉** StarterKit 里的这几个扩展（本项目不该出现它们）：
+    //    · heading（标题）—— 日记不需要标题层级，且会撑乱行高；
+    //    · codeBlock / code —— 正文不该有代码块（要贴代码用等宽字体即可）；
+    //    · blockquote（引用）—— 同上，暂不需要；
+    //    · horizontalRule（分割线）—— 与"段落之间空一行"重复。
+    //    关掉它们是**减功能**，为的是让白名单小而明确（见 utils/richText.ts）。
+    StarterKit.configure({
+      heading: false,
+      codeBlock: false,
+      blockquote: false,
+      horizontalRule: false,
+      // ⚠️ `code` 是 StarterKit 里的行内代码标记，同关。
+      code: false,
+    }),
+    // 下划线（U 按钮）。
+    Underline,
+    // TextStyle + FontFamily + FontSize：字体 / 字号两个下拉的载体。
+    // ⚠️ 它们渲染出来的就是 `<span style="font-family: ...">`，
+    //    正好命中白名单里 `span` 允许的 `style`。
+    TextStyle,
+    FontFamily,
+    FontSize,
+    // 空内容时的"今天发生了什么…"占位。
+    // ⚠️ 它渲染的是 `::before` 伪元素 —— **不是真内容**，
+    //    所以不占字符、不算字、不会被存进库（旧 textarea 的 placeholder 同理）。
+    // ⚠️⚠️ **必须显式配 `emptyEditorClass`** —— Tiptap 3 默认**不加**任何类名，
+    //     不配的话 CSS 里的 `.is-editor-empty::before` 永远匹配不到，
+    //     表现为"占位文字根本不出现"（踩过，界面验证 B.7 抓到的）。
+    //     类名要和 EditorPane 的样式中那条选择器**完全一致**。
+    // ⚠️⚠️ **还必须配 `showOnlyWhenEditable: false`** —— 默认 true 时，
+    //     "未解锁（锁定态）的空日记"一个占位都不给；而本软件**每次 load()
+    //     都先 lockAllEntries()**，等于"空日记几乎永远处于锁定态"，
+    //     占位就永远不出现。旧 textarea 是 `readonly`（不是 disabled），
+    //     `readonly` 的占位照样显示 —— 要对齐旧行为就得关掉这个开关。
+    Placeholder.configure({
+      placeholder: "今天发生了什么…",
+      emptyEditorClass: "is-editor-empty",
+      showOnlyWhenEditable: false,
+    }),
+  ],
+  onUpdate: ({ editor: ed }) => {
+    // ⚠️ 组字期间（拼音还没上屏）**不往外抛**：中途的字母会让字数乱跳、
+    //    也可能把半成品存进去。等 `compositionend` 之后 Tiptap 会再抛一次。
+    if (composing) return;
+    // 洗过再进 content —— 于是 content 永远是"可以直接落库"的那个串。
+    content.value = sanitizeHtml(ed.getHTML());
+    scheduleSave();
+  },
+  onSelectionUpdate: () => {
+    // 光标一动，工具栏那几个按钮的高亮要跟着变（B 亮不亮看光标处有没有粗体）。
+    refreshMarks();
+    // ⚠️ 字体 / 字号两个下拉**同样**要跟着光标走 —— 只刷新 B/I/U/S 的话，
+    //    把光标移进一段宋体字里，下拉还停在「默认」，读出来的就是假的。
+    //    （它俩走 `getAttributes("textStyle")`，和 B/I/U 的 `isActive` 一样是"读回"。）
+    refreshTextStyle();
+  },
+  onTransaction: () => {
+    // 同上：任何一步编辑（不只是打字）都可能改变格式，统一在这里同步。
+    refreshMarks();
+    refreshTextStyle();
+  },
+});
+
+/**
+ * 工具栏的四个开关状态（光标处有没有 B / I / U / S）。
+ *
+ * ⚠️ 它在 `onSelectionUpdate` / `onTransaction` 里被刷新，是**从编辑器读回状态**，
+ *    不是"按钮自己记住自己按过"—— 前者才不会出现"光标移开按钮还亮着"。
+ */
+const markBold = ref(false);
+const markItalic = ref(false);
+const markUnderline = ref(false);
+const markStrike = ref(false);
+
+function refreshMarks() {
+  const ed = editor.value;
+  if (!ed) return;
+  markBold.value = ed.isActive("bold");
+  markItalic.value = ed.isActive("italic");
+  markUnderline.value = ed.isActive("underline");
+  markStrike.value = ed.isActive("strike");
+}
+
+/** 字体 / 字号下拉的当前档位（同上，从编辑器读回，不是自己记）。 */
+const curFont = ref("");
+const curSize = ref("");
+
+/**
+ * 把 `style` 里的 `font-family` 反查成下拉的档位键。
+ *
+ * ⚠️ 存进去的是完整字体栈（见 EditorToolbar 的 FONTS），所以这里
+ *    不能直接比字符串 —— 要先取第一段（`"Songti SC"` 这类）再比。
+ *    认不出来就退回"默认"档，绝不猜。
+ */
+function fontKeyOf(stack: string): string {
+  if (!stack) return "";
+  const first = stack.split(",")[0].trim().replace(/^["']|["']$/g, "").toLowerCase();
+  if (first.includes("songti") || first.includes("simsun")) return "song";
+  if (first.includes("heiti") || first.includes("simhei")) return "hei";
+  if (first.includes("kaiti") || first.includes("stkaiti")) return "kai";
+  return "";
+}
+
+/** 同上，把 `font-size` 反查成档位（存的是 em，所以直接比）。 */
+function sizeKeyOf(size: string): string {
+  if (!size) return "";
+  if (size.startsWith("1.25")) return "l";
+  if (size.startsWith("0.875")) return "s";
+  return "";
+}
+
+/** 从编辑器读回字体 / 字号档位（在 marks 刷新时一起做）。 */
+function refreshTextStyle() {
+  const ed = editor.value;
+  if (!ed) return;
+  const attrs = ed.getAttributes("textStyle") as Record<string, string>;
+  curFont.value = fontKeyOf(attrs?.fontFamily ?? "");
+  curSize.value = sizeKeyOf(attrs?.fontSize ?? "");
+}
+
+/**
+ * 工具栏点了 B / I / U / S / 清除格式。
+ *
+ * ⚠️ 全部走 `chain().focus()` —— 不先 focus 的话，命令会作用在
+ *    "上一个选区"上（因为点按钮时焦点已经跑到了按钮上），
+ *    表现为"点了加粗没反应"。这个坑非常隐蔽。
+ */
+function onFormat(kind: string) {
+  const ed = editor.value;
+  if (!ed || locked.value) return;
+  const chain = ed.chain().focus();
+  switch (kind) {
+    case "bold":
+      chain.toggleBold().run();
+      break;
+    case "italic":
+      chain.toggleItalic().run();
+      break;
+    case "underline":
+      chain.toggleUnderline().run();
+      break;
+    case "strike":
+      chain.toggleStrike().run();
+      break;
+    case "clear":
+      // 清除格式：把选区（没有选区就是整个当前块）的标记全摘掉，
+      // **文字一个不删** —— 用户点"清除格式"是想去掉样子，不是想丢字。
+      chain
+        .unsetAllMarks()
+        .setFontFamily("")
+        .setFontSize("")
+        .run();
+      // `setFontFamily("")` 会留下一个空的 `<span style="">`，
+      // 洗一遍把它清掉（sanitizeHtml 里空 style 不输出）。
+      content.value = sanitizeHtml(ed.getHTML());
+      scheduleSave();
+      break;
+  }
+  refreshMarks();
+  refreshTextStyle();
+}
+
+/** 工具栏换了字体（`stack` 是完整字体栈；空串 ＝ 跟随全局默认）。 */
+function onFont(stack: string) {
+  const ed = editor.value;
+  if (!ed || locked.value) return;
+  if (stack) ed.chain().focus().setFontFamily(stack).run();
+  else ed.chain().focus().unsetFontFamily().run();
+  content.value = sanitizeHtml(ed.getHTML());
+  scheduleSave();
+  refreshTextStyle();
+}
+
+/** 工具栏换了字号（`size` 是 em 倍数；空串 ＝ 跟随全局默认）。 */
+function onSize(size: string) {
+  const ed = editor.value;
+  if (!ed || locked.value) return;
+  if (size) ed.chain().focus().setFontSize(size).run();
+  else ed.chain().focus().unsetFontSize().run();
+  content.value = sanitizeHtml(ed.getHTML());
+  scheduleSave();
+  refreshTextStyle();
+}
+
+/**
+ * 把 `content` 里的 HTML 灌进编辑器。
+ *
+ * ⚠️ **只在"从库里读回来"和"恢复备份"时调用**，⛔ 绝不在用户打字时调用
+ *    （那会把光标顶回开头）。调用点只有 `load()` 和 restoreToken 的 watch。
+ * ⚠️ `emitUpdate: false` 是必须的 —— 否则这次灌入会反过来触发 `onUpdate`，
+ *    把 `scheduleSave()` 又跑一遍、凭空制造一次"未保存"。
+ */
+function pushContentToEditor(html: string) {
+  const ed = editor.value;
+  if (!ed) return;
+  // 纯文本（旧日记）先转成段落 HTML；已经是 HTML 的过一遍白名单。
+  ed.commands.setContent(plainTextToHtml(html), { emitUpdate: false });
+}
 /** '' | 'pending' | 'saving' | 'saved' | 'error' */
 const saveState = ref<"" | "pending" | "saving" | "saved" | "error">("");
 /** 锁定：正文只读。注意锁的是**能否修改**，不是显示方式。 */
@@ -391,6 +627,59 @@ let saveTimer: number | null = null;
 let dirty = false;
 
 /**
+ * ⭐【P2-3】第 2 步：锁定 ↔ 编辑器可编辑状态，**单向同步**。
+ *
+ * 旧 textarea 靠 `:readonly="locked"` 一条绑定就完事；Tiptap 没这个属性，
+ * 必须显式调 `setEditable()`。这个 watch 就是那一条绑定在新架构下的对应物。
+ *
+ * ⚠️ 为什么要有 `immediate: true`：`useEditor` 起手是 `editable: false`
+ *    （**故意**的兜底 —— 万一同步漏了，默认是"锁着"，绝不会出现"该锁却可改"）。
+ *    若某天进编辑器时 `locked` 本来就是 false，没有 immediate 就会一直锁着，
+ *    表现为"打开日记打不了字"。
+ * ⚠️ Tiptap 的 `setEditable(false)` **不会**让内容失去选中 / 滚动 / 复制能力 ——
+ *    这正是旧代码坚持用 `readonly` 而不是 `disabled` 的那个理由，行为一致。
+ */
+watch(locked, (v) => {
+  // ⚠️⚠️ **第二个参数必须显式给 `false`** —— `setEditable(v, emitUpdate = true)`
+  //      的 `emitUpdate` **默认是 true**，会抛一次 `update` 事件！
+  //      后果（踩过，界面验证 K.7 抓的）：
+  //        · `onUpdate` 被这次"假更新"唤醒 ⇒ `content.value` 被写成
+  //          编辑器规范化后的 HTML ⇒ 标记为"有改动" ⇒ 紧接着落库；
+  //        · 于是**打开一篇旧的纯文本日记、点一下解锁/上锁，它就悄悄被改存成
+  //          HTML 了** —— 直接违反"旧日记原样显示、不受影响"这条硬验收；
+  //        · 顺带每次解锁都白闪一遍"未保存…/已保存"。
+  //      解锁/上锁**没有改任何字**，不该触发任何保存。
+  editor.value?.setEditable(!v, false);
+}, { immediate: true });
+
+/**
+ * ⭐【P2-3】第 2 步：编辑器实例就绪时，**立刻按当前的 `locked` 同步一次**。
+ *
+ * ⚠️ 为什么上面那条 `immediate: true` 不够：`useEditor` 是在组件**挂载时**
+ *    才创建实例的（`@tiptap/vue-3` 内部走 `onMounted`），所以上面那条 watch
+ *    的"立即执行"发生在**实例还不存在**的时候 —— `editor.value` 是 `undefined`，
+ *    那一次同步是空跑。之后它只在 `locked` **变化**时才再跑。
+ * ⚠️ 于是会漏掉这一种情况：`locked` 从头到尾都是 `false`（例如用户在设置里
+ *    关掉了「离开日记时自动锁定」）⇒ watch 一次都不触发 ⇒ 编辑器**永远停在
+ *    `useEditor` 起手的 `editable: false`** ⇒ 表现为"打开日记打不了字"。
+ * ⚠️ 挂在 `editor` 上就不会漏：实例一出现就补一次同步。
+ */
+watch(editor, (ed) => {
+  // ⚠️ 同样要 `false`（理由见上面 watch(locked) 里那段）—— 这里也是"只改
+  //    能不能编辑、没改任何字"，绝不能借机抛一次 update 去触发保存。
+  if (ed) ed.setEditable(!locked.value, false);
+}, { immediate: true });
+
+/**
+ * ⭐【P2-3】第 2 步：把组字状态告诉编辑器。
+ *
+ * 旧写法是在 textarea 上挂 `@compositionstart/@compositionend`；
+ * 现在编辑器的 DOM 由 Tiptap 生成，事件的挂法也归它管 ——
+ * 所以改成**监听编辑器自己的组字事件**（下面那两条 `editor.value.on(...)`），
+ * 而不是在模板上挂监听器。
+ */
+
+/**
  * 后端**最后一次确认**的标签状态。
  *
  * 用来判断"还需不需要再提交一次"（`tags` 与它不一致 = 有未落库的改动），
@@ -413,7 +702,7 @@ let tagInflight = false;
  * 刻意只留正文和附件、不看标题：只打了标题没写正文不算写完一篇。
  */
 function hasContent(): boolean {
-  return content.value.trim().length > 0 || attachments.value.length > 0;
+  return htmlHasContent(content.value) || attachments.value.length > 0;
 }
 
 /** 数据库里是否已经存在这一行。 */
@@ -554,6 +843,12 @@ async function load() {
     const rawBody = e.content_md;
     content.value = stripAttachmentImages(rawBody);
     const legacyCleaned = content.value !== rawBody;
+    // ⭐【P2-3】第 2 步：把读到的正文灌进富文本编辑器。
+    // ⚠️ 顺序不能反：`pushContentToEditor` 里 `emitUpdate: false` 保证了
+    //    这一步**不会**触发 `onUpdate`，所以下面的 `dirty = false` 是安全的。
+    // ⚠️ 必须在 `locked.value` 定下来**之后**再做 —— 因为灌入时编辑器要
+    //    处于正确的可编辑状态（见下面 watch(locked) 的另一半）。
+    pushContentToEditor(content.value);
     mood.value = e.mood;
     // 先清空再读：读失败时宁可"看不到标签"，也不能把上一天的标签
     // 留在屏幕上冒充这一天的（那会让用户以为标签串了）。
@@ -1242,41 +1537,71 @@ function onTagKeydown(ev: KeyboardEvent) {
   }
 }
 
-/** 组字开始/结束。结束时补一次保存，把最终文本落库。 */
-function onCompositionStart() {
-  composing = true;
-}
-function onCompositionEnd() {
-  composing = false;
-  scheduleSave();
-}
-
 /**
- * 文本域里按下 Tab 时插入缩进而不是移动焦点。
- * 日记里写代码块或列表时很需要。
+ * ⭐【P2-3】第 2 步：组字（输入法拼音）与手动快捷键。
+ *
+ * 旧写法在模板上挂 `@compositionstart/@compositionend/@keydown`；
+ * 现在这些事件发生在 Tiptap 自己生成的 DOM 上，所以改成：
+ *   · 组字 → 监听编辑器实例的 `compositionstart` / `compositionend`（见下）；
+ *   · Tab / Ctrl+S → 用 Tiptap 的 `addKeyboardShortcuts` 插件（在编辑器
+ *     配置里加，见 `editor` 的 extensions 之后那段 `onCreate`）。
+ *
+ * ⚠️ 为什么组字必须接管：中文打字时 `onUpdate` 会在拼音还没上屏时反复触发。
+ *    不挡的话，字数会跟着拼音跳（"今天"打成 4 个字）、而且中途内容会被存进去。
+ *    这是**从旧 textarea 时代就有的规则**，换了编辑器不能丢。
  */
-function onKeydown(ev: KeyboardEvent) {
-  // 只读输入框仍然会触发 keydown。不挡住的话，在锁定状态下按 Tab 会悄悄改掉
-  // 内存里的 content —— 界面上看不见变化，解锁后那次编辑却会被保存进去。
-  if (locked.value) return;
-  if (ev.key === "Tab") {
-    ev.preventDefault();
-    const el = ev.target as HTMLTextAreaElement;
-    const start = el.selectionStart;
-    const end = el.selectionEnd;
-    content.value =
-      content.value.slice(0, start) + "  " + content.value.slice(end);
-    void nextTick(() => {
-      el.selectionStart = el.selectionEnd = start + 2;
+
+/** 编辑器就绪后立刻挂上键盘 / 组字事件。 */
+watch(
+  editor,
+  (ed) => {
+    if (!ed) return;
+
+    // 组字开始 / 结束。结束后补一次保存，把最终上屏的文字落库。
+    //
+    // ⚠️ **不能**用 `ed.on("compositionstart", ...)` —— Tiptap 的事件表里
+    //    没有这一对（它只转发编辑类事件）。而组字事件是**浏览器原生事件**，
+    //    发生在 ProseMirror 那个 DOM 节点上，所以直接监听那个节点。
+    //    这是"换了编辑器但不能丢旧规则"的落点：中文拼音期间绝不能保存。
+    const dom = ed.view.dom;
+    dom.addEventListener("compositionstart", () => {
+      composing = true;
     });
-    scheduleSave();
-  }
-  // Ctrl+S 手动保存（虽然自动保存已覆盖，但符合直觉）
-  if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s") {
-    ev.preventDefault();
-    void flush();
-  }
-}
+    dom.addEventListener("compositionend", () => {
+      composing = false;
+      // ⚠️ 此刻编辑器里的内容才是"最终文字"，而 `onUpdate` 在组字期间被挡掉了
+      //    ⇒ 必须在这里补一次同步 + 保存，否则最后一个词会**留在内存里不落库**。
+      //    注意用 `getHTML()` 现读，不要用 `content.value`（它还是组字前的旧值）。
+      content.value = sanitizeHtml(ed.getHTML());
+      scheduleSave();
+    });
+
+    // Tab 与 Ctrl+S。用 Tiptap 的 `handleKeyDown` 而不是模板监听器 ——
+    // 事件发生在 Tiptap 生成的 DOM 上，挂模板监听会被它的内部处理抢先。
+    ed.setOptions({
+      editorProps: {
+        handleKeyDown: (_view, ev) => {
+          // Tab 插两个空格而不是移走焦点：日记里写缩进或列对齐时需要。
+          // ⚠️ 走 `insertContent` 而不是手改字符串 —— 这样才进 undo 栈（撤销得掉）。
+          // ⚠️ 锁定态下 Tiptap 的 `editable=false` 已让按键不生效，这里不必再判。
+          if (ev.key === "Tab") {
+            ev.preventDefault();
+            ed.commands.insertContent("  ");
+            return true;
+          }
+          // Ctrl+S 手动保存（自动保存已覆盖，但符合直觉）。
+          if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s") {
+            ev.preventDefault();
+            void flush();
+            return true;
+          }
+          return false;
+        },
+      },
+    });
+  },
+  { immediate: true }
+);
 
 const saveLabel = computed(() => {
   switch (saveState.value) {
@@ -1733,27 +2058,41 @@ defineExpose({ flushNow: () => flush() });
       <p v-if="imageError" class="error">{{ imageError }}</p>
 
       <!--
-        锁定与编辑共用同一个 textarea，**刻意不切换成渲染视图**。
-        看得见的就是将要保存的原文：换行、空格、缩进全部原样，
-        所以"锁定"不会改变排版。只读靠 readonly（不是 disabled）——
-        disabled 的输入框不能选中、不能滚动，想复制一段都做不到。
+        【P2-3】第 2 步：正文＝一张纸（上沿贴工具栏，下面是可写的正文）。
+        ⚠️ 纸面（背景 / 边框 / 圆角）挂在**这个外层容器**上，不在编辑器内部 ——
+           因为 Tiptap 生成的 DOM 结构不受我们控制，样式挂进去容易打架。
+        ⚠️ 拖动图片时的高亮（dragging）也挂在纸面上，与第 1 步同一套观感。
       -->
-      <textarea
-        v-model="content"
-        class="content-input"
+      <div
+        class="paper"
         :class="{ locked, dragging }"
-        placeholder="今天发生了什么…"
-        spellcheck="false"
-        :readonly="locked"
         @mousedown="onContentMouseDown"
-        @compositionstart="onCompositionStart"
-        @compositionend="onCompositionEnd"
-        @keydown="onKeydown"
         @dragover="onDragOver"
         @dragleave="onDragLeave"
         @drop="onDrop"
         @paste="onPaste"
-      />
+      >
+        <EditorToolbar
+          :font="curFont"
+          :size="curSize"
+          :bold="markBold"
+          :italic="markItalic"
+          :underline="markUnderline"
+          :strike="markStrike"
+          :disabled="locked"
+          @format="onFormat"
+          @font="onFont"
+          @size="onSize"
+        />
+        <!--
+          编辑器本体（Tiptap）。
+          ⚠️ 锁定 / 解锁走 `editor.setEditable()`（见 watch(locked)），
+             ⛔ 不在这里写 `:readonly` —— Tiptap 没这个属性。
+          ⚠️ 没有内容时显示占位文字（由 CSS 的 :empty::before 做，
+             见 .rich-body 那条）—— 这样占位**不占正文的字符**。
+        -->
+        <EditorContent class="rich-body" :editor="editor" />
+      </div>
     </template>
 
     <!--
@@ -2258,42 +2597,91 @@ defineExpose({ flushNow: () => flush() });
 }
 
 /*
-  ⭐ 【P2-3】第 1 步：正文从"直接铺在背景上"变成**一张纸**。
-     - 字体：等宽 `--mono` → 阅读字体 `--reading-font`（中英混排不再跳）；
-     - 字号 15px → 16px、行高 1.9 保持；
-     - 纸面：`--surface` 底 ＋ 圆角 ＋ 内边距。
-  ⚠️ **后端一行没动、存储格式一个字没动** —— 这一步只改"字"和"纸"。
-  ⚠️ 纸面用 padding 撑出来，所以原来那个 `padding: 0` 要去掉；
-     但它仍在 `.editor` 的限宽 padding 里面 ⇒ 限的是"纸的宽度"，不是"纸上的字"。
-  ⚠️ `min-height: 0` ＋ `flex: 1` 保持 —— 正文要能自己滚动、不吃掉下方缩略图条。
+  ⭐ 【P2-3】第 2 步：正文＝**一张纸**（上沿贴工具栏、下面是可写的正文区）。
+     - 第 1 步定下的"纸"（`--surface` 底 ＋ 细边框 ＋ 10px 圆角）保留；
+     - 新增：上沿接工具栏 ⇒ 顶部圆角交给工具栏（`.toolbar` 有自己的
+       `border-radius: 10px 10px 0 0`），这里只保留下方两个圆角；
+     - 整块变成 `overflow: hidden` 的容器，让工具栏与正文共享同一个圆角轮廓。
+  ⚠️ 纸面外壳（本类）**不接收键盘事件** —— 真正的编辑区是它里面的
+     `.rich-body`（Tiptap 生成的 ProseMirror 根节点）。所以字体 / 行高 /
+     内边距写在 `.rich-body` 上，本类只管"壳"。
+  ⚠️ `flex: 1` ＋ `min-height: 0` 保持 —— 纸要能自己长高、且不吃掉下方缩略图条。
+  ⚠️ 之所以把纸面从 `.content-input` 挪到这里的 `.paper`：Tiptap 生成的 DOM
+     结构不受我们控制（外面会是 `.tiptap` → `.ProseMirror`），样式挂在
+     textarea 时代的那个类上会找不到落点。改挂**我们自己写的壳**更稳。
 */
-.content-input {
+.paper {
   flex: 1;
   width: 100%;
   min-height: 0;
-  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+/*
+  正文的编辑区（Tiptap / ProseMirror 的根）。
+  ⭐ 这里就是第 1 步那些排版属性**原地搬家**过来的地方：
+     阅读字体 / 16px / 行高 1.9 / 内边距。
+  ⚠️ 内边距从原来的 20px 24px 改成 18px 24px 20px —— 因为上面多了工具栏，
+     再顶 20px 会显得正文被推得太低。
+  ⚠️ 必须自己写 `font-family`：Tiptap 默认会给 `.ProseMirror` 一套自己的字体。
+     写 `var(--reading-font)` 保证第 1 步的字体决策在这里仍然生效。
+  ⚠️ `outline: none` 去掉聚焦时的蓝框（Tiptap 会加），改成靠光标本身表达焦点。
+*/
+.rich-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.rich-body :deep(.tiptap) {
+  min-height: 100%;
+  padding: 18px 24px 20px;
   font-family: var(--reading-font);
   font-size: 16px;
   line-height: 1.9;
   color: var(--text-1);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 10px;
   outline: none;
-  resize: none;
   tab-size: 2;
+  /* 中文换行规则：优先在标点后断，避免"标点跑到行首"。 */
+  line-break: strict;
+  word-break: break-word;
 }
-.content-input::placeholder {
+/*
+  空内容时的占位文字。
+  ⚠️ 用 `:empty::before` ＋ `attr(data-placeholder)`（Tiptap 的标准做法）——
+     占位文字**不是真内容**，所以不占一个字符、不算字、不会被存进库。
+  ⚠️ `<p><br></p>` 这种"看起来空"的情况由 Tiptap 自己收敛成 `:empty`。
+*/
+.rich-body :deep(.tiptap p.is-editor-empty:first-child::before) {
+  content: attr(data-placeholder);
+  float: left;
+  height: 0;
   color: var(--text-3);
+  pointer-events: none;
+}
+/* 段落之间的间距：Tiptap 默认是 margin，收紧一点更接近"手写"的观感。 */
+.rich-body :deep(.tiptap p) {
+  margin: 0 0 0.2em;
+}
+.rich-body :deep(.tiptap p:last-child) {
+  margin-bottom: 0;
+}
+/* 锁定态：文字淡一点表示只读，但仍可选中 / 复制 / 滚动（与旧 textarea 一致）。 */
+.paper.locked .rich-body :deep(.tiptap) {
+  color: var(--text-2);
+  cursor: default;
 }
 .preview {
   flex: 1;
   overflow-y: auto;
   min-height: 0;
 }
-/* 锁定态：文字淡一点表示只读，但仍然可选中、可复制、可滚动。 */
-.title-input.locked,
-.content-input.locked {
+/* 标题输入框的锁定态（正文那半已跟着纸面迁移到 .paper.locked）。 */
+.title-input.locked {
   color: var(--text-2);
   cursor: default;
 }
@@ -2435,7 +2823,7 @@ defineExpose({ flushNow: () => flush() });
 }
 
 /* 有文件拖到正文上方时给它一圈提示 —— 否则用户不知道"这里能放"。 */
-.content-input.dragging {
+.paper.dragging {
   border-color: var(--accent);
   background: var(--accent-soft);
 }
