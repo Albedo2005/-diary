@@ -16,6 +16,7 @@
 import { ref } from "vue";
 import { searchEntries, toAppError, type SearchHit } from "../api";
 import { humanDate } from "../utils/date";
+import { splitByTerms, type Seg } from "../utils/text";
 
 const emit = defineEmits<{ (e: "open", date: string): void }>();
 
@@ -59,19 +60,29 @@ function clear() {
 }
 
 /**
- * 在摘要里高亮查询词。
- * 因为摘要是原文的子串，直接做文本替换即可；用切分后拼接避免 XSS。
+ * 查询串切成词 —— 按**空白**切，每个词分别高亮（搜索框里打"牛肉 面"⇒ 两个词都亮）。
+ *
+ * 上限 8 个：`splitByTerms` 里是「词数 × 串长」次 `indexOf`。摘摘要一般才一两百字、
+ * 本来不用担心，但用户真粘一整段话进来时，加上限更稳。
  */
-function parts(hit: SearchHit): { text: string; hit: boolean }[] {
-  const q = query.value.trim();
-  if (!q) return [{ text: hit.snippet, hit: false }];
-  const idx = hit.snippet.indexOf(q);
-  if (idx < 0) return [{ text: hit.snippet, hit: false }];
-  return [
-    { text: hit.snippet.slice(0, idx), hit: false },
-    { text: q, hit: true },
-    { text: hit.snippet.slice(idx + q.length), hit: false },
-  ];
+function terms(): string[] {
+  return query.value.trim().split(/\s+/).filter(Boolean).slice(0, 8);
+}
+
+/**
+ * 在摘要里高亮**所有**命中处（【P2-16】）。
+ *
+ * 改之前这里是 `indexOf` —— 只找**第一处**，所以同一篇里那词出现八次也只亮一处。
+ * 现在整件事交给了 `utils/text.ts::splitByTerms()`（抽出去才能写单测）。
+ *
+ * ✅ **摘要本身就是"可见文字"**：正文变成富文本后，后端 `db::make_snippet()`
+ *    已经先 `strip_html()` 再开窗 ⇒ 从后端出去的摘要里**不夹格式标记**，
+ *    这里直接在它上面找词天然正确。⛔ 别在前端再剥一遍（那是第二套实现）。
+ *
+ * ⚠️ 切段后按段渲染（`<mark>` ＋ `<span>`），**不用 `v-html`** —— 防 XSS。
+ */
+function parts(hit: SearchHit): Seg[] {
+  return splitByTerms(hit.snippet, terms());
 }
 </script>
 

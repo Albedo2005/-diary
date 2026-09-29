@@ -1,13 +1,14 @@
 {
   "name": "diary-app",
   "private": true,
-  "version": "3.14",
+  "version": "3.15",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "vue-tsc --noEmit",
+    "test:fe": "node --test \"tests/**/*.test.ts\"",
     "tauri": "tauri",
     "app:exe": "tauri build --no-bundle",
     "app:dev": "tauri dev"
