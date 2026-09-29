@@ -13,8 +13,15 @@
  * 摘要（snippet）由后端在**原文**上截取，不用 FTS5 的 snippet()，
  * 因为索引里存的是分词文本，直接输出会是破碎排版。
  */
-import { ref } from "vue";
-import { searchEntries, toAppError, type SearchHit } from "../api";
+import { computed, onMounted, ref } from "vue";
+import {
+  clearSearchHistory,
+  getSearchHistory,
+  pushSearchHistory,
+  searchEntries,
+  toAppError,
+  type SearchHit,
+} from "../api";
 import { humanDate } from "../utils/date";
 import { splitByTerms, type Seg } from "../utils/text";
 
@@ -25,6 +32,16 @@ const results = ref<SearchHit[]>([]);
 const searching = ref(false);
 const errorText = ref("");
 const searched = ref(false);
+
+/**
+ * 搜索历史（【P2-20】）。**最近搜的在最前**。
+ *
+ * ⚠️ 它住在**加密库**里（后端 `app_setting` 表），⛔ **不是 `localStorage`** ——
+ *    搜索词往往就是日记里的字，存别处等于把日记的一部分明文摊在硬盘上。
+ * ⚠️ `SearchPanel` **切页即卸载**（`App.vue` 用 `v-if` 切页）⇒ 每次进来都要重拉，
+ *    ⛔ 别指望组件内变量跨页存活。
+ */
+const history = ref<string[]>([]);
 
 let debounce: number | null = null;
 
@@ -57,6 +74,80 @@ function clear() {
   results.value = [];
   searched.value = false;
   errorText.value = "";
+}
+
+// ---------------------------------------------------------------------------
+// 搜索历史（【P2-20】）
+// ---------------------------------------------------------------------------
+
+/**
+ * 历史区什么时候露脸。
+ *
+ *   * 一篇都没搜过 / 刚清空 ⇒ 历史为空 ⇒ **整块不出现**（连标题、空白都不留）；
+ *   * 输入框里有字、还没回车 ⇒ **照常显示**（那不算"搜过"）；
+ *   * ⭐ **只要搜过就让位** —— "一屏只放一样东西"（用户 2026-09-29 拍板：
+ *     连"一条都没搜到"也算搜过）。点输入框右边那个 **×**（`clear()`）之后
+ *     `searched` 回到 `false` ⇒ 历史又回来。
+ */
+const showHistory = computed(() => history.value.length > 0 && !searched.value);
+
+/** 进页面拉一次（一条只读命令、几百字节）。 */
+async function loadHistory() {
+  try {
+    history.value = await getSearchHistory();
+  } catch {
+    // ⚠️ 这是"读不到历史"，**不是**"搜不到日记" —— 为它弹一条错误既误导又是噪声。
+    //    静默当空列表，搜索本身照常能用。
+    history.value = [];
+  }
+}
+
+onMounted(() => void loadHistory());
+
+/**
+ * 记一次历史。
+ *
+ * ⚠️ **只许在"用户真的搜了"那两处调**：**回车** 与 **点历史胶囊**。
+ *    ⛔ **别塞进 `run()`** —— `run()` 被 260ms 输入防抖调到，
+ *    那样"打一半停一下"也会被记进历史。
+ * 后端把新列表**直接返回**（不必再拉一次）。
+ */
+async function remember(q: string) {
+  try {
+    history.value = await pushSearchHistory(q);
+  } catch {
+    // 记不上不影响这次搜索 —— 结果已经出来了，别为一笔历史弹错。
+  }
+}
+
+/** 回车：搜 ＋ 记一次。 */
+function onEnter() {
+  void run();
+  void remember(query.value);
+}
+
+/** 点一颗历史胶囊：填进输入框 → 立刻搜 → 记一次（顶到最前）。 */
+function pick(word: string) {
+  query.value = word;
+  void run();
+  void remember(word);
+}
+
+/**
+ * 「清空」：一次清光历史。
+ *
+ * ⚠️ **输入框与结果都不动** —— 那是上面 `clear()` 的事，两者语义不同，
+ *    ⛔ 别合并成一个动作。
+ */
+async function clearHistory() {
+  try {
+    await clearSearchHistory();
+  } catch {
+    // ⛔ 后端没清掉就别把本地列表置空 —— 否则界面说"已清空"、库里还留着，
+    //    用户下次进来又会看见它们，那比直接说失败更糟。
+    return;
+  }
+  history.value = [];
 }
 
 /**
@@ -95,9 +186,34 @@ function parts(hit: SearchHit): Seg[] {
         type="search"
         placeholder="搜索日记内容…"
         @input="onInput"
-        @keyup.enter="run"
+        @keyup.enter="onEnter"
       />
       <button v-if="query" class="clear" title="清空" @click="clear">×</button>
+    </div>
+
+    <!--
+      搜索历史（【P2-20】）：搜索框**正下方**、结果区之上。
+      形态照 B站 —— 小标题 ＋ 右上角「清空」＋ 一排胶囊（放不下就**折行**）。
+      ⛔ 不显示条数、⛔ 不做"删单条"（要删就清空）、⛔ 不借 B站 的配色（一律走主题变量）。
+    -->
+    <div v-if="showHistory" class="history">
+      <div class="history-head">
+        <span class="history-title">搜索历史</span>
+        <button class="history-clear" title="清空搜索历史" @click="clearHistory">
+          清空
+        </button>
+      </div>
+      <div class="history-pills">
+        <button
+          v-for="w in history"
+          :key="w"
+          class="hist-pill"
+          :title="w"
+          @click="pick(w)"
+        >
+          {{ w }}
+        </button>
+      </div>
     </div>
 
     <p v-if="errorText" class="error">{{ errorText }}</p>
@@ -174,6 +290,68 @@ function parts(hit: SearchHit): Seg[] {
   cursor: pointer;
 }
 .clear:hover {
+  background: var(--hover);
+  color: var(--text-1);
+}
+/*
+  搜索历史（【P2-20】）。形态照 B站：小标题 ＋ 右侧文字按钮 ＋ 一排胶囊。
+  ⚠️ **颜色一律走主题变量** —— B站 是粉色系，⛔ 一个色号都不许借过来。
+
+  ⚠️ 它只在 `!searched` 时出现，而那时候 `results` 必然为空
+     （`.list` 是 `v-if="results.length"`）⇒ **不会和结果列表抢高度**。
+*/
+.history {
+  flex-shrink: 0;
+  margin-bottom: 12px;
+}
+.history-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+/* 小标题：比正文小一号、次要色。 */
+.history-title {
+  font-size: 12px;
+  color: var(--text-3);
+}
+/* 「清空」：**文字按钮**，同 `.picker-link` 那一类（小字、无边框、悬停才亮）。 */
+.history-clear {
+  flex-shrink: 0;
+  padding: 0;
+  font-size: 12px;
+  color: var(--text-2);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+.history-clear:hover {
+  color: var(--accent);
+}
+/* 一排胶囊：**折行**（窗口最窄 720px；B站 那种"一行溢出"在这儿会很难看）。 */
+.history-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+/* 一颗历史词。⚠️ 同一个词只存一份（后端去重）⇒ 可以拿它当 `key`。 */
+.hist-pill {
+  max-width: 100%;
+  padding: 3px 10px;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--text-2);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+  /* 词最长 50 字 ⇒ 太长的钉住宽度、末尾省略号，别把一行撑破。 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hist-pill:hover {
   background: var(--hover);
   color: var(--text-1);
 }

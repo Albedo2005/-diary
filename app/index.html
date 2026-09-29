@@ -49,12 +49,33 @@
         font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei",
           sans-serif;
       }
+      /*
+        呼吸：让"停着不动"的那 1 秒看得出来在加载，而不是卡死了（【P2-2】追加）。
+        ⚠️ 三条约束：① **纯 CSS**，⛔ 不许用 JS 定时器（"启动画面不依赖 JS"
+           是这条设计的立身之本）；② **必须尊重系统「减弱动态效果」**（下面有）；
+           ③ 幅度要小 —— **只动透明度**，⛔ 不做位移或缩放（那会显得廉价）。
+      */
+      @keyframes boot-pulse {
+        0%,
+        100% {
+          opacity: 0.55;
+        }
+        50% {
+          opacity: 1;
+        }
+      }
       #boot-splash .mark {
         font-size: 25px;
         font-weight: 500;
         letter-spacing: 0.34em;
         /* 与 global.css 的 --text-2 同值：够醒目、又不刺眼。 */
         color: #5c5955;
+        animation: boot-pulse 1.4s ease-in-out infinite;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #boot-splash .mark {
+          animation: none;
+        }
       }
       #boot-splash .hint {
         font-size: 12px;

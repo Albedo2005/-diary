@@ -7983,4 +7983,173 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // -----------------------------------------------------------------------
+    // 搜索历史（【P2-20】）
+    //
+    // 这一组的重点是那四条"写死"的规则（空/超长不记、重复顶到最前、上限 20）
+    // 和一条**绝不能报错**的兜底（库里那个值是坏 JSON 时）。
+    // 另外钉两条"跨连接"的：它是**用户数据**，必须一直保留。
+    // -----------------------------------------------------------------------
+
+    /// 造一个只属于搜索历史那几条测试的库。
+    fn history_vault(tag: &str) -> (Vault, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("dsh-diary-history-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let vault = Vault::create(&dir, "135790", None).unwrap();
+        (vault, dir)
+    }
+
+    /// ① 空库 ⇒ 空列表，不报错。
+    #[test]
+    fn search_history_starts_empty() {
+        let (vault, dir) = history_vault("empty");
+        assert!(vault.search_history().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ② 连推 3 个不同词 ⇒ **最近搜的在第 0 位**。
+    ///    ⚠️ 是"按时间倒序"，⛔ 不是"按搜索次数"排序。
+    #[test]
+    fn search_history_newest_first() {
+        let (vault, dir) = history_vault("order");
+        for w in ["图书馆", "那天下雨", "加班"] {
+            vault.push_search_history(w).unwrap();
+        }
+        assert_eq!(
+            vault.search_history().unwrap(),
+            vec!["加班", "那天下雨", "图书馆"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ③ ⭐ 重复推同一个词 ⇒ 列表**不增长**，且那一条**排到最前**。
+    #[test]
+    fn search_history_dedupes_and_moves_to_front() {
+        let (vault, dir) = history_vault("dedupe");
+
+        vault.push_search_history("妈妈").unwrap();
+        vault.push_search_history("第一份工资").unwrap();
+        vault.push_search_history("妈妈").unwrap();
+
+        let h = vault.search_history().unwrap();
+        assert_eq!(h, vec!["妈妈", "第一份工资"], "同一个词只留一份、并顶到最前");
+        assert_eq!(h.len(), 2, "列表不能变长");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ④ ⭐ 推 25 个不同词 ⇒ 只剩 **20 条**，**最旧的被挤掉**（且挤掉的正是第 1 个）。
+    #[test]
+    fn search_history_truncates_to_twenty() {
+        let (vault, dir) = history_vault("limit");
+
+        for i in 1..=25 {
+            vault.push_search_history(&format!("词{i}")).unwrap();
+        }
+
+        let h = vault.search_history().unwrap();
+        assert_eq!(h.len(), MAX_SEARCH_HISTORY);
+        assert_eq!(h[0], "词25", "最新的在最前");
+        assert_eq!(h[h.len() - 1], "词6", "留下的正好是最近 20 个");
+        assert!(!h.iter().any(|w| w == "词1"), "最旧的那条必须被挤掉");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⑤ 超长词（> 50 **字**）不记；**空词 / 纯空白**也不记。
+    ///    ⚠️ 边界是"**超过** 50"⇒ 正好 50 字**要记**。
+    #[test]
+    fn search_history_ignores_blank_and_overlong() {
+        let (vault, dir) = history_vault("guard");
+
+        assert!(vault.push_search_history("").unwrap().is_empty(), "空串不记");
+        assert!(
+            vault.push_search_history("   ").unwrap().is_empty(),
+            "纯空白不记"
+        );
+
+        // 正好 50 字 ⇒ 记。
+        let fifty = "字".repeat(MAX_SEARCH_QUERY_CHARS);
+        assert_eq!(vault.push_search_history(&fifty).unwrap().len(), 1);
+
+        // 51 字 ⇒ **不记**，而且列表是**原样返回**（不是被清空）。
+        let over = "字".repeat(MAX_SEARCH_QUERY_CHARS + 1);
+        let after = vault.push_search_history(&over).unwrap();
+        assert_eq!(after.len(), 1, "超长词必须不记");
+        assert_eq!(after[0], fifty, "不记的意思是列表原样返回");
+
+        // 前后空白要 trim 掉**再判重、再存**。
+        vault.push_search_history("  青柠  ").unwrap();
+        assert_eq!(vault.search_history().unwrap()[0], "青柠");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⑥ 清空 ⇒ 空列表；再推一个 ⇒ 只有那一个。
+    #[test]
+    fn search_history_clear_then_push_again() {
+        let (vault, dir) = history_vault("clear");
+
+        vault.push_search_history("图书馆").unwrap();
+        vault.push_search_history("加班").unwrap();
+
+        vault.clear_search_history().unwrap();
+        assert!(vault.search_history().unwrap().is_empty());
+
+        assert_eq!(
+            vault.push_search_history("新的").unwrap(),
+            vec!["新的"],
+            "清空之后再推一个，列表里只有它"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⑦ ⭐ **坏值兜底**：把库里那个键改成 `not json` ⇒ `search_history()`
+    ///    **返回空列表、不报错**。
+    ///
+    /// ⚠️ 这条是硬要求：读历史是"每次进搜索页都要走"的路径，
+    ///    为它抛错会让**整页搜索打不开**，而用户什么都没做错。
+    #[test]
+    fn search_history_survives_corrupt_value() {
+        let (vault, dir) = history_vault("corrupt");
+
+        for bad in ["not json", "{}", "123", "[1,2,3]", "\"青柠\"", ""] {
+            vault.set_setting(setting_keys::SEARCH_HISTORY, bad).unwrap();
+            assert!(
+                vault.search_history().unwrap().is_empty(),
+                "坏值 {bad:?} 必须静默当空列表"
+            );
+        }
+
+        // 数组里混着空白 ⇒ 滤掉（渲染层不必再防一遍）。
+        vault
+            .set_setting(setting_keys::SEARCH_HISTORY, r#"["", "  ", "青柠"]"#)
+            .unwrap();
+        assert_eq!(vault.search_history().unwrap(), vec!["青柠"]);
+
+        // 坏值之后**照样能写进去** —— 不是"这一项从此废了"。
+        assert_eq!(vault.push_search_history("青柠").unwrap(), vec!["青柠"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ⑧ ⭐ **"一直保留"** —— 换一个连接（＝模拟"关掉软件再打开"）之后历史还在。
+    ///    这是用户最初拍板的原话：「**肯定是一直保留啊**」，
+    ///    也正是它决定了"必须进加密库"（⛔ 不是 `localStorage`）。
+    #[test]
+    fn search_history_survives_reopen() {
+        let (vault, dir) = history_vault("reopen");
+
+        vault.push_search_history("图书馆").unwrap();
+        vault.push_search_history("加班").unwrap();
+        drop(vault);
+
+        let again = Vault::unlock(&dir, "135790").unwrap();
+        assert_eq!(again.search_history().unwrap(), vec!["加班", "图书馆"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
