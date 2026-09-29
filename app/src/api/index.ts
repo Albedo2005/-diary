@@ -780,6 +780,34 @@ export const getRecap = () => invoke<Recap>("recap", { today: todayKey() });
 export const searchEntries = (query: string, limit = 50) =>
   invoke<SearchHit[]>("search_entries", { query, limit });
 
+/**
+ * 读搜索历史（**最近的在最前**）。【P2-20】
+ *
+ * ⚠️ 它存在**加密库**里（`app_setting` 表），⛔ 不在 `localStorage` ——
+ *    搜索词往往就是日记里的字，存别处等于把日记的一部分明文摊在硬盘上。
+ * ⚠️ `SearchPanel` 切页即**卸载**（`App.vue` 用 `v-if` 切页）⇒
+ *    历史每次进来都要重新拉一次，⛔ 别指望组件内变量跨页存活。
+ */
+export const getSearchHistory = () => invoke<string[]>("get_search_history");
+
+/**
+ * 记一条搜索历史，**返回新列表**（直接拿去渲染，不用再拉一次）。
+ *
+ * ⚠️ 只许在"用户**真的搜了**"那两处调：**回车** 与 **点历史胶囊**。
+ *    ⛔ 别放进 `run()` —— 它被输入防抖调到，会把"打一半停一下"也记进去。
+ * ⚠️ 空串 / 纯空白 / 超过 50 字，后端**原样返回旧列表**（不报错）。
+ */
+export const pushSearchHistory = (query: string) =>
+  invoke<string[]>("push_search_history", { query });
+
+/**
+ * 清空搜索历史（一次清光）。
+ *
+ * ⚠️ **不动输入框、也不动结果** —— 那是 `clear()` 的事。两者语义不同，
+ *    ⛔ 别合并成一个动作。
+ */
+export const clearSearchHistory = () => invoke<void>("clear_search_history");
+
 // ---------------------------------------------------------------------------
 // 筛选（P2-7）
 // ---------------------------------------------------------------------------

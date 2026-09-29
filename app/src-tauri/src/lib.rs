@@ -167,6 +167,13 @@ pub fn run() {
             commands::recap,
             // 搜索
             commands::search_entries,
+            // 搜索历史（【P2-20】）。
+            // ⚠️ 存的是**加密库**里的 `app_setting` ⇒ 三条都走 `with_vault`。
+            //    `push` 返回**新列表**而不是 `()`：省一次往返，也避免
+            //    "两次请求之间列表不一致"。
+            commands::get_search_history,
+            commands::push_search_history,
+            commands::clear_search_history,
             // 标签
             // 读是"列全部 + 查某天"，写是"整组覆盖"（不是逐条增删）——
             // 逐条增删会多出"插一个已存在的"这种中间态，语义反而更绕。

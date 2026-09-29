@@ -88,6 +88,16 @@ pub mod setting_keys {
     ///    超过上限**钳到上限**（用户填 `999999` 想表达的是"很高"，
     ///    别把他的设置抹成"没设"）。
     pub const DAILY_WORD_GOAL: &str = "daily_word_goal";
+    /// 搜索历史（【P2-20】）：一个 **JSON 数组字符串**，**最近的排在最前**。
+    ///
+    /// ⚠️ **必须住在加密库里** —— ⛔ 不许存 `localStorage`、也不许存明文文件：
+    ///    搜索词**往往就是日记里的字**，存别处等于把日记的一部分明文摊在硬盘上
+    ///    （P2-22 立过规矩：`localStorage` 只许存"界面偏好"）。
+    ///
+    /// ⚠️ 存的是**整份数组**（不是一条条追加）：去重 / 上限 20 / 坏值兜底
+    ///    全部收在 `push_search_history()` 与 `search_history()` 里，
+    ///    ⛔ 别处不要直接写这个键。
+    pub const SEARCH_HISTORY: &str = "search_history";
 }
 
 /// 自动锁定时长的**档位白名单**（秒）。`0` 表示"永不"。
@@ -135,6 +145,18 @@ pub const DEFAULT_DAILY_WORD_GOAL: u32 = 0;
 ///    上限存在的理由只是防止一个荒谬的数字把界面撑坏
 ///    （`type="number"` 能被粘进任意长的串）。
 pub const MAX_DAILY_WORD_GOAL: u32 = 100_000;
+
+/// 搜索历史最多留几条（【P2-20】）。
+///
+/// 20 条足够覆盖"最近常用"，再多就要滚动 —— 用户要的是"**和别的软件一样**"，
+/// 而别家也都是一屏之内能看完。
+pub const MAX_SEARCH_HISTORY: usize = 20;
+
+/// 单条搜索词最长几个**字**（【P2-20】）。超了**不记**。
+///
+/// 理由：超过这个长度的东西不叫"搜索"，是**把一整段话粘进来了** ——
+/// 记下来既占地方、也没法再当搜索词用。⚠️ 回车照常搜，只是不进历史。
+pub const MAX_SEARCH_QUERY_CHARS: usize = 50;
 
 /// 应用设置。
 ///
@@ -3657,6 +3679,80 @@ impl Vault {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // 搜索历史（【P2-20】）
+    //
+    // 存的还是 `app_setting` 这张键值表（值是一个 JSON 数组字符串），
+    // 所以**零建表、零迁移、不动 `SCHEMA_VERSION`**。
+    // -----------------------------------------------------------------------
+
+    /// 读搜索历史。**最近搜的在最前**（数组第 0 位）。
+    ///
+    /// ⚠️ **值坏掉（不是 JSON / 不是字符串数组）一律静默当空列表** ——
+    ///    这是"每次进搜索页都要读一次"的路径，为它抛错会让搜索页直接打不开，
+    ///    而用户什么都没做错（与 `get_settings()` 同一条理由）。
+    ///    ⛔ **读取路径不写库**（不顺手把坏值修掉）—— 读就是读。
+    ///
+    /// ⚠️ 顺手滤掉空串：库里若被外部工具塞进 `["", "a"]`，渲染层就不必再防一遍。
+    ///    上限**不在这里砍** —— 那是 `push_search_history()` 的职责，
+    ///    两边都砍会让"超限了没有"这件事变得验不出来。
+    pub fn search_history(&self) -> AppResult<Vec<String>> {
+        let raw = match self.get_setting(setting_keys::SEARCH_HISTORY)? {
+            Some(v) => v,
+            None => return Ok(Vec::new()),
+        };
+        // 解析失败 / 形状不对（比如 `[1,2]`）都落进 `unwrap_or_default()`。
+        let list: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+        Ok(list.into_iter().filter(|w| !w.trim().is_empty()).collect())
+    }
+
+    /// 记一条搜索历史，返回**新列表**（最近的在最前）。
+    ///
+    /// 四条规则**写死，别自由发挥**：
+    ///   1. `trim()` 后为空          ⇒ **原样返回当前列表**，不记
+    ///   2. `trim()` 后超过 50 个**字** ⇒ 不记（那是把一整段话粘进来了，不叫"搜索"）
+    ///   3. 列表里已有（trim 后完全相同）⇒ 删掉旧的、插到最前
+    ///   4. 列表里没有               ⇒ 插到最前，超过 20 条砍掉尾部
+    ///
+    /// ⚠️ **不做大小写折叠**：搜索本身是**精确匹配**（FTS 那套），
+    ///    折了反而与"搜得到什么"对不上。
+    ///
+    /// ⚠️ 返回**新列表**而不是 `()` —— 一是省掉前端"再去拉一次"的往返，
+    ///    二是避免两次请求之间列表不一致（前端直接拿它渲染）。
+    ///
+    /// ⚠️ **调用点只许是"真的搜了"那两处**（回车 / 点历史胶囊）。
+    ///    ⛔ 绝不要从 `search()` 那条路调进来 —— 前端 `run()` 被输入防抖（260ms）调到，
+    ///    那样"打一半停一下"就会被记进历史。
+    pub fn push_search_history(&self, q: &str) -> AppResult<Vec<String>> {
+        let w = q.trim();
+        let mut list = self.search_history()?;
+        if w.is_empty() || w.chars().count() > MAX_SEARCH_QUERY_CHARS {
+            return Ok(list);
+        }
+        list.retain(|x| x.as_str() != w);
+        list.insert(0, w.to_string());
+        list.truncate(MAX_SEARCH_HISTORY);
+        self.save_search_history(&list)?;
+        Ok(list)
+    }
+
+    /// 清空搜索历史。
+    ///
+    /// ⚠️ 写 `"[]"` 而不是把那一行 `DELETE` 掉：读取端两条路径本来就等价
+    ///    （都是空列表），写空数组少一种状态。⛔ 与前端那个 `clear()`
+    ///    （清输入框 ＋ 结果）**不是一回事**，别共用一个名字。
+    pub fn clear_search_history(&self) -> AppResult<()> {
+        self.set_setting(setting_keys::SEARCH_HISTORY, "[]")
+    }
+
+    /// 把整份列表写回。**只由 `push_search_history()` 调用** ——
+    /// 别处直接写这个键会绕过上面那四条规则。
+    fn save_search_history(&self, list: &[String]) -> AppResult<()> {
+        let json = serde_json::to_string(list)
+            .map_err(|e| AppError::State(format!("搜索历史序列化失败：{e}")))?;
+        self.set_setting(setting_keys::SEARCH_HISTORY, &json)
     }
 
     /// 自动备份是否开启。**默认开启** —— 对日记软件来说，

@@ -877,6 +877,48 @@ pub fn search_entries(
 }
 
 // ---------------------------------------------------------------------------
+// 搜索历史（【P2-20】）
+//
+// ⚠️ 三条都走 `with_vault` —— 历史存在**加密库**的 `app_setting` 表里。
+//    这是刻意的：搜索词**往往就是日记里的字**，存 `localStorage` 或明文文件
+//    等于把日记的一部分明文摊在硬盘上（与 P2-22 立的规矩同理）。
+//    ✅ 搜索页本来就只在**解锁之后**才出现 ⇒ 没有时序问题。
+//
+// ⚠️ 历史**不进 `app_status`**：照 `get_settings` 那条注释的惯例 ——
+//    `app_setting` 表在加密库里，而 `app_status` 是"未解锁也要能答"的那条路。
+// ---------------------------------------------------------------------------
+
+/// 读搜索历史（**最近的在最前**）。
+///
+/// ⚠️ 库里那个值是坏 JSON 时**静默返回空列表、不报错** ——
+///    这条每次进搜索页都要走，为它抛错会让搜索页整块打不开。
+#[tauri::command]
+pub fn get_search_history(state: State<'_, VaultState>) -> AppResult<Vec<String>> {
+    with_vault(&state, |v| v.search_history())
+}
+
+/// 记一条搜索历史，**返回新列表**（前端直接拿去渲染，不必再拉一次）。
+///
+/// ⚠️ 调用点只许有**两个**：**回车** 与 **点历史胶囊**（＝用户"真的搜了"）。
+///    ⛔ **绝不要把它放进前端的 `run()`** —— `run()` 被输入防抖（260ms）调到，
+///    那样"打一半停一下"也会被记进历史。
+#[tauri::command]
+pub fn push_search_history(
+    state: State<'_, VaultState>,
+    query: String,
+) -> AppResult<Vec<String>> {
+    with_vault(&state, |v| v.push_search_history(&query))
+}
+
+/// 清空搜索历史（一次清光）。
+///
+/// ⚠️ **不动输入框、也不动结果** —— 那是前端 `clear()` 的事，两者语义不同。
+#[tauri::command]
+pub fn clear_search_history(state: State<'_, VaultState>) -> AppResult<()> {
+    with_vault(&state, |v| v.clear_search_history())
+}
+
+// ---------------------------------------------------------------------------
 // 筛选（P2-7）
 // ---------------------------------------------------------------------------
 
