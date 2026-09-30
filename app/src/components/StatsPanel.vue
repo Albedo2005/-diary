@@ -53,6 +53,7 @@ import {
   toMonthKey,
   todayKey,
 } from "../utils/date";
+import TreePane from "./TreePane.vue";
 
 const props = defineProps<{
   stats: Stats | null;
@@ -76,7 +77,7 @@ const props = defineProps<{
    * ⚠️ 状态**放在 `App.vue`**，不是这儿 —— 切走再回来本组件会被卸载重建，
    *    放组件内部就记不住"上次停在旧影"，而用户要的正是记住（只在这次运行里记）。
    */
-  tab?: "scale" | "recap";
+  tab?: "scale" | "recap" | "tree";
   /**
    * 从写日记屏那句「N 年前的今天写过 · 去看看」跳过来时带的**那一天**
    * （`YYYY-MM-DD`）。只用来在「往年今天」里高亮对应那一年。
@@ -90,7 +91,7 @@ const props = defineProps<{
  */
 const emit = defineEmits<{
   (e: "open", date: string): void;
-  (e: "tab", tab: "scale" | "recap"): void;
+  (e: "tab", tab: "scale" | "recap" | "tree"): void;
 }>();
 
 /** 柱状图窗口：最近 12 个月（含本月）。固定格数才好横向比较，缺的月份补 0。 */
@@ -343,9 +344,9 @@ const tagEmpty = computed(() => rankedTags.value.length === 0);
    ⛔ 别做成和顶栏一样的一排 —— 那会让人以为是又一个导航层。 */
 
 /** 当前停在哪边。`props.tab` 没传时按「刻度」—— ⛔ 默认值别写成"旧影"。 */
-const tab = computed<"scale" | "recap">(() => props.tab ?? "scale");
+const tab = computed<"scale" | "recap" | "tree">(() => props.tab ?? "scale");
 
-const switchTab = (t: "scale" | "recap") => {
+const switchTab = (t: "scale" | "recap" | "tree") => {
   if (t !== tab.value) emit("tab", t);
 };
 
@@ -480,15 +481,14 @@ const streakCard = computed(() => {
     <!-- 还没读到 / 读失败：只说一句中性的话，不弹错误。 -->
     <p v-if="!stats" class="hint">正在读取统计…</p>
 
-    <section v-else-if="!hasEntries" class="hint">
-      <p>还没有写过日记。</p>
-      <p class="sub">写下第一篇之后，这里会开始累积数据。</p>
-    </section>
-
     <template v-else>
       <!--
-        页内两个小切换。⚠️ 状态由 `App.vue` 持有（见 script 里 `tab` 的说明）：
-        切走再回来本组件会被卸载重建，状态放这儿就记不住"上次停在旧影"。
+        页内三个小切换。⚠️ 状态由 `App.vue` 持有（见 script 里 `tab` 的说明）：
+        切走再回来本组件会被卸载重建，状态放这儿就记不住"上次停在哪边"。
+
+        ⚠️ 这一层**搬到了空库判断之外** —— 树语（第一期）不读任何数据，
+        空库时照样画得出那棵树。若还留在原来那个 `v-else` 里，
+        一篇日记都没写过时整排切换都不会出现，树语就永远进不去。
       -->
       <nav class="subtabs">
         <button type="button" :class="{ on: tab === 'scale' }" @click="switchTab('scale')">
@@ -497,10 +497,22 @@ const streakCard = computed(() => {
         <button type="button" :class="{ on: tab === 'recap' }" @click="switchTab('recap')">
           旧影
         </button>
+        <button type="button" :class="{ on: tab === 'tree' }" @click="switchTab('tree')">
+          树语
+        </button>
       </nav>
 
+      <!-- ══ 树语：一棵树（独立小项目 ⇒ `生产\Diary-树语-项目书.md`） ════
+           ⚠️ **不读数据** ⇒ 排在空库判断**前面**：一篇日记都没有时也要看得见。 -->
+      <TreePane v-if="tab === 'tree'" />
+
+      <section v-else-if="!hasEntries" class="hint">
+        <p>还没有写过日记。</p>
+        <p class="sub">写下第一篇之后，这里会开始累积数据。</p>
+      </section>
+
       <!-- ══ 刻度：攒下来的数字 ══════════════════════════════════════ -->
-      <template v-if="tab === 'scale'">
+      <template v-else-if="tab === 'scale'">
       <!-- ── 六个数字 ───────────────────────────────────────────── -->
       <section class="cards">
         <div class="card">

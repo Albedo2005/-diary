@@ -54,6 +54,18 @@ target/**/*.d
 _verify-*/
 _ui-verify*/
 
+# 探针 / 验收脚本的一次性工作目录（里面是临时数据目录＋截图）
+_probe-*/
+
+# "把 node_modules 改名挪走"产生的备份（修 pnpm 链接问题时用过）——
+# ⚠️ `node_modules` 这条匹配不到 `node_modules_bak_*`，所以 2026-09-30 单独补。
+#    里面是整个依赖树（几十上百 MB），永远不要进版本库。
+node_modules_bak*/
+
+# 仓库根下的一次性诊断输出（环境转储 / 链接探测 / 临时解码器）
+/_*.txt
+/_*.py
+
 # Never commit real diary data or key material
 *.diarydb
 crypto_meta.bin

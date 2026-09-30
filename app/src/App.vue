@@ -192,7 +192,7 @@ const recap = ref<Recap | null>(null);
  * ⚠️ **只在这次运行里记**，⛔ 不落盘 —— `localStorage` 只许存界面偏好
  *    （P2-22 立的规矩），"你写过什么"属于日记内容，落盘就是泄露。
  */
-const recapTab = ref<"scale" | "recap">("scale");
+const statsTab = ref<"scale" | "recap" | "tree">("scale");
 
 /**
  * 从写日记屏那句「N 年前的今天写过 · 去看看」带过来的那一天（P2-23）。
@@ -476,10 +476,10 @@ async function loadRecap() {
  * 两个触发点 —— **合起来才是完整的"什么时候该重读回顾"**：
  *   1. 页内切到「旧影」；
  *   2. **进入年轮页且停在旧影**（切走再回来属于这种情况：本组件被卸载重建，
- *      第 1 条不会触发，因为 `recapTab` 的值压根没变）。
+ *      第 1 条不会触发，因为 `statsTab` 的值压根没变）。
  * ⚠️ 离开年轮页时顺手把"定位年份"清掉 —— 那条指令只用一次。
  */
-watch(recapTab, (t) => {
+watch(statsTab, (t) => {
   if (t === "recap" && mode.value === "stats") void loadRecap();
 });
 
@@ -488,7 +488,7 @@ watch(mode, (m) => {
     recapFocus.value = "";
     return;
   }
-  if (recapTab.value === "recap") void loadRecap();
+  if (statsTab.value === "recap") void loadRecap();
 });
 
 /**
@@ -500,10 +500,10 @@ watch(mode, (m) => {
  * ⚠️ 传进来的仍然只是**一个日期字符串**（事件名 `open` 与参数形式都没动 ——
  *    P2-17 那边就是照这个传的，改了会把它一起拖下水）。
  * ⚠️ 顺序要紧：先摆好页内 tab 和定位年份，**最后**再切 `mode` ——
- *    否则 `mode` 那个 watcher 跑起来时 `recapTab` 还是旧的，回顾数据不会去拉。
+ *    否则 `mode` 那个 watcher 跑起来时 `statsTab` 还是旧的，回顾数据不会去拉。
  */
 function openOnThisDay(d: string) {
-  recapTab.value = "recap";
+  statsTab.value = "recap";
   recapFocus.value = d;
   mode.value = "stats";
 }
@@ -1321,9 +1321,9 @@ onUnmounted(() => {
             :tags="tags"
             :recap="recap"
             :dates="writtenDays"
-            :tab="recapTab"
+            :tab="statsTab"
             :focus-date="recapFocus"
-            @tab="(t) => (recapTab = t)"
+            @tab="(t) => (statsTab = t)"
             @open="
               (d) => {
                 selected = d;
