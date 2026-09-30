@@ -40,6 +40,21 @@
   --mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", Consolas,
     "Courier New", monospace;
 
+  /* 树语（独立子项目，three.js 画的 3D 场景）。
+     ⚠️ 这几档是**给 3D 用的颜色**，组件里一行都不许写死色号 ——
+        深浅主题各一套，换主题时 `scene.ts::applyTheme()` 会把贴图重画一遍。
+     ⛔ 别把它们并进上面的界面色族：界面色是给平面 UI 的，
+        3D 需要的是"天、地、树皮、阳光"这一套自然界的色。 */
+  --tree-sky-top: #cfe3f2; /* 淡青天 */
+  --tree-sky-bottom: #f4f8f6;
+  --tree-ground: #b9c8ac; /* 草地 */
+  --tree-ground-far: #d3dcc9;
+  --tree-disc: #a8b79f; /* 树下那圈很淡的圆台 */
+  --tree-bark: #7a6551; /* 树皮 */
+  --tree-bark-dark: #4f4235;
+  --tree-sun: #fff3e0; /* 那束投影的直射光 */
+  --tree-foliage: #c9a227; /* 叶（批次 3 才用得到，先备着） */
+
   /* 日记正文的阅读字体（【P2-3】第 1 步）。
      ⚠️ 正文**不再用等宽**（--mono 是给代码 / Markdown 用的）：中文日记用等宽，
         中英混排时字宽一跳一跳 —— 这正是"写多了显乱"的第一条病。
@@ -81,6 +96,19 @@
     --danger-bg: #3a2624;
     --warn-bg: #3a3324;
     --ok: #7fb894;
+
+    /* 树语 · 深色主题 ＝ **深蓝夜**（C5 拍板：两套都要好看）。
+       ⚠️ 注意深浅两套的"由亮到暗"方向是**相反的**：这里天空要够暗，
+          否则那一大块亮色会把整个深色界面照得发灰。 */
+    --tree-sky-top: #0a1120;
+    --tree-sky-bottom: #26344d;
+    --tree-ground: #2c3831;
+    --tree-ground-far: #1b2422;
+    --tree-disc: #35423b;
+    --tree-bark: #6d5a49;
+    --tree-bark-dark: #3a3029;
+    --tree-sun: #dfe9ff; /* 夜里是月光，偏冷 */
+    --tree-foliage: #b8912f;
 
     color-scheme: dark;
   }

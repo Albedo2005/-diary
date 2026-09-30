@@ -1308,7 +1308,7 @@ onUnmounted(() => {
             @notice="flash"
           />
         </div>
-        <div v-else class="stats-wrap">
+        <div v-else class="stats-wrap" :class="{ 'stats-wrap--tree': statsTab === 'tree' }">
           <!--
             热力图点格子 → 跳到那天写日记（与搜索结果的 @open 是同一套动作）。
             标签、回顾数据、写过的日期都走 **prop** —— 面板自己不发命令
@@ -1528,6 +1528,26 @@ onUnmounted(() => {
 }
 .stats-wrap {
   max-width: 820px;
+}
+
+/*
+  树语那一栏（2026-09-30 用户拍板：「撑满，而且全屏的时候也要等比例放大」）。
+
+  ⚠️ 只在**停在「树语」这一栏**时生效 —— 刻度 / 旧影 两栏的版式**一个像素都不动**。
+     `.stats-wrap--tree` 这个类由 `statsTab` 驱动（见模板），不是无条件松开的。
+
+  三条改动各自解决一件事：
+  · `max-width: none` —— 820px 是给图表用的；树需要整个宽度，否则会被压成一条横条；
+  · `overflow: hidden` —— 撑满的 3D 场景**不该出现页面滚动条**（拖一下滚轮画面不动，
+    很容易被当成坏了）；
+  · 变成 flex 列容器 —— 好让里面那块画布 `flex: 1` 吃掉剩下的高度，
+    这正是"全屏时跟着放大"的链条起点（往下依次是 `.stats--tree` → `.tree-slot`）。
+*/
+.stats-wrap--tree {
+  max-width: none;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 .filter-wrap {
   max-width: 760px;

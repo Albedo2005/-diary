@@ -477,7 +477,7 @@ const streakCard = computed(() => {
 </script>
 
 <template>
-  <div class="stats">
+  <div class="stats" :class="{ 'stats--tree': tab === 'tree' }">
     <!-- 还没读到 / 读失败：只说一句中性的话，不弹错误。 -->
     <p v-if="!stats" class="hint">正在读取统计…</p>
 
@@ -503,8 +503,13 @@ const streakCard = computed(() => {
       </nav>
 
       <!-- ══ 树语：一棵树（独立小项目 ⇒ `生产\Diary-树语-项目书.md`） ════
-           ⚠️ **不读数据** ⇒ 排在空库判断**前面**：一篇日记都没有时也要看得见。 -->
-      <TreePane v-if="tab === 'tree'" />
+           ⚠️ **不读数据** ⇒ 排在空库判断**前面**：一篇日记都没有时也要看得见。
+           ⚠️ 外面这层 `.tree-slot` 只干一件事：**把剩下的高度吃满**
+              （用户拍板要"撑满 ＋ 全屏等比例放大"，那条链子的一环：
+               `.stats-wrap--tree` → `.stats--tree` → `.tree-slot` → 画布）。 -->
+      <div v-if="tab === 'tree'" class="tree-slot">
+        <TreePane />
+      </div>
 
       <section v-else-if="!hasEntries" class="hint">
         <p>还没有写过日记。</p>
@@ -790,6 +795,26 @@ const streakCard = computed(() => {
   flex-direction: column;
   gap: 22px;
 }
+
+/*
+  树语那一栏：本组件自己也要变成 flex 列 ＋ 允许收缩，
+  否则里面那块画布拿不到"剩余高度"，`height: 100%` 会算成 0。
+  ⚠️ 只在这一栏生效（`:class` 绑定在 `tab === 'tree'`）—— 刻度/旧影 的间距不动。
+*/
+.stats--tree {
+  flex: 1;
+  min-height: 0;
+}
+.tree-slot {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+.tree-slot > * {
+  flex: 1;
+  min-width: 0;
+}
+
 .hint {
   margin: 6px 0 0;
   color: var(--text-2);
