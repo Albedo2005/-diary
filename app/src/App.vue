@@ -52,6 +52,7 @@ import {
 } from "./api";
 import { listen } from "@tauri-apps/api/event";
 import { humanBytes, todayKey } from "./utils/date";
+import { readTreeMotion, writeTreeMotion } from "./tree/motion.ts";
 
 const status = ref<AppStatus | null>(null);
 const booting = ref(true);
@@ -116,6 +117,23 @@ function toggleCalendar() {
   } catch {
     /* 存不下就算了 —— 它只是个偏好 */
   }
+}
+
+/**
+ * 「树语」动不动（第一期 · 批次 3 的纪律第 4 条）。
+ *
+ * ⚠️ 状态放这儿而不是 `TreePane` 内部：切走再回来树那一屏会被卸载重建，
+ *    放组件里就记不住"我关过动效"，用户每次进来都得再关一次。
+ * ⭐ 与"折叠日历栏"是同一类东西 ⇒ 同样住 `localStorage`
+ *    （键 `diary.tree-motion`，读写都在 `tree/motion.ts`）。
+ * ⛔ 关掉只是**树不动**，不是把树藏起来。
+ */
+const treeMotion = ref(readTreeMotion());
+
+/** 切换树语动效。⚠️ 写失败**不许打断这个动作**（界面照切，只是下次记不住）。 */
+function onTreeMotion(on: boolean) {
+  treeMotion.value = on;
+  writeTreeMotion(on);
 }
 
 /** 递增以要求日历刷新标记。**每次保存都会递增** —— 所以别拿它去驱动整篇重载。 */
@@ -1323,6 +1341,7 @@ onUnmounted(() => {
             :dates="writtenDays"
             :tab="statsTab"
             :focus-date="recapFocus"
+            :tree-motion="treeMotion"
             @tab="(t) => (statsTab = t)"
             @open="
               (d) => {
@@ -1368,6 +1387,7 @@ onUnmounted(() => {
         :reminder-time="reminderTime"
         :auto-start="autoStart"
         :daily-word-goal="dailyWordGoal"
+        :tree-motion="treeMotion"
         @close="showSettings = false"
         @backup="doBackup"
         @integrity="doIntegrity"
@@ -1380,6 +1400,7 @@ onUnmounted(() => {
         @reminder-time="onReminderTime"
         @auto-start="onAutoStart"
         @daily-word-goal="onDailyWordGoal"
+        @tree-motion="onTreeMotion"
         @password-changed="onPasswordChanged"
         @auto-login-changed="onAutoLoginChanged"
         @refresh-status="refreshStatus"

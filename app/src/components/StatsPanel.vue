@@ -83,6 +83,12 @@ const props = defineProps<{
    * （`YYYY-MM-DD`）。只用来在「往年今天」里高亮对应那一年。
    */
   focusDate?: string;
+  /**
+   * 「树语」动不动（第一期 · 批次 3）。**由 `App.vue` 持有**（开关在设置页），
+   * 这里只是**原样往下递给 `TreePane`** —— ⛔ 本组件不许自己读 `localStorage`
+   * （那会出现"设置页说关着、树上还在摆"）。
+   */
+  treeMotion?: boolean;
 }>();
 
 /**
@@ -508,7 +514,7 @@ const streakCard = computed(() => {
               （用户拍板要"撑满 ＋ 全屏等比例放大"，那条链子的一环：
                `.stats-wrap--tree` → `.stats--tree` → `.tree-slot` → 画布）。 -->
       <div v-if="tab === 'tree'" class="tree-slot">
-        <TreePane />
+        <TreePane :motion="treeMotion !== false" />
       </div>
 
       <section v-else-if="!hasEntries" class="hint">

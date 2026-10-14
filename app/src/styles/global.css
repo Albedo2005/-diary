@@ -53,7 +53,8 @@
   --tree-bark: #7a6551; /* 树皮 */
   --tree-bark-dark: #4f4235;
   --tree-sun: #fff3e0; /* 那束投影的直射光 */
-  --tree-foliage: #c9a227; /* 叶（批次 3 才用得到，先备着） */
+  --tree-foliage: #c9a227; /* 叶 —— 秋天是金黄的 */
+  --tree-blossom: #f4c542; /* 花 —— 秋天桂花，比叶子更亮一档，免得花叶糊成一片 */
 
   /* 日记正文的阅读字体（【P2-3】第 1 步）。
      ⚠️ 正文**不再用等宽**（--mono 是给代码 / Markdown 用的）：中文日记用等宽，
@@ -109,6 +110,7 @@
     --tree-bark-dark: #3a3029;
     --tree-sun: #dfe9ff; /* 夜里是月光，偏冷 */
     --tree-foliage: #b8912f;
+    --tree-blossom: #e6bf4d;
 
     color-scheme: dark;
   }

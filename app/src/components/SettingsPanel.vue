@@ -107,6 +107,13 @@ const props = defineProps<{
    *    （编辑器底部那一句吃的就是它），放两份必然对不上。
    */
   dailyWordGoal: number;
+  /**
+   * 「树语」动不动（第一期 · 批次 3 的纪律第 4 条）。
+   *
+   * ⚠️ 真值源在 App.vue —— 它还要把同一个值传给 `StatsPanel` → `TreePane`
+   *    （树那一屏吃的是它），放两份必然出现"设置页说关着、树上还在摆"。
+   */
+  treeMotion: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -123,6 +130,8 @@ const emit = defineEmits<{
   (e: "auto-lock-entries", on: boolean): void;
   /** 「三击左键快速解锁」已成功写入后端，通知 App.vue 更新本地值。 */
   (e: "triple-click-unlock", on: boolean): void;
+  /** 「树语」动效开关（批次 3）。住 `localStorage`，由 App.vue 落盘。 */
+  (e: "tree-motion", on: boolean): void;
   /** 主密码已更换。带上后端返回的最新状态与收尾警告，由 App.vue 落库。 */
   (e: "password-changed", res: ChangePasswordResult): void;
   /**
@@ -473,6 +482,18 @@ async function onChangeDailyWordGoal(e: Event) {
     el.value = props.dailyWordGoal > 0 ? String(props.dailyWordGoal) : ""; // 回滚
     emit("notice", toAppError(err).message);
   }
+}
+
+/**
+ * 切换「树语动效」（第一期 · 批次 3 的纪律第 4 条）。
+ *
+ * ⚠️ 与上面那些开关**不一样**：它**不走后端** —— 它是纯界面偏好，
+ *    住 `localStorage`（与"折叠日历栏""导出格式"同一类），所以
+ *    没有 IPC、不会失败、也不用回滚。这里只负责把新值发给 `App.vue`。
+ * ⛔ 别为了"统一"把它塞进加密库 —— 那要动后端四处，而本期的红线是"不碰 Rust"。
+ */
+function onToggleTreeMotion(e: Event) {
+  emit("tree-motion", (e.target as HTMLInputElement).checked);
 }
 
 // ---------------------------------------------------------------------------
@@ -1569,6 +1590,30 @@ async function doCopyBackups() {
                   @change="onChangeDailyWordGoal"
                 />
                 <span class="unit">字</span>
+              </div>
+            </div>
+
+            <!--
+              树语动效开关（第一期 · 批次 3 的纪律第 4 条）。
+              ⚠️ 排在**最末**，与上面五项不是一族（那五项都在"让提醒响得了"这条链上）。
+              ⚠️ 这一行也只写**一句**（用户 2026-09-28 定的："界面上的解释最多一句话"）——
+                 要说的就一件事：关掉之后**树还在**，否则他会以为把树关没了。
+              ⛔ 别把它挪去"数据与备份"或"安全"：它是**外观偏好**，同族的是
+                 "折叠日历栏""导出格式"（都住 `localStorage`，都不碰后端）。
+            -->
+            <div class="row">
+              <div class="label">
+                <div class="t">树语动效</div>
+                <div class="d">关掉后树还在，只是不随风摆。</div>
+              </div>
+              <div class="ctl">
+                <label class="toggle">
+                  <input
+                    type="checkbox"
+                    :checked="treeMotion"
+                    @change="onToggleTreeMotion"
+                  />
+                </label>
               </div>
             </div>
           </section>

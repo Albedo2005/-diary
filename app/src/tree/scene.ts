@@ -11,14 +11,24 @@
  *    ⛔ 所以这里**不许**出现"按宽度算距离"的写法，那会把树拉变形。
  *    ⚠️ 唯一例外是**极端瘦高**的窗口：那时按高度算会让树冠横着出画，
  *       `fit()` 里有一条兜底把相机退远（只影响很窄的窗口，正常画幅走不到）。
+ *
+ * ── 批次 3 加的两样 ──────────────────────────────────────────────────
+ * **花与叶**：`foliage.ts` 算出挂点 ⇒ 叶、花**各一个 `InstancedMesh`**
+ *   （一片叶子 ＝ 一个四边形面片，⛔ 不是真叶子模型）。加上枝条那一块，
+ *   整棵树一共 **3 次绘制**。
+ * **风**：位移在**顶点着色器里算**（`patchWind` 往材质里注入一小段代码），
+ *   主线程每帧只更新一个 `uWindTime`。⛔ 不是每帧去改几千份实例矩阵。
  */
 import * as THREE from "three";
 import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
 
 import type { Tree } from "./grow.ts";
+import type { Foliage, FoliageInstance } from "./foliage.ts";
 import {
   makeBarkTexture,
+  makeBlossomTexture,
   makeGroundTexture,
+  makeLeafTexture,
   makeSkyTexture,
   readPalette,
   type TreePalette,
@@ -44,6 +54,14 @@ export type TreeStage = {
   fit(width: number, height: number): void;
   /** 系统深浅主题变了：把贴图与光的颜色整个重做一遍。 */
   applyTheme(): void;
+  /**
+   * 现在几点（秒）—— **风的唯一输入**。
+   * ⚠️ 位移是在**顶点着色器里**按这个时间算的，⛔ 主线程每帧只改这一个数，
+   *    不碰任何几何体（碰了几何体就是每帧重传 1600 份矩阵，白烧）。
+   */
+  setTime(seconds: number): void;
+  /** 风的大小（1 ＝ 默认的"轻轻摆"）。第五期做天气时会用到。 */
+  setWind(level: number): void;
   dispose(): void;
 };
 
@@ -116,12 +134,161 @@ function crownWidth(tree: Tree): number {
   return m * 2;
 }
 
+// ---------------------------------------------------------------------------
+// 风（批次 3）
+// ---------------------------------------------------------------------------
+
+/**
+ * 风：树梢处的最大摆幅（世界单位）。
+ * 树高 2.82、画布宽 785 时约 **129 像素/单位** ⇒ 0.055 ≈ **7 个像素**。
+ * ⚠️ 这是指令要的"**轻轻摆**"的量级。想更狠调这里，⛔ 别去改着色器里的频率
+ *    （频率改了会从"摆"变成"抖"）。
+ */
+const WIND_AMPLITUDE = 0.055;
+
+type WindUniforms = {
+  time: { value: number };
+  strength: { value: number };
+  baseY: { value: number };
+  treeH: { value: number };
+};
+
+/**
+ * 顶点位移：**所有的风都在这一段里**。
+ *
+ * ⭐ 直接替掉 `#include <project_vertex>`（three 里算屏幕坐标就这一段），
+ *    于是**普通网格和实例化网格共用同一段代码** —— "实例矩阵要乘在前面"
+ *    这类坑只在同一个地方出现一次。
+ * ⚠️ `modelMatrix` / `viewMatrix` / `projectionMatrix` 都是 three 注入的内建
+ *    uniform，直接用，⛔ 不用自己传。
+ * ⚠️ 弯曲量取 `h²`：树根几乎不动、树梢摆得最狠（`h` ＝ 这个点离地多高，0~1）。
+ * ⚠️ 主线程每帧只更新 `uWindTime` 一个数 —— 位移是显卡算的（指令明文要求）。
+ */
+const WIND_PROJECT = /* glsl */ `
+vec4 mvPosition = vec4( transformed, 1.0 );
+
+#ifdef USE_BATCHING
+
+	mvPosition = batchingMatrix * mvPosition;
+
+#endif
+
+#ifdef USE_INSTANCING
+
+	mvPosition = instanceMatrix * mvPosition;
+
+#endif
+
+vec4 treeWorld = modelMatrix * mvPosition;
+float treeH = clamp( ( treeWorld.y - uWindBaseY ) / uWindTreeH, 0.0, 1.0 );
+float treeFlex = treeH * treeH;
+float treePhase = treeWorld.x * 1.7 + treeWorld.z * 1.15;
+float treeGust = 0.66 + 0.34 * sin( uWindTime * 0.29 + 1.1 );
+float treeAmp = uWindStrength * treeFlex * treeGust;
+treeWorld.x += sin( uWindTime * 1.55 + treePhase ) * treeAmp;
+treeWorld.z += sin( uWindTime * 1.19 + treePhase * 0.72 ) * treeAmp * 0.55;
+treeWorld.y -= abs( sin( uWindTime * 1.55 + treePhase ) ) * treeAmp * 0.14;
+mvPosition = viewMatrix * treeWorld;
+gl_Position = projectionMatrix * mvPosition;
+`;
+
+/**
+ * 把一个材质接到风上。
+ *
+ * ⚠️⚠️ **`customProgramCacheKey` 这一句不能省** —— three 的着色器缓存键里
+ *    **不含 `onBeforeCompile`**（它只看材质自身的参数）。不设的话，两个
+ *    "参数看起来一样"的材质会**共用同一个编好的程序** ⇒ 补过风的树皮
+ *    和没补过的地面有可能撞成同一个，**整块地跟着树一起摆**。
+ *    这是本批最容易踩、而且从现象上看不出原因的一个坑。
+ * ⚠️ 风**只补在树皮与花叶上**，地面、台座、天空一律不补。
+ */
+function patchWind(material: THREE.Material, u: WindUniforms): void {
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uWindTime = u.time;
+    shader.uniforms.uWindStrength = u.strength;
+    shader.uniforms.uWindBaseY = u.baseY;
+    shader.uniforms.uWindTreeH = u.treeH;
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        "#include <common>",
+        `#include <common>
+uniform float uWindTime;
+uniform float uWindStrength;
+uniform float uWindBaseY;
+uniform float uWindTreeH;`
+      )
+      .replace("#include <project_vertex>", WIND_PROJECT);
+  };
+  material.customProgramCacheKey = () => "tree-wind";
+  material.needsUpdate = true;
+}
+
+// ---------------------------------------------------------------------------
+// 花与叶（批次 3）
+// ---------------------------------------------------------------------------
+
+/**
+ * 把一批挂点变成**一个**实例化网格（1600 片叶子 ＝ **1 次绘制**）。
+ *
+ * ⚠️ 几何体是**一个四边形**，只是往上挪了半个身子 ⇒ 实例的挂点正好落在
+ *    面片的**下沿**（叶柄），叶子于是"从枝条上长出来"，而不是"挂在中点"。
+ */
+function buildFoliageMesh(
+  list: FoliageInstance[],
+  material: THREE.Material
+): THREE.InstancedMesh | null {
+  if (list.length === 0) return null;
+
+  const geo = new THREE.PlaneGeometry(1, 1);
+  geo.translate(0, 0.5, 0);
+
+  const mesh = new THREE.InstancedMesh(geo, material, list.length);
+  // 整个场景就 5 个物体，视锥剔除省不下什么，关掉反而少一类
+  // "东西明明在、就是没画出来"的怪事（合并网格/实例化网格都容易栽在这）。
+  mesh.frustumCulled = false;
+
+  const up = new THREE.Vector3(0, 1, 0);
+  const dir = new THREE.Vector3();
+  const pos = new THREE.Vector3();
+  const scale = new THREE.Vector3();
+  const align = new THREE.Quaternion();
+  const spin = new THREE.Quaternion();
+  const m = new THREE.Matrix4();
+
+  list.forEach((it, i) => {
+    pos.set(it.pos.x, it.pos.y, it.pos.z);
+    dir.set(it.dir.x, it.dir.y, it.dir.z).normalize();
+    align.setFromUnitVectors(up, dir);
+    spin.setFromAxisAngle(up, it.roll);
+    align.multiply(spin); // 先自转（把叶子翻个面），再对齐到"朝外"
+    m.compose(pos, align, scale.set(it.size, it.size, it.size));
+    mesh.setMatrixAt(i, m);
+  });
+  mesh.instanceMatrix.needsUpdate = true;
+  return mesh;
+}
+
+/**
+ * 给每个实例刷上颜色（深浅不一，清一色一样亮会像塑料叶子）。
+ * ⚠️ 单独一个函数：换主题时贴图要重画、**实例颜色也得重算**（都从 CSS 变量来）。
+ */
+function paintInstances(
+  mesh: THREE.InstancedMesh | null,
+  list: FoliageInstance[],
+  colour: (tone: number) => THREE.Color
+): void {
+  if (!mesh) return;
+  list.forEach((it, i) => mesh.setColorAt(i, colour(it.tone)));
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+}
+
 /**
  * 搭台子。
  *
- * @param tree 已经长好的骨架（`grow.ts` 的输出）
+ * @param tree    已经长好的骨架（`grow.ts` 的输出）
+ * @param foliage 已经算好的花叶挂点（`foliage.ts` 的输出）
  */
-export function makeStage(tree: Tree): TreeStage {
+export function makeStage(tree: Tree, foliage: Foliage): TreeStage {
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(FOV, 1, 0.05, 400);
 
@@ -210,6 +377,87 @@ export function makeStage(tree: Tree): TreeStage {
   trunk.receiveShadow = true;
   scene.add(trunk);
 
+  // ── 花与叶（批次 3 · B 段） ─────────────────────────────────────
+  /*
+   * ⚠️ 两张贴图的"深色配角"都取 `barkDark`：那是这一套自然色里唯一的深色，
+   *    用来画叶脉和花心刚好（⛔ 别写死一个色号，换主题时会露馅）。
+   */
+  let leafTex = keep(makeLeafTexture(palette.foliage, palette.barkDark));
+  const leafMat = keep(
+    new THREE.MeshStandardMaterial({
+      map: leafTex,
+      roughness: 0.9,
+      metalness: 0,
+      // ⚠️ 叶子是**面片**：法线朝哪边都不该变黑，所以必须双面。
+      side: THREE.DoubleSide,
+      /*
+       * ⭐ 靠 `alphaTest` 把贴图里透明的地方**整个切掉**（不是半透明混合）：
+       *    叶缘干净、不用管前后排序，而且**还能投出带镂空的影子**
+       *    （three 的阴影深度材质会自动继承 map ＋ alphaTest）。
+       */
+      alphaTest: 0.4,
+    })
+  );
+  let blossomTex = keep(makeBlossomTexture(palette.blossom, palette.barkDark));
+  const blossomMat = keep(
+    new THREE.MeshStandardMaterial({
+      map: blossomTex,
+      roughness: 0.75,
+      metalness: 0,
+      side: THREE.DoubleSide,
+      alphaTest: 0.4,
+    })
+  );
+
+  // 深/浅两档实例颜色：`tone` 在它们之间插值 ⇒ 花叶有层次。
+  const leafLo = new THREE.Color();
+  const leafHi = new THREE.Color();
+  const bloomLo = new THREE.Color();
+  const bloomHi = new THREE.Color();
+  const scratch = new THREE.Color();
+  function readFoliageColours(): void {
+    leafLo.set(palette.foliage).offsetHSL(0, 0.05, -0.13);
+    leafHi.set(palette.foliage).offsetHSL(0, 0.02, 0.19);
+    bloomLo.set(palette.blossom).offsetHSL(0, 0.03, -0.1);
+    bloomHi.set(palette.blossom).offsetHSL(0, 0.01, 0.17);
+  }
+  const leafColour = (t: number): THREE.Color => scratch.copy(leafLo).lerp(leafHi, t);
+  const bloomColour = (t: number): THREE.Color => scratch.copy(bloomLo).lerp(bloomHi, t);
+
+  const leafMesh = buildFoliageMesh(foliage.leaves, leafMat);
+  if (leafMesh) {
+    // ⭐ 叶子投影：几何上是一片片四边形的影子 —— 地面上于是有"树影里有光斑"的层次。
+    leafMesh.castShadow = true;
+    scene.add(leafMesh);
+    keep(leafMesh.geometry);
+    keep(leafMesh);
+  }
+  const blossomMesh = buildFoliageMesh(foliage.blossoms, blossomMat);
+  if (blossomMesh) {
+    // ⚠️ 花簇**不投影**：一簇才 9 个像素，投出来只是一层脏兮兮的噪点，
+    //    却要多跑一遍阴影。等第五期真要做"花瓣落下"再说。
+    blossomMesh.castShadow = false;
+    scene.add(blossomMesh);
+    keep(blossomMesh.geometry);
+    keep(blossomMesh);
+  }
+
+  // ── 风 ──────────────────────────────────────────────────────────
+  /*
+   * ⚠️ 只补树皮与花叶三块材质 —— 地面、台座、天空都**不进风**。
+   *    靠 `patchWind` 里的 `customProgramCacheKey` 把它们隔开（那里有说明）。
+   */
+  const wind: WindUniforms = {
+    time: { value: 0 },
+    strength: { value: WIND_AMPLITUDE },
+    // 树根大约在 y＝0（`growTree` 把主干起点放在 −0.02）⇒ 弯曲量从地面算起。
+    baseY: { value: 0 },
+    treeH: { value: Math.max(0.5, tree.height) },
+  };
+  patchWind(barkMat, wind);
+  patchWind(leafMat, wind);
+  patchWind(blossomMat, wind);
+
   // ── 取景 ────────────────────────────────────────────────────────
   const aimY = tree.height * AIM_RATIO;
   const crown = crownWidth(tree);
@@ -246,6 +494,23 @@ export function makeStage(tree: Tree): TreeStage {
     barkMat.map = nextBark;
     barkMat.needsUpdate = true;
 
+    // 花与叶：贴图重画 ＋ **实例颜色也重算**（颜色全从 CSS 变量来，换主题就得一起换）。
+    const nextLeaf = makeLeafTexture(palette.foliage, palette.barkDark);
+    trash.push(nextLeaf);
+    leafMat.map?.dispose();
+    leafMat.map = nextLeaf;
+    leafMat.needsUpdate = true;
+
+    const nextBlossom = makeBlossomTexture(palette.blossom, palette.barkDark);
+    trash.push(nextBlossom);
+    blossomMat.map?.dispose();
+    blossomMat.map = nextBlossom;
+    blossomMat.needsUpdate = true;
+
+    readFoliageColours();
+    paintInstances(leafMesh, foliage.leaves, leafColour);
+    paintInstances(blossomMesh, foliage.blossoms, bloomColour);
+
     const dc = palette.disc;
     discMat.color.set(dc);
   }
@@ -280,5 +545,13 @@ export function makeStage(tree: Tree): TreeStage {
     trash.length = 0;
   }
 
-  return { scene, camera, fit, applyTheme, dispose };
+  function setTime(seconds: number): void {
+    wind.time.value = seconds;
+  }
+
+  function setWind(level: number): void {
+    wind.strength.value = WIND_AMPLITUDE * level;
+  }
+
+  return { scene, camera, fit, applyTheme, setTime, setWind, dispose };
 }

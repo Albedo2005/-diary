@@ -84,19 +84,20 @@ const add = (a: Vec3, b: Vec3): Vec3 => v(a.x + b.x, a.y + b.y, a.z + b.z);
 const mul = (a: Vec3, k: number): Vec3 => v(a.x * k, a.y * k, a.z * k);
 const cross = (a: Vec3, b: Vec3): Vec3 =>
   v(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
-const length = (a: Vec3): number => Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
-function normalize(a: Vec3): Vec3 {
-  const l = length(a);
+export const vecLength = (a: Vec3): number => Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+export function normalize(a: Vec3): Vec3 {
+  const l = vecLength(a);
   return l < 1e-9 ? v(0, 1, 0) : mul(a, 1 / l);
 }
 
 /**
  * 由种子决定的小随机数发生器（mulberry32）。
  *
- * ⭐ **本文件里唯一的"随机"来源。** 整数种子进去、[0,1) 出来，
- *    同一颗种子给出的数列**逐位相同** —— 这就是 A2 那条"同一棵树"的实现方式。
+ * ⭐ **全项目唯一的"随机"来源**（批次 3 的挂花挂叶也从这儿导出去用 ——
+ *    见 `foliage.ts`）。整数种子进去、[0,1) 出来，同一颗种子给出的数列
+ *    **逐位相同** —— 这就是 A2 那条"同一棵树"的实现方式。
  */
-function makeRng(seed: number): () => number {
+export function makeRng(seed: number): () => number {
   let a = seed >>> 0;
   return () => {
     a = (a + 0x6d2b79f5) >>> 0;
@@ -113,7 +114,7 @@ function makeRng(seed: number): () => number {
  * 分叉 = 把父方向**在一个圆锥面上偏转**：绕这两个侧向量各转一点。
  * ⚠️ 参考轴要挑一个跟 `dir` **不平行**的，否则叉乘出零向量、整棵树会塌成一条线。
  */
-function sideBasis(dir: Vec3): [Vec3, Vec3] {
+export function sideBasis(dir: Vec3): [Vec3, Vec3] {
   const ref = Math.abs(dir.y) > 0.9 ? v(1, 0, 0) : v(0, 1, 0);
   const u = normalize(cross(ref, dir));
   const w = cross(dir, u);

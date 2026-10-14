@@ -22,7 +22,10 @@ export const TREE_COLORS = {
   barkDark: ["--tree-bark-dark", "#4f4235"],
   /** 那束投影的直射光的颜色（浅色下偏暖白，深色下偏冷月白）。 */
   sun: ["--tree-sun", "#fff3e0"],
+  /** 叶 —— 秋天是金黄的（B1：花叶跟着当季走）。 */
   foliage: ["--tree-foliage", "#c9a227"],
+  /** 花 —— 秋天桂花；比叶子再亮一档，否则花叶糊成一片看不出花。 */
+  blossom: ["--tree-blossom", "#f4c542"],
 } as const;
 
 export type TreeColorName = keyof typeof TREE_COLORS;
@@ -239,6 +242,159 @@ export function makeGroundTexture(base: string, far: string): THREE.CanvasTextur
   const tex = new THREE.CanvasTexture(cv);
   tex.wrapS = THREE.RepeatWrapping;
   tex.wrapT = THREE.RepeatWrapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+// ---------------------------------------------------------------------------
+// 批次 3：花与叶
+// ---------------------------------------------------------------------------
+
+/**
+ * 叶：一片**带透明边的面片**（B 段定的做法 —— 比建真叶子模型便宜一个量级）。
+ *
+ * ⭐ 贴图是**在画布上现画的一片叶子**（不是素材图）：叶形＝两段对称贝塞尔，
+ *    纵向渐变 ＋ 主脉 ＋ 侧脉 ＋ 一点噪点。
+ * ⚠️ 底色**全透明**（`clearRect`）—— 靠材质的 `alphaTest` 把没画到的地方
+ *    整个切掉，于是叶缘干净；⛔ 不能走半透明混合，那会带来前后排序问题。
+ * ⚠️ 画布 128×128、叶子竖着长（**叶尖朝 +Y**）—— 渲染那边把面片的 +Y
+ *    对齐到"叶子该朝的方向"。
+ */
+export function makeLeafTexture(base: string, dark: string): THREE.CanvasTexture {
+  const S = 128;
+  const [cv, ctx] = canvas2d(S, S);
+  const b = parseCssColor(base);
+  const d = parseCssColor(dark);
+  ctx.clearRect(0, 0, S, S);
+
+  const cx = S / 2;
+  const tipY = 9; // 叶尖
+  const petioleY = 123; // 叶柄（连在枝上那端）
+  const half = 27; // 最宽处的半宽
+  const wideY = 62; // 最宽处在哪
+
+  /** 叶形轮廓：左右两条对称贝塞尔（控制点往外撑 ⇒ 披针形，不是椭圆）。 */
+  const outline = (): void => {
+    ctx.beginPath();
+    ctx.moveTo(cx, petioleY);
+    ctx.bezierCurveTo(cx - half, wideY + 30, cx - half, wideY - 40, cx, tipY);
+    ctx.bezierCurveTo(cx + half, wideY - 40, cx + half, wideY + 30, cx, petioleY);
+    ctx.closePath();
+  };
+
+  outline();
+  const g = ctx.createLinearGradient(0, tipY, 0, petioleY);
+  g.addColorStop(0, hex(shade(b, 1.2)));
+  g.addColorStop(0.5, hex(b));
+  g.addColorStop(1, hex(shade(b, 0.72)));
+  ctx.fillStyle = g;
+  ctx.fill();
+
+  // 主脉：从叶柄通到叶尖
+  ctx.strokeStyle = `rgba(${d[0]},${d[1]},${d[2]},0.5)`;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(cx, petioleY - 3);
+  ctx.lineTo(cx, tipY + 8);
+  ctx.stroke();
+
+  // 侧脉：从主脉斜着往外挑，长度按叶形收放（抛物线近似，两头自然收窄）
+  ctx.strokeStyle = `rgba(${d[0]},${d[1]},${d[2]},0.3)`;
+  ctx.lineWidth = 0.9;
+  for (let i = 1; i <= 4; i += 1) {
+    const t = i / 5;
+    const y = tipY + (petioleY - tipY) * t;
+    const w = half * Math.pow(4 * t * (1 - t), 0.7) * 0.85;
+    for (const s of [-1, 1]) {
+      ctx.beginPath();
+      ctx.moveTo(cx, y);
+      ctx.quadraticCurveTo(cx + s * w * 0.6, y - 6, cx + s * w, y - 15);
+      ctx.stroke();
+    }
+  }
+
+  // 叶面噪点 —— ⚠️ 裁在叶形里，别糊到透明区（那里多一个像素都会变成"毛刺"）
+  ctx.save();
+  outline();
+  ctx.clip();
+  speckle(ctx, S, S, 420, 0.12);
+  ctx.restore();
+
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+/**
+ * 花：**一簇**桂花（B4 定的口径 —— 桂花是"一簇簇小碎花"，⛔ 不是一朵朵大花）。
+ *
+ * ⭐ 一朵桂花在屏幕上只有两三个像素，所以这里画的不是"一朵花"，而是
+ *    **一簇**：约 30 朵四瓣小花聚成一个毛茸茸的圆球，渲染那边把它实例化成
+ *    一片小小的四边形。⛔ 别改成一朵大花，那就不像桂花了。
+ * ⚠️ 最后用 `destination-in` 抹一圈径向羽化 ⇒ 簇是**圆的**，不是一块方片。
+ */
+export function makeBlossomTexture(base: string, dark: string): THREE.CanvasTexture {
+  const S = 96;
+  const [cv, ctx] = canvas2d(S, S);
+  const b = parseCssColor(base);
+  const d = parseCssColor(dark);
+  ctx.clearRect(0, 0, S, S);
+
+  const c = S / 2;
+
+  /** 画一朵四瓣小花：绕花心排 4 个小椭圆 ＋ 一粒更深的花心。 */
+  const flower = (x: number, y: number, r: number): void => {
+    const k = Math.random() * Math.PI;
+    for (let i = 0; i < 4; i += 1) {
+      const a = (i / 4) * Math.PI * 2 + k;
+      ctx.fillStyle = hex(shade(b, 0.9 + Math.random() * 0.24));
+      ctx.beginPath();
+      ctx.ellipse(
+        x + Math.cos(a) * r * 0.7,
+        y + Math.sin(a) * r * 0.7,
+        r * 0.78,
+        r * 0.58,
+        a,
+        0,
+        Math.PI * 2
+      );
+      ctx.fill();
+    }
+    ctx.fillStyle = hex(shade(d, 1.2));
+    ctx.beginPath();
+    ctx.arc(x, y, r * 0.34, 0, Math.PI * 2);
+    ctx.fill();
+  };
+
+  for (let i = 0; i < 30; i += 1) {
+    // ⚠️ 半径取 sqrt 分布 ⇒ 铺满圆面；直接用随机半径会全挤在花心上。
+    const a = Math.random() * Math.PI * 2;
+    const rr = S * 0.42 * Math.sqrt(Math.random());
+    flower(c + Math.cos(a) * rr, c + Math.sin(a) * rr * 0.94, 2.4 + Math.random() * 1.8);
+  }
+
+  // 几粒没开的花苞，让簇的边缘不那么规整
+  for (let i = 0; i < 10; i += 1) {
+    const a = Math.random() * Math.PI * 2;
+    const rr = S * 0.46 * Math.sqrt(Math.random());
+    ctx.fillStyle = hex(shade(d, 1.05 + Math.random() * 0.3));
+    ctx.beginPath();
+    ctx.arc(c + Math.cos(a) * rr, c + Math.sin(a) * rr * 0.94, 1.3 + Math.random() * 0.9, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // 圆形羽化：把方画布"削"成一个软边的圆球
+  ctx.globalCompositeOperation = "destination-in";
+  const mask = ctx.createRadialGradient(c, c, S * 0.3, c, c, S * 0.5);
+  mask.addColorStop(0, "rgba(0,0,0,1)");
+  mask.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.fillStyle = mask;
+  ctx.fillRect(0, 0, S, S);
+  ctx.globalCompositeOperation = "source-over";
+
+  const tex = new THREE.CanvasTexture(cv);
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.anisotropy = 4;
   return tex;
