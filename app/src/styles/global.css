@@ -49,12 +49,15 @@
   --tree-sky-bottom: #f4f8f6;
   --tree-ground: #b9c8ac; /* 草地 */
   --tree-ground-far: #d3dcc9;
-  --tree-disc: #a8b79f; /* 树下那圈很淡的圆台 */
+  --tree-disc: #bccab0; /* 树下那圈圆台 —— 调整轮改成**贴着草地的色**（原来 #a8b79f 明显深一档，像扣了个盘子） */
   --tree-bark: #7a6551; /* 树皮 */
   --tree-bark-dark: #4f4235;
   --tree-sun: #fff3e0; /* 那束投影的直射光 */
   --tree-foliage: #c9a227; /* 叶 —— 秋天是金黄的 */
-  --tree-blossom: #f4c542; /* 花 —— 秋天桂花，比叶子更亮一档，免得花叶糊成一片 */
+  /* 花 —— 秋天桂花。⚠️ 调整轮：`#f4c542` → `#ffe9a3`（用户："对比度拉开"）。
+     原来的只比叶子亮一档，远看和秋叶糊成一片；桂花本就是**淡黄近白**，
+     改成近白后与叶子的**亮度**和**饱和度**双双拉开，一眼能看见。 */
+  --tree-blossom: #ffe9a3;
 
   /* 日记正文的阅读字体（【P2-3】第 1 步）。
      ⚠️ 正文**不再用等宽**（--mono 是给代码 / Markdown 用的）：中文日记用等宽，
@@ -105,12 +108,13 @@
     --tree-sky-bottom: #26344d;
     --tree-ground: #2c3831;
     --tree-ground-far: #1b2422;
-    --tree-disc: #35423b;
+    --tree-disc: #33403a;
     --tree-bark: #6d5a49;
     --tree-bark-dark: #3a3029;
     --tree-sun: #dfe9ff; /* 夜里是月光，偏冷 */
     --tree-foliage: #b8912f;
-    --tree-blossom: #e6bf4d;
+    /* ⚠️ 调整轮：`#e6bf4d` → `#f2d98a`（深色主题同样把花色往近白推）。 */
+    --tree-blossom: #f2d98a;
 
     color-scheme: dark;
   }

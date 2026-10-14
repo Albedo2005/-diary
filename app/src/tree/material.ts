@@ -24,8 +24,8 @@ export const TREE_COLORS = {
   sun: ["--tree-sun", "#fff3e0"],
   /** 叶 —— 秋天是金黄的（B1：花叶跟着当季走）。 */
   foliage: ["--tree-foliage", "#c9a227"],
-  /** 花 —— 秋天桂花；比叶子再亮一档，否则花叶糊成一片看不出花。 */
-  blossom: ["--tree-blossom", "#f4c542"],
+  /** 花 —— 秋天桂花。⚠️ 调整轮改成**近白**：原来的只比叶子亮一档，远看糊成一片。 */
+  blossom: ["--tree-blossom", "#ffe9a3"],
 } as const;
 
 export type TreeColorName = keyof typeof TREE_COLORS;

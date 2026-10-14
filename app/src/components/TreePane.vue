@@ -62,6 +62,17 @@ type StageHook = {
   tips: number;
   height: number;
   crownWidth: number;
+  /**
+   * ⭐ 调整轮新增：**树冠枝条的垂直角分布**（园艺学分档：直立／斜生／水平／下垂）。
+   *
+   * 为什么要把它放进钩子 —— 用户这一轮的核心要求是「**大部分向斜上方生长，
+   * 一部分向平行于地面的四周生长，向下生长的不好看都被裁剪掉了**」。
+   * 做成四个计数后，验收脚本就能**从真实 DOM 里直接读数**断言，
+   * ⛔ 不用靠"我觉得这张图像真树"来判。
+   */
+  angleBins: { 直立: number; 斜生: number; 水平: number; 下垂: number };
+  /** 树冠枝条垂直角的平均值（度）。 */
+  angleMean: number;
   /** 花与叶的片数（证明"花叶真挂上去了"）。 */
   leaves: number;
   blossoms: number;
@@ -118,6 +129,29 @@ onMounted(() => {
   let maxSide = 0;
   for (const b of tree.branches) maxSide = Math.max(maxSide, Math.abs(b.to.x), Math.abs(b.to.z));
 
+  /*
+   * ⭐ 调整轮新增：算树冠枝条的**垂直角分布**（园艺学分档）。
+   *    尺子：垂直角 ＝ 枝条与竖直主干的夹角。
+   *      <30° 直立 ｜ 30~60° 斜生 ｜ 60~90° 水平 ｜ >90° 下垂（真树里要剪掉）。
+   *    ⚠️ 只看 `depth ≥ 2` 的枝 —— 主干和它下面那一级是"骨架"，不算树冠形态。
+   */
+  const angleBins = { 直立: 0, 斜生: 0, 水平: 0, 下垂: 0 };
+  let angleSum = 0;
+  let angleN = 0;
+  for (const b of tree.branches) {
+    if (b.depth < 2) continue;
+    const dy = b.to.y - b.from.y;
+    const len = Math.hypot(b.to.x - b.from.x, dy, b.to.z - b.from.z);
+    if (len < 1e-9) continue;
+    const deg = (Math.acos(Math.max(-1, Math.min(1, dy / len))) * 180) / Math.PI;
+    angleSum += deg;
+    angleN++;
+    if (deg < 30) angleBins.直立++;
+    else if (deg < 60) angleBins.斜生++;
+    else if (deg <= 90) angleBins.水平++;
+    else angleBins.下垂++;
+  }
+
   /**
    * 自动验收用的计数。
    * ⭐ `frames` **只能由"真的画了一帧"来加** —— ⛔ 不许拿浏览器的动画帧冒充
@@ -131,6 +165,8 @@ onMounted(() => {
     tips: tree.tips.length,
     height: tree.height,
     crownWidth: maxSide * 2,
+    angleBins,
+    angleMean: angleN > 0 ? angleSum / angleN : 0,
     leaves: foliage.leaves.length,
     blossoms: foliage.blossoms.length,
     triangles: 0,
@@ -149,7 +185,11 @@ onMounted(() => {
   hookHost.__treeStage = hook;
 
   renderer = new THREE.WebGLRenderer({ antialias: true });
-  // D4：**画质按屏幕密度封顶 2 倍**。不封顶的话 4K 屏会傻乎乎按 4 倍画，白烧一倍显卡。
+  /*
+   * D4：**画质按屏幕密度封顶 2 倍**。不封顶的话 4K 屏会傻乎乎按 4 倍画，白烧一倍显卡。
+   * ⚠️ 调整轮：这里的**初值**保留（挂载时先按当前屏画一帧），但真正的
+   *    "封顶"改由 `resize()` 每次重算 —— 见那个函数里的注释（换显示器的问题）。
+   */
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   // D2：地上一片淡淡的树影 —— "像不像真的"里性价比最高的一项。
   renderer.shadowMap.enabled = true;
@@ -216,6 +256,17 @@ onMounted(() => {
     if (!box || !renderer || !stage) return;
     const w = Math.max(1, box.clientWidth);
     const h = Math.max(1, box.clientHeight);
+    /*
+     * ⭐ 调整轮：**把"画质封顶"挪进 `resize()`**（用户拍板"换显示器那条也补"）。
+     *
+     * ⚠️ 原来它只在挂载时算一次（`renderer.setPixelRatio(...)` 那一行），
+     *    所以**把窗口拖到另一块缩放比不同的屏幕上时，画布不会按新密度重画**
+     *    —— 现象是字和叶子在新屏幕上发虚／发糊。
+     * ⭐ 放在这里就跟着 `ResizeObserver` 一起跑：换屏通常伴随可用尺寸变化，
+     *    所以几乎一定会触发；即使尺寸恰好不变，下面的 `setSize` 也会接着重算。
+     * ⚠️ 上限仍是 **2**（D4 定的），只是现在**每次都重新读一遍** `devicePixelRatio`。
+     */
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     // ⚠️ 第三个参数 `updateStyle = false`：**不让 three 往画布上写内联宽高**，
     //    尺寸交给 CSS（`.tree-stage :deep(canvas)` 的 100%）。
     //    这样"填充多大"只有一个来源（CSS），不会出现两套尺寸打架。

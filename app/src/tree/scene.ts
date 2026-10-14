@@ -36,8 +36,13 @@ import {
 
 /** 竖直视角。45 是"人眼舒服、又不至于透视太夸张"的常见值。 */
 const FOV = 45;
-/** A4：树高占画面 75%。 */
-const TREE_FILL = 0.75;
+/**
+ * A4：树高占画面 75%。
+ * ⚠️ 调整轮：**0.75 → 0.82**（用户：「树占比画面不是很大」）。
+ *    ⚠️ 但**上不了 0.9** —— 那是 A4 之外还留了"树顶到画面顶"的余量，
+ *    贴到边会显得憋；0.82 是"明显更大、又还透气"的位置。
+ */
+const TREE_FILL = 0.82;
 /** 树冠横向要留的边（只在窗口太窄时才会用上，见文件头）。 */
 const CROWN_FILL = 0.9;
 /** 相机瞄在树的这个高度比例上 —— 取 0.55 是为了让树"**居中、略偏下**"。 */
@@ -350,7 +355,12 @@ export function makeStage(tree: Tree, foliage: Foliage): TreeStage {
   scene.add(ground);
   keep(ground.geometry);
 
-  // ── 树下那圈很淡的圆台（A5：照视频里那个底座） ──────────────────
+  /* ── 树下那圈很淡的圆台 ──────────────────────────────────────────
+   * A5：照视频里那个底座。
+   * ⚠️ 调整轮：**更含蓄**（用户："树下那圈圆台改成跟地面同色系、更含蓄一点"）。
+   *    原来 0.045 高、颜色 `--tree-disc` 比草地明显深一档 ⇒ 像扣了个盘子。
+   *    现在压到 **0.026**（几乎贴地）、颜色交给 CSS 里往草地靠。
+   */
   const discMat = keep(
     new THREE.MeshStandardMaterial({
       color: new THREE.Color(palette.disc),
@@ -359,9 +369,9 @@ export function makeStage(tree: Tree, foliage: Foliage): TreeStage {
     })
   );
   const discR = Math.max(crownWidth(tree) * 0.62, tree.height * 0.32);
-  const discGeo = keep(new THREE.CylinderGeometry(discR * 0.985, discR, 0.045, 64));
+  const discGeo = keep(new THREE.CylinderGeometry(discR * 0.985, discR, 0.026, 64));
   const disc = new THREE.Mesh(discGeo, discMat);
-  disc.position.y = 0.0225;
+  disc.position.y = 0.013;
   disc.receiveShadow = true;
   disc.castShadow = false;
   scene.add(disc);
@@ -418,8 +428,14 @@ export function makeStage(tree: Tree, foliage: Foliage): TreeStage {
   function readFoliageColours(): void {
     leafLo.set(palette.foliage).offsetHSL(0, 0.05, -0.13);
     leafHi.set(palette.foliage).offsetHSL(0, 0.02, 0.19);
-    bloomLo.set(palette.blossom).offsetHSL(0, 0.03, -0.1);
-    bloomHi.set(palette.blossom).offsetHSL(0, 0.01, 0.17);
+    /*
+     * ⚠️ 调整轮：花的**两档差距拉开**（用户："对比度拉开"）。
+     *    原来 −0.10 / +0.17 —— 同一簇里明暗只差 0.27，远看是一块平的色块。
+     *    现在 −0.16 / +0.22 ⇒ 一簇里自己就有明暗层次，加上花本身已经近白，
+     *    和叶子的金黄在**亮度 ＋ 饱和度**两处同时分开。
+     */
+    bloomLo.set(palette.blossom).offsetHSL(0, 0.04, -0.16);
+    bloomHi.set(palette.blossom).offsetHSL(0, 0.01, 0.22);
   }
   const leafColour = (t: number): THREE.Color => scratch.copy(leafLo).lerp(leafHi, t);
   const bloomColour = (t: number): THREE.Color => scratch.copy(bloomLo).lerp(bloomHi, t);

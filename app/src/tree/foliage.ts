@@ -71,10 +71,18 @@ export const DEFAULT_FOLIAGE: FoliageOptions = {
    */
   minDepth: 2,
   leafPerUnit: 30,
-  blossomPerUnit: 6.5,
-  // 树高 2.82；这两个数是"叶子在屏幕上大约 13 像素"倒推出来的（画布宽 785 时）。
+  /*
+   * ⭐ 调整轮：**6.5 → 4.6**（用户："我感觉花有点密…调整间隙"）。
+   *    ⚠️ 只降花、**不降叶** —— 用户要的是"花别挤"，不是"树变秃"；
+   *    叶子保持原密度，花稀疏下来后反而更看清楚"一簇一簇"。
+   *    ⭐ 同时 `alongBranch` 改成了"均分后抖动"（见那里），所以实际观感
+   *    比这个数字降得更多 —— 花之间会真正留出缝。
+   */
+  blossomPerUnit: 4.6,
+  // 树高 2.79；这两个数是"叶子在屏幕上大约 13 像素"倒推出来的（画布宽 785 时）。
   leafSize: 0.115,
-  blossomSize: 0.095,
+  // ⚠️ 调整轮：0.095 → 0.088 —— 花小了才显得"疏"，也才不糊成一片。
+  blossomSize: 0.088,
 };
 
 // ---------------------------------------------------------------------------
@@ -160,9 +168,21 @@ export function growFoliage(tree: Tree, overrides: Partial<FoliageOptions> = {})
       });
     };
 
-    /** 沿枝条把 `n` 个挂点撒开（首尾各留一点余量，别怼在端点上）。 */
+    /**
+     * 沿枝条把 `n` 个挂点撒开（首尾各留一点余量，别怼在端点上）。
+     *
+     * ⚠️ 调整轮改：原来是 `(i + 0.15 + rng() * 0.7) / n` —— **每个点纯随机**
+     *    ⇒ 两个点撞在一起的概率很高（生日问题），簇里就会"花挤成一坨"。
+     *    现在改成**先把这一段均分、再在每格里抖 ±40% 格宽**：
+     *    既保留不规整的天然感，又保证不会出现两个点重叠。
+     */
     const alongBranch = (n: number, f: (t: number) => void): void => {
-      for (let i = 0; i < n; i += 1) f(Math.min(0.99, (i + 0.15 + rng() * 0.7) / n));
+      if (n <= 0) return;
+      const slot = 1 / n;
+      for (let i = 0; i < n; i += 1) {
+        const jittered = (i + 0.5 + (rng() * 2 - 1) * 0.4) * slot;
+        f(Math.max(0.02, Math.min(0.99, jittered)));
+      }
     };
 
     const nLeaf = Math.max(0, Math.round(len * o.leafPerUnit * (0.55 + 0.3 * b.depth)));

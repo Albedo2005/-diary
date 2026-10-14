@@ -82,17 +82,27 @@ test("花叶都长在树冠上，⛔ 没有一片长到地面以下", () => {
   const ys = [...f.leaves, ...f.blossoms].map((x) => x.pos.y);
   const lo = Math.min(...ys);
   const hi = Math.max(...ys);
-  // 树干占全树约三分之一、主枝再往上一截 ⇒ 树冠从**半树高以上**开始才对。
-  assert.ok(lo > t.height * 0.45, `最低的一片在树高 ${(lo / t.height * 100).toFixed(0)}% 处，太低了`);
+  /*
+   * ⚠️ 调整轮改判据：原来要求"最低一片 > 树高 45%"。
+   *    但"主干沿途出 3 层侧枝"之后，**最下面那层侧枝本身就在树高约 1/4 处**，
+   *    花叶跟着挂到那儿 ⇒ 实测 25%。这正是要的"树冠从下往上都有东西"，
+   *    ⛔ 不是退化 —— 旧判据会把正确的树判红。
+   * ⭐ 新判据守住真正该守的那条线：**别掉到树干那一段上去**（树高 20% 以下）。
+   */
+  assert.ok(lo > t.height * 0.2, `最低的一片在树高 ${(lo / t.height * 100).toFixed(0)}% 处，太低（掉到树干上了）`);
   assert.ok(hi <= t.height + 0.2, `最高的一片比树还高 ${(hi - t.height).toFixed(2)}`);
 });
 
 test("数量在合理区间（太少树冠是光的，太多批次 3 会拖慢）", () => {
   const t = growTree({ seed: 20260930 });
   const f = growFoliage(t, { seed: 20260930 });
-  assert.ok(f.leaves.length >= 700, `叶子只有 ${f.leaves.length} 片，树冠会很稀`);
+  // ⚠️ 调整轮：maxDepth 5→4（用户："树枝太密"）⇒ 枝条 139→31、挂点 72→16，
+  //    叶子总量跟着从 1,645 降到约 390。**这是用户要的"疏"，不是回归。**
+  //    ⚠️ 但"枝条变少"不能变成"树冠发亮" —— 所以下限按**每根枝**来定更稳：
+  //    `leafPerUnit` 保证每单位枝长上叶子管够（那条另有专门断言）。
+  assert.ok(f.leaves.length >= 300, `叶子只有 ${f.leaves.length} 片，树冠会很稀`);
   assert.ok(f.leaves.length <= 3000, `叶子多到 ${f.leaves.length} 片，会白烧显卡`);
-  assert.ok(f.blossoms.length >= 80, `花簇只有 ${f.blossoms.length} 簇，看不出"开花了"`);
+  assert.ok(f.blossoms.length >= 30, `花簇只有 ${f.blossoms.length} 簇，看不出"开花了"`);
   assert.ok(f.blossoms.length <= 600, `花簇多到 ${f.blossoms.length} 簇，会白烧显卡`);
   // 桂花是"一簇簇小碎花"，本来就比叶子少 —— 花比叶还多的树不像桂花。
   assert.ok(f.blossoms.length < f.leaves.length, "花比叶子还多，不像桂花");
