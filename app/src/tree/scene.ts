@@ -24,14 +24,7 @@ import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
 
 import type { Tree } from "./grow.ts";
 import type { Foliage, FoliageInstance } from "./foliage.ts";
-import {
-  RING_BAND_INNER,
-  RING_BAND_OUTER,
-  RING_PICK_HEIGHT_RATIO,
-  RING_PICK_RADIUS,
-  RING_TUBE_RATIO,
-  type Ring,
-} from "./rings.ts";
+import type { TrunkBlock } from "./rings.ts";
 import {
   makeBarkTexture,
   makeBlossomTexture,
@@ -76,22 +69,39 @@ export type TreeStage = {
   /** 风的大小（1 ＝ 默认的"轻轻摆"）。第五期做天气时会用到。 */
   setWind(level: number): void;
   /**
-   * 第二期：把年轮环摆到主干上（`rings.ts` 算好位置，这里只管画）。
+   * 第二期：把**树干上的三段年轮块**摆上去（`rings.ts` 算好位置，这里只管画）。
    * ⚠️ 幂等 —— 重复调用会先把上一批拆干净，不会越堆越多。
    */
-  setRings(rings: Ring[]): void;
-  /** 展开某一圈（`null` ＝ 全收回）。⭐ 同时只会有一圈是开的。 */
-  setRingOpen(index: number | null): void;
-  /** 鼠标现在悬在哪一圈上（`null` ＝ 没悬停）。 */
-  setRingHover(index: number | null): void;
+  setBlocks(blocks: TrunkBlock[]): void;
+  /** 现在"开着"哪一块（`null` ＝ 都收着、面板也收着）。⭐ 同时只会有一块是开的。 */
+  setBlockActive(index: number | null): void;
+  /** 鼠标现在悬在哪一块上（`null` ＝ 没悬停）。 */
+  setBlockHover(index: number | null): void;
   /**
    * 屏幕**归一化设备坐标**（NDC：-1~1，画布中心是 0,0，左上角是 -1,+1）
-   * → 命中第几圈（没命中 ＝ `null`）。
+   * → 命中第几块（没命中 ＝ `null`）。
    *
    * ⚠️ NDC 必须用 `getBoundingClientRect()` 换算，⛔ 不用 `canvas.width/height`
    *    （那是**背衬**尺寸，差一个屏密度倍率，第一期在这儿栽过）。
    */
-  pickRing(nx: number, ny: number): number | null;
+  pickBlock(nx: number, ny: number): number | null;
+  /**
+   * ⭐ **只给验收用**：把三块薄壳**整体藏起来 / 放出来**。
+   *
+   * 为什么要开这个口子：`I3`（"多出来的三角形逐个数得上"）是这一套里**最灵的
+   * 一把尺子** —— 批次 1 那三圈细环就是被它当场抓出来的（多出 2,304，正好对上）。
+   * 这一版把环换成薄壳，"几何算出来是 3×20×2 ＝ 120"只是**推的**；
+   * 藏起来再渲染一帧、用差值量一次，才是**量的**。
+   * ⚠️ 平时渲染路径**完全不走这里**，只在挂载时量一次。
+   */
+  setBlocksVisible(visible: boolean): void;
+  /**
+   * ⭐ **只给验收用**：三块薄壳的**纯几何**三角形数（Σ `index.count / 3`）。
+   *
+   * ⚠️ 它跟"渲染器账本上的差值"（`|blockTriOn − blockTriOff|`）**必须分开报**：
+   *    两个数对不上，就说明有别的东西也被算进去了 —— 那正是要找的线索。
+   */
+  blockTriangles(): number;
   dispose(): void;
 };
 
@@ -313,40 +323,46 @@ function paintInstances(
 }
 
 // ---------------------------------------------------------------------------
-// 年轮环（第二期 · 批次 1）
+// 年轮块（第二期 · 修订版：树干上的三段）
 // ---------------------------------------------------------------------------
 
 /*
- * ⚠️ 环的颜色**复用已有的树色变量，不新增 CSS 变量** ——
- *    这一批只许动 4 个文件（`rings.ts` / `rings.test.ts` / `scene.ts` / `TreePane.vue`），
- *    `styles/global.css` 不在名单里。
+ * ⚠️⚠️ 这一节在 **2026-10-14 17:37 被推翻重写过一版**。
  *
- * ⚠️⚠️ **第一次跑完截图之后改过一版**：原来平时态用的是 `--tree-bark-dark`
- *    （"比树皮深一档"，看着最含蓄）—— 结果**在深色主题下整个看不见**：
- *    树干本身就差不多是这个色，细环（管径不到 2 像素）压上去等于没画。
- *    而用户定过"界面上不写解释性小字"⇒ **唯一的提示就只剩"看得见"**，
- *    看不见 ＝ 这个功能等于不存在。
- *    ⇒ 改成用**浅黄**（跟花同色系）：两种主题下树皮都是棕色，
- *      浅黄压上去对比明显，但因为是"细箍"所以并不抢眼。
+ * 第一版把"点击区"做成了**套在主干上的三圈可见细环**（`TorusGeometry`
+ * ＋ 点开原地抽成环带）。用户看完截图当场纠正：
+ *   · **点击区是"树干上的一段（一块）"，不是环**；
+ *   · **平时画个圈太突兀**；
+ *   · 点开之后应当**在侧边弹面板**画"圆环数据图"，⛔ 不是在树上原地展开。
+ * ⇒ 可见的环几何（`buildRingTorus` / `buildRingBand`）**整段删掉**，
+ *   留下的是"怎么把一段树干淡淡地标出来 ＋ 怎么点得中"。
+ *
+ * ⭐ 现在的做法：每块一个**贴着树皮的透明薄壳** ——
+ *   · 半径 ＝ 该处主干半径 × 1.06（⛔ 不能 ≤ 主干半径，否则陷进树皮里看不见也点不着）；
+ *   · 平时**很淡**，鼠标划过 ⇒ 提亮，开着的那块 ⇒ 更亮；
+ *   · ⭐ **薄壳自己就是射线热区** —— 不再需要第一版那种"看不见的粗圆柱"
+ *     （那时是因为细环太细、点不中；现在薄壳整段包住树干，点哪都中）；
+ *   · ⚠️ 颜色一律从 CSS 变量取（换主题时 `applyTheme()` 会重读重刷）。
  */
-const RING_VARS = {
-  /** 平时那一圈细环 —— ⭐ 必须跟树皮**明显不同色**，否则等于没画（见上）。 */
-  ring: "--tree-blossom",
-  /** 悬停 / 展开时的细环（"亮起来"）—— 接近白的暖白，跟浅黄能分辨。 */
-  hot: "--tree-sun",
-  /** 展开环带里"没写过"的格子（暗底）。 */
-  dim: "--tree-bark-dark",
-  /** 展开环带里"写过"的格子（批次 2 接上数据才会用上）。 */
-  lit: "--tree-blossom",
+
+/**
+ * 三种状态下的透明度。
+ * ⭐ 薄壳"看不看得见"**只靠这个数**（⛔ 不靠描边、不靠画圈）——
+ *    用户要的正是"够看得见、又不突兀"，所以这组数是这一版最要紧的参数。
+ * ⚠️ 调大之前想清楚：批次 1 的"突兀"就是这么来的。
+ */
+const BLOCK_OPACITY = { idle: 0.13, hover: 0.3, active: 0.36 } as const;
+
+/** 薄壳颜色取哪几个 CSS 变量（⛔ 不新增变量 —— 复用树语那一套）。 */
+const BLOCK_VARS = {
+  /** 平时 / 悬停 —— 用花的浅黄（两种主题下树皮都是棕色，浅黄压上去对比明显）。 */
+  shell: "--tree-blossom",
+  /** "开着"那一块 —— 直射光的暖白，显得更"被选中"。 */
+  active: "--tree-sun",
 } as const;
 
-/** CSS 变量取不到时的兜底色（⛔ 不许让 undefined 进 three）。 */
-const RING_FALLBACK = {
-  ring: "#ffe9a3",
-  hot: "#fff3e0",
-  dim: "#4f4235",
-  lit: "#ffe9a3",
-} as const;
+/** CSS 变量取不到时的兜底色（⛔ 不许让空串进 three）。 */
+const BLOCK_FALLBACK = { shell: "#ffe9a3", active: "#fff3e0" } as const;
 
 /** 从 CSS 变量读一个颜色；读不到就用兜底。 */
 function readCss(name: string, fallback: string): string {
@@ -355,55 +371,45 @@ function readCss(name: string, fallback: string): string {
 }
 
 /**
- * 平时态：一圈**细环**（像一道箍贴在树皮上）。
- * ⚠️ 圆环默认躺在 XY 平面（法线 +Z）⇒ 这里先转成**法线 +Y**，
- *    好让细环与环带**共用同一套朝向口径**（都按 "+Y → 主干方向" 摆）。
+ * ⭐「年轮纹理」：一张极简的**横向条纹**贴图，贴在薄壳上当"纹路"。
+ *
+ * 为什么不用纯色：用户拍板的是"**保留一点极淡的年轮纹理**"——
+ * 纯色只是一层均匀的色雾（像罩了个塑料袋），有几道横线才像**树的年轮**。
+ * ⚠️ 贴图**现场生成**（跟树皮 / 叶子那些一个路子），⛔ 不引图片资源。
+ * ⚠️ 只画 **4 像素宽**（沿周长重复，看不出接缝），高 64 ——
+ *    上下各一道实线（＝ 相邻两块的**分界线**，让人一眼看出"是三段"），中间两道浅线。
  */
-function buildRingTorus(radius: number): THREE.BufferGeometry {
-  const g = new THREE.TorusGeometry(radius, radius * RING_TUBE_RATIO, 6, 64);
-  g.rotateX(-Math.PI / 2);
-  return g;
+function makeBlockTexture(): THREE.CanvasTexture {
+  const h = 64;
+  const c = document.createElement("canvas");
+  c.width = 4;
+  c.height = h;
+  const ctx = c.getContext("2d");
+  if (ctx) {
+    ctx.clearRect(0, 0, 4, h);
+    // 底色：一层"看得见但不抢眼"的淡色（透明度最终还要乘 `BLOCK_OPACITY`）
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.fillRect(0, 0, 4, h);
+    // 几道更亮的横线 ＝ 年轮（0/1 与 h-2/h-1 是**块的边界**）
+    ctx.fillStyle = "rgba(255,255,255,1)";
+    for (const y of [0, 1, 21, 42, h - 2, h - 1]) ctx.fillRect(0, y, 4, 1);
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.needsUpdate = true;
+  return tex;
 }
 
 /**
- * 展开态：一圈**扁环带**，按那个月的天数切成 `cells` 格。
+ * 一块的**薄壳**几何：贴着树干的一段**锥台**（跟主干一样上细下粗），只是外扩一点点。
  *
- * ⭐ 每格的**顶点色**写进 color 属性 ⇒ 批次 2 只要改颜色就能"点亮某几天"。
- * ⚠️ 整条环带**合成一个几何体**（`cells` 格 × 2 三角形）——
- *    ⛔ 不是一格一个 `Mesh`（31 格 × 3 圈 ＝ 93 次绘制，老规矩：合并）。
- * ⚠️ 格与格之间留一道角向的缝，否则 30 格连成一圈、看不出"一格一格"。
+ * ⚠️ `CylinderGeometry(顶半径, 底半径, 高, …)` —— 参数顺序别写反（主干那边也栽过）。
+ * ⚠️ `openEnded = true`：不用封盖 —— 壳里面还包着树干，封了也看不见，白费一半三角形。
+ * ⚠️ 默认 UV 的 v 从底（0）到顶（1）⇒ 那张条纹贴图**竖着铺正好**（上下各一道边界线）。
  */
-function buildRingBand(cells: number, inner: number, outer: number): THREE.BufferGeometry {
-  const n = Math.max(1, Math.round(cells));
-  const pos: number[] = [];
-  const nor: number[] = [];
-  const col: number[] = [];
-  const step = (Math.PI * 2) / n;
-  const gap = step * 0.16;
-
-  for (let i = 0; i < n; i += 1) {
-    const a0 = i * step + gap / 2;
-    const a1 = (i + 1) * step - gap / 2;
-    const quad: [number, number, number][] = [
-      [Math.cos(a0) * inner, 0, Math.sin(a0) * inner],
-      [Math.cos(a0) * outer, 0, Math.sin(a0) * outer],
-      [Math.cos(a1) * outer, 0, Math.sin(a1) * outer],
-      [Math.cos(a1) * inner, 0, Math.sin(a1) * inner],
-    ];
-    // 两个三角形 ＝ 一格（顶点顺序 0-1-2 / 0-2-3）
-    for (const idx of [0, 1, 2, 0, 2, 3]) {
-      const p = quad[idx];
-      pos.push(p[0], p[1], p[2]);
-      nor.push(0, 1, 0);
-      col.push(1, 1, 1); // 先全白，随后由 `paintBand` 按格刷成实际颜色
-    }
-  }
-
-  const g = new THREE.BufferGeometry();
-  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
-  g.setAttribute("normal", new THREE.Float32BufferAttribute(nor, 3));
-  g.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
-  return g;
+function buildBlockShell(b: TrunkBlock): THREE.BufferGeometry {
+  return new THREE.CylinderGeometry(b.rTop, b.rBase, b.length, 20, 1, true);
 }
 
 /**
@@ -593,207 +599,162 @@ export function makeStage(tree: Tree, foliage: Foliage): TreeStage {
   patchWind(leafMat, wind);
   patchWind(blossomMat, wind);
 
-  // ── 年轮环（第二期 · 批次 1） ────────────────────────────────────
+  // ── 年轮块（第二期 · 修订版：树干上的三段） ──────────────────────
   /*
-   * ⭐ 口径（用户 2026-10-14 拍板）：
-   *   · 三圈**上下排开、一样大**，都套在主干上（位置由 `rings.ts` 纯函数算）；
-   *   · 平时是**三圈细环**（"看得见但含蓄" —— 界面上不写解释性小字，
-   *     唯一的提示就只剩"看得见"）；
-   *   · 点一下 ⇒ 那一圈**原地扩成一圈扁环带**（外径 2 倍），格数 ＝ 当月天数；
-   *   · 同时**只开一圈**；再点收回；点空白收回；点树干不反应。
+   * ⭐ 口径（用户 2026-10-14 两次拍板）：
+   *   · 点击区是**树干上的一段（一块）**，⛔ 不是环（第一版做错的就是这件）；
+   *   · 三块**上下排开、一样高、首尾相接**，位置由 `rings.ts` 纯函数算；
+   *   · 平时只是**极淡的一层薄壳 ＋ 几道年轮线**（"看得见但不突兀"）；
+   *   · 鼠标划过 ⇒ 那一块**提亮**；点一下 ⇒ 提亮更明显，并**弹侧边面板**；
+   *   · 同时**只开一块**；再点同一块收回；点树干别处 / 空白 ⇒ 收回。
    *
-   * ⚠️ **拾取不用细环本身**（太细，点不中），而是每圈配一个**看不见的粗圆柱**
-   *    当热区。这些圆柱只放进 `pickers` 这一个数组里单独检测，
-   *    ⛔ 不去 `intersectObjects(scene.children, true)` 翻全场景。
-   * ⚠️ 圆柱用的是**材质级** `visible = false`（对象本身仍是 visible）——
-   *    这样它不参与渲染，但射线照样打得中，不依赖 `Raycaster` 对 `visible` 的处理。
+   * ⭐ **薄壳自己就是射线热区** —— 不再需要第一版那种"看不见的粗圆柱"：
+   *    那时是因为细环太细、点不中；现在薄壳整段包住树干，点哪都中。
+   * ⚠️ 但仍然**只把这三块拿去 `intersectObjects`**，⛔ 不翻全场景。
    */
-  const ringGroup = new THREE.Group();
-  scene.add(ringGroup);
+  const blockGroup = new THREE.Group();
+  scene.add(blockGroup);
 
-  let rings: Ring[] = [];
-  let ringOpen: number | null = null;
-  let ringHover: number | null = null;
-  /** 每个环"哪几格亮着"。批次 1 全暗；批次 2 接上数据后才会有点亮的。 */
-  let ringLit: boolean[][] = [];
+  let blockActive: number | null = null;
+  let blockHover: number | null = null;
   /*
    * ⚠️ 颜色**读一次、缓存住** —— `getComputedStyle` 会强制一次样式计算，
    *    挂在 `pointermove`（每动一下就查一次）上会明显卡。
    *    换主题时由 `applyTheme()` 重读一遍。
    */
-  let ringColours = {
-    ring: new THREE.Color(),
-    hot: new THREE.Color(),
-    dim: new THREE.Color(),
-    lit: new THREE.Color(),
-  };
-  const ringMats: THREE.MeshBasicMaterial[] = [];
-  const torusMeshes: THREE.Mesh[] = [];
-  const bandMeshes: THREE.Mesh[] = [];
-  const pickers: THREE.Mesh[] = [];
-  const bandGeos: THREE.BufferGeometry[] = [];
-  let torusGeo: THREE.BufferGeometry | null = null;
-  let pickGeo: THREE.BufferGeometry | null = null;
+  let blockColours = { shell: new THREE.Color(), active: new THREE.Color() };
+  const blockMats: THREE.MeshBasicMaterial[] = [];
+  const blockMeshes: THREE.Mesh[] = [];
+  const blockGeos: THREE.BufferGeometry[] = [];
+  let blockTex: THREE.Texture | null = null;
 
   const ray = new THREE.Raycaster();
   const ndc = new THREE.Vector2();
-  const ringAxisUp = new THREE.Vector3(0, 1, 0);
-  const ringNormal = new THREE.Vector3();
-  /** 纯草稿纸（算热区高度用）—— ⛔ 别拿 `ringNormal` 凑合。 */
-  const ringScratch = new THREE.Vector3();
+  const blockAxisUp = new THREE.Vector3(0, 1, 0);
+  const blockNormal = new THREE.Vector3();
 
-  function readRingColours(): void {
-    ringColours = {
-      ring: new THREE.Color(readCss(RING_VARS.ring, RING_FALLBACK.ring)),
-      hot: new THREE.Color(readCss(RING_VARS.hot, RING_FALLBACK.hot)),
-      dim: new THREE.Color(readCss(RING_VARS.dim, RING_FALLBACK.dim)),
-      lit: new THREE.Color(readCss(RING_VARS.lit, RING_FALLBACK.lit)),
+  function readBlockColours(): void {
+    blockColours = {
+      shell: new THREE.Color(readCss(BLOCK_VARS.shell, BLOCK_FALLBACK.shell)),
+      active: new THREE.Color(readCss(BLOCK_VARS.active, BLOCK_FALLBACK.active)),
     };
   }
 
-  /** 把"哪几格亮着"刷进顶点颜色。 */
-  function paintBand(geo: THREE.BufferGeometry, lit: boolean[]): void {
-    const attr = geo.getAttribute("color") as THREE.BufferAttribute | undefined;
-    if (!attr) return;
-    const cells = Math.floor(attr.count / 6);
-    for (let i = 0; i < cells; i += 1) {
-      const c = lit[i] === true ? ringColours.lit : ringColours.dim;
-      for (let k = 0; k < 6; k += 1) attr.setXYZ(i * 6 + k, c.r, c.g, c.b);
-    }
-    attr.needsUpdate = true;
-  }
-
-  /** 按"开没开、悬没悬"把三圈的样子刷一遍。 */
-  function refreshRingLook(): void {
-    rings.forEach((_, i) => {
-      const mat = ringMats[i];
-      if (mat) {
-        const active = ringOpen === i || ringHover === i;
-        mat.color.copy(active ? ringColours.hot : ringColours.ring);
-      }
-      const band = bandMeshes[i];
-      if (band) band.visible = ringOpen === i;
+  /** 按"开没开、悬没悬"把三块的样子刷一遍（只改颜色与透明度，⛔ 不重建几何）。 */
+  function refreshBlockLook(): void {
+    blockMats.forEach((mat, i) => {
+      const on = blockActive === i;
+      mat.opacity = on
+        ? BLOCK_OPACITY.active
+        : blockHover === i
+          ? BLOCK_OPACITY.hover
+          : BLOCK_OPACITY.idle;
+      mat.color.copy(on ? blockColours.active : blockColours.shell);
     });
   }
 
-  function setRings(next: Ring[]): void {
+  function setBlocks(next: TrunkBlock[]): void {
     // ① 先把上一批拆干净（幂等 —— 重复调用不会越堆越多）
-    for (const m of torusMeshes) ringGroup.remove(m);
-    for (const m of bandMeshes) ringGroup.remove(m);
-    for (const m of pickers) ringGroup.remove(m);
-    torusMeshes.length = 0;
-    bandMeshes.length = 0;
-    pickers.length = 0;
-    ringMats.length = 0;
-    for (const g of bandGeos) g.dispose();
-    bandGeos.length = 0;
-    torusGeo?.dispose();
-    pickGeo?.dispose();
-    torusGeo = null;
-    pickGeo = null;
+    for (const m of blockMeshes) blockGroup.remove(m);
+    blockMeshes.length = 0;
+    blockMats.length = 0;
+    for (const g of blockGeos) g.dispose();
+    blockGeos.length = 0;
+    blockTex?.dispose();
+    blockTex = null;
 
-    rings = next;
-    ringOpen = null;
-    ringHover = null;
-    ringLit = next.map((r) => new Array<boolean>(Math.max(1, r.days)).fill(false));
+    blockActive = null;
+    blockHover = null;
     if (next.length === 0) return;
 
-    readRingColours();
+    readBlockColours();
+    // 一张条纹贴图**三块共用**（每块各自乘自己的颜色与透明度）
+    blockTex = keep(makeBlockTexture());
 
-    const radius = next[0].radius;
-    torusGeo = keep(buildRingTorus(radius));
-
-    // ② 平时态：三圈细环。⭐ 三圈**共用同一个几何体**（半径一样）。
-    next.forEach((r) => {
-      const mat = keep(new THREE.MeshBasicMaterial({ color: ringColours.ring.clone() }));
-      const mesh = new THREE.Mesh(torusGeo as THREE.BufferGeometry, mat);
-      mesh.position.set(r.center.x, r.center.y, r.center.z);
-      ringNormal.set(r.normal.x, r.normal.y, r.normal.z);
-      mesh.quaternion.setFromUnitVectors(ringAxisUp, ringNormal);
-      // 整个场景就几个物体，关掉视锥剔除少一类"明明在、就是没画出来"的怪事
-      mesh.frustumCulled = false;
-      ringGroup.add(mesh);
-      ringMats.push(mat);
-      torusMeshes.push(mesh);
-    });
-
-    // ③ 展开态：一圈扁环带（每格一个色块）—— 平时先藏着
-    next.forEach((r, i) => {
-      const geo = keep(buildRingBand(r.days, radius * RING_BAND_INNER, radius * RING_BAND_OUTER));
+    next.forEach((b) => {
+      const geo = keep(buildBlockShell(b));
       const mat = keep(
-        new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide })
+        new THREE.MeshBasicMaterial({
+          color: blockColours.shell.clone(),
+          map: blockTex,
+          transparent: true,
+          opacity: BLOCK_OPACITY.idle,
+          /*
+           * ⚠️ 透明薄壳**不写深度** —— 否则它会把后面那半圈树干挡掉，
+           *    看着就变成一圈"实心"的箍（第一版那个"突兀"有一部分就是这么来的）。
+           */
+          depthWrite: false,
+          side: THREE.DoubleSide,
+          /*
+           * ⚠️⚠️ **必须显式关掉"双面 ＋ 透明"的两遍渲染** —— 这是本批最值一提的坑。
+           *
+           * three.js 对**双面且透明**的材质默认画**两遍**（先背面、再正面，用来缓解
+           * 透明混色的顺序问题）。原文见 `node_modules/three/build/three.core.js`：
+           *   "The engine renders double-sided, transparent objects with **two draw calls**
+           *    (back faces first, then front faces)... set the `forceSinglePass` flag to
+           *    `true` to disable the two pass rendering to avoid performance issues."
+           *
+           * ⇒ 三块薄壳因此变成 **6 次绘制 / 240 个三角形**（本该 3 次 / 120 个）。
+           * ⭐ 是 `I3`（三角形逐个数得上）把这笔账抓出来的：几何算 120、账本上多 240，
+           *    而 `drawCalls` 只多 6 ⇒ 一块两次。**先量出来、再去源码里找为什么**，
+           *    ⛔ 绝不是把常数从 120 改成 240 了事（那就成了"数字全绿、东西不对"）。
+           *
+           * 这里关掉是**纯赚**：薄壳是套在树干外面的一层极淡的壳（透明度 0.13），
+           * 背／正面的先后对混色结果没有可见影响，却白烧一倍绘制。
+           */
+          forceSinglePass: true,
+        })
       );
       const mesh = new THREE.Mesh(geo, mat);
-      mesh.position.copy(torusMeshes[i].position);
-      mesh.quaternion.copy(torusMeshes[i].quaternion);
+      mesh.position.set(b.center.x, b.center.y, b.center.z);
+      blockNormal.set(b.normal.x, b.normal.y, b.normal.z);
+      mesh.quaternion.setFromUnitVectors(blockAxisUp, blockNormal);
+      /*
+       * ⚠️ **明确写死两件事**（都不靠默认值 —— 默认值改一次就悄悄失效）：
+       *   · `castShadow = false`：薄壳是**装饰性**的（透明度 0.13），
+       *     投影只会在树干／地面上压出一道谁也说不清的暗带；
+       *   · `receiveShadow = false`：它自己也不需要接阴影。
+       * ⚠️ 实测这两条**不是**"三块被画两遍"的原因（写死之后依然是 6 次绘制）——
+       *    真凶是材质那边"双面 ＋ 透明"的两遍渲染，见下面 `forceSinglePass` 那段。
+       *    留着它们是因为**本来就该这么写**，⛔ 不因为"改了也没用"就删掉。
+       */
+      mesh.castShadow = false;
+      mesh.receiveShadow = false;
+      // 整个场景就几个物体，关掉视锥剔除少一类"明明在、就是没画出来"的怪事
       mesh.frustumCulled = false;
-      mesh.visible = false;
-      ringGroup.add(mesh);
-      bandGeos.push(geo);
-      bandMeshes.push(mesh);
-      paintBand(geo, ringLit[i]);
+      blockGroup.add(mesh);
+      blockMeshes.push(mesh);
+      blockMats.push(mat);
+      blockGeos.push(geo);
     });
 
-    // ④ 热区：一个**看不见的粗圆柱**（环本身太细，直接当热区会点空）
-    const pickR = radius * RING_PICK_RADIUS;
+    refreshBlockLook();
+  }
+
+  function setBlockActive(index: number | null): void {
+    blockActive = index;
+    refreshBlockLook();
+  }
+
+  function setBlockHover(index: number | null): void {
+    if (blockHover === index) return; // 没变就不刷（`pointermove` 触发得很密）
+    blockHover = index;
+    refreshBlockLook();
+  }
+
+  function pickBlock(nx: number, ny: number): number | null {
+    if (blockMeshes.length === 0) return null;
     /*
-     * 热区**高度** ＝ 相邻两圈的间距 × 0.88。
-     * ⚠️ 必须 < 1 —— 到 1 时上下两个热区正好贴上，再大就会重叠
-     *    （现象：点哪一圈都开同一圈）。
-     * ⚠️ 用**独立的**临时向量算距离，⛔ 别借用 `ringNormal` —— 那个后面还有人读，
-     *    借来当草稿纸的话，下次改的人会以为它还是法线。
-     */
-    const gap =
-      next.length > 1
-        ? ringScratch
-            .set(
-              next[1].center.x - next[0].center.x,
-              next[1].center.y - next[0].center.y,
-              next[1].center.z - next[0].center.z
-            )
-            .length()
-        : radius * 2;
-    pickGeo = keep(
-      new THREE.CylinderGeometry(pickR, pickR, gap * RING_PICK_HEIGHT_RATIO, 16, 1, true)
-    );
-    // ⚠️ 材质级 `visible = false`：不渲染，但射线照样打得中（对象本身仍是 visible）。
-    const pickMat = keep(new THREE.MeshBasicMaterial({ visible: false }));
-    next.forEach((_, i) => {
-      const pick = new THREE.Mesh(pickGeo as THREE.BufferGeometry, pickMat);
-      pick.position.copy(torusMeshes[i].position);
-      pick.quaternion.copy(torusMeshes[i].quaternion);
-      pick.frustumCulled = false;
-      ringGroup.add(pick);
-      pickers.push(pick);
-    });
-
-    refreshRingLook();
-  }
-
-  function setRingOpen(index: number | null): void {
-    ringOpen = index;
-    refreshRingLook();
-  }
-
-  function setRingHover(index: number | null): void {
-    if (ringHover === index) return; // 没变就不刷（`pointermove` 触发得很密）
-    ringHover = index;
-    refreshRingLook();
-  }
-
-  function pickRing(nx: number, ny: number): number | null {
-    if (pickers.length === 0) return null;
-    /*
-     * ⚠️ 拾取前把世界矩阵刷到最新 —— 否则"刚摆好环、还没画第一帧"就去点，
+     * ⚠️ 拾取前把世界矩阵刷到最新 —— 否则"刚摆好块、还没画第一帧"就去点，
      *    矩阵还是上一次的，会整片点空。
      */
     camera.updateMatrixWorld();
-    for (const p of pickers) p.updateWorldMatrix(true, false);
+    for (const m of blockMeshes) m.updateWorldMatrix(true, false);
     ndc.set(nx, ny);
     ray.setFromCamera(ndc, camera);
-    const hits = ray.intersectObjects(pickers, false);
+    const hits = ray.intersectObjects(blockMeshes, false);
     if (hits.length === 0) return null;
-    const idx = pickers.indexOf(hits[0].object as THREE.Mesh);
+    const idx = blockMeshes.indexOf(hits[0].object as THREE.Mesh);
     return idx >= 0 ? idx : null;
   }
 
@@ -853,11 +814,10 @@ export function makeStage(tree: Tree, foliage: Foliage): TreeStage {
     const dc = palette.disc;
     discMat.color.set(dc);
 
-    // 年轮环：颜色也全从 CSS 变量来 ⇒ 换主题要重读一遍并重刷。
-    if (rings.length > 0) {
-      readRingColours();
-      bandGeos.forEach((g, i) => paintBand(g, ringLit[i]));
-      refreshRingLook();
+    // 年轮块：颜色也全从 CSS 变量来 ⇒ 换主题要重读一遍并重刷（⛔ 不重建几何）。
+    if (blockMeshes.length > 0) {
+      readBlockColours();
+      refreshBlockLook();
     }
   }
   applyTheme();
@@ -899,6 +859,20 @@ export function makeStage(tree: Tree, foliage: Foliage): TreeStage {
     wind.strength.value = WIND_AMPLITUDE * level;
   }
 
+  /** ⭐ 只给验收用 —— 见 `TreeStage` 上的说明。平时渲染路径不走这里。 */
+  function setBlocksVisible(visible: boolean): void {
+    blockGroup.visible = visible;
+  }
+
+  /** ⭐ 只给验收用 —— 三块薄壳的**纯几何**三角形数（量出来的，不是写死的）。 */
+  function blockTriangles(): number {
+    let n = 0;
+    for (const g of blockGeos) {
+      n += g.index ? g.index.count / 3 : g.attributes.position.count / 3;
+    }
+    return n;
+  }
+
   return {
     scene,
     camera,
@@ -906,10 +880,12 @@ export function makeStage(tree: Tree, foliage: Foliage): TreeStage {
     applyTheme,
     setTime,
     setWind,
-    setRings,
-    setRingOpen,
-    setRingHover,
-    pickRing,
+    setBlocks,
+    setBlockActive,
+    setBlockHover,
+    pickBlock,
+    setBlocksVisible,
+    blockTriangles,
     dispose,
   };
 }

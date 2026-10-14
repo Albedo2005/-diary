@@ -10,6 +10,17 @@
  * ⛔ **第一期不许读日记数据、不许发任何后端命令** —— 树不接数据（花多花少跟数据无关）。
  * ⛔ **颜色一律从 CSS 变量取**；系统切主题时 `applyTheme()` 会把贴图重画一遍。
  *
+ * ── ⭐ 第二期（点树出年轮）＋ 2026-10-14 17:37 的**修订** ─────────────
+ * 用户拍板要"点树看这个月的写作数据"。**点击区 ＝ 树干上的一段（一块）**，
+ * 点中之后**从右侧滑出一块面板**画"圆环数据图 ＋ 当月统计 ＋ 当月篇目"。
+ * ⚠️⚠️ 第一版把点击区做成了**套在主干上的三圈可见细环**（点开原地抽成环带），
+ *    用户当场纠正："**有一个圈感觉很突兀**"、"点击区域为一个块"。
+ *    ⇒ 环几何整段拆掉，改成"贴着树皮的极淡薄壳"（见 `scene.ts` 那一节）。
+ *
+ * ⚠️ **接数据这一层就放在这里**（`listMonth`）：它是唯一"知道现在是哪个月"的地方。
+ *    面板本身（`TreeMonthPanel.vue`）是**纯展示**，⛔ 它不发命令。
+ * ⚠️ 面板一开一关会改变画布宽窄 ⇒ 交给 `ResizeObserver` 重新取景，⛔ 不手动算。
+ *
  * ── ⭐ 纪律六条（指令 §五-4，**都在这儿落实**） ──────────────────────
  * | # | 规矩 | 落点 |
  * |---|---|---|
@@ -27,13 +38,23 @@
  *    它要一直留到第一期验收做完（它证明不了好看，但"切走真的停了""关了就真不动了"
  *    这几条纪律**只能靠它机器验**）。见文件末尾那段注释。
  */
-import { onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import * as THREE from "three";
 
+import { listMonth, type EntrySummary } from "../api/index.ts";
 import { growTree } from "../tree/grow.ts";
 import { growFoliage } from "../tree/foliage.ts";
 import { makeStage, type TreeStage } from "../tree/scene.ts";
-import { ringLayout, seasonMonths, type Ring } from "../tree/rings.ts";
+import {
+  BLOCK_HALF,
+  monthCells,
+  monthSummary,
+  seasonMonths,
+  trunkBlocks,
+  type TrunkBlock,
+} from "../tree/rings.ts";
+import { todayKey } from "../utils/date.ts";
+import TreeMonthPanel from "./TreeMonthPanel.vue";
 
 const props = defineProps<{
   /**
@@ -96,35 +117,66 @@ type StageHook = {
   /** 渲染一帧的耗时（毫秒，滚动平均）—— 验"帧时间在预算内"。 */
   frameMs: number;
 
-  /* ── 第二期 · 年轮环 ─────────────────────────────────────────────
-   * ⭐ 为什么要全放进钩子：这一期验的是**看得见的东西**（三圈在不在主干上、
-   *    一样不一样大、点一下开不开）。光靠"看图觉得像"判不了，得能从真实
+  /* ── 第二期 · 年轮块（树干上的三段） ───────────────────────────────
+   * ⭐ 为什么要全放进钩子：这一期验的是**看得见的东西**（三块在不在主干上、
+   *    一样不一样高、点一下面板开不开）。光靠"看图觉得像"判不了，得能从真实
    *    DOM 里读数断言。⛔ 这些字段只读不改。
    */
-  /** 三圈的条数（应当永远是 3）。 */
-  ringCount: number;
-  /** 三圈各自的半径 —— 验"一样大"。 */
-  ringRadii: number[];
-  /** 三圈的世界坐标（环心）—— 验"套在主干上"。 */
-  ringPositions: { x: number; y: number; z: number }[];
+  /** 三块的条数（应当永远是 3）。 */
+  blockCount: number;
+  /** 三块各自的**块心**比例（应当 0.15 / 0.4 / 0.65）—— 验"上下排开"。 */
+  blockFracs: number[];
+  /** 三块各自的世界坐标（块心）—— 验"套在主干上"。 */
+  blockPositions: { x: number; y: number; z: number }[];
+  /** 三块各自的高度 —— 验"三块一样高"（相邻间距一半 ⇒ 首尾相接不留缝）。 */
+  blockLengths: number[];
+  /** 三块薄壳的**纯几何**三角形数（＝ Σ `index.count / 3`）。 */
+  blockTriGeom: number;
   /**
-   * 三圈**各自在屏幕上的中心点**（页面 CSS 像素）。
+   * ⭐⭐ "藏起三块"前后各渲染一帧的三角形数。
+   * `blockTriOn − blockTriOff` ＝ 三块在**渲染器账本**上真正占的 ——
+   * ⛔ 不是把几何算出来的 120 写死，**是量出来的**（两者对不上就是线索）。
+   */
+  blockTriOn: number;
+  blockTriOff: number;
+  /** 同上的**绘制次数**：`On − Off` ＝ 三块一共画了几次（3 ＝ 每块一次）。 */
+  blockDrawOn: number;
+  blockDrawOff: number;
+  /**
+   * 三块**各自在屏幕上的中心点**（页面 CSS 像素）。
    * ⚠️ 验收脚本要按它在画布上**真的派发一次指针事件** —— 没有这个，
    *    就只能靠猜坐标，等于验了个寂寞。
    */
-  ringScreen: { x: number; y: number }[];
-  /** 三圈各是几月。 */
-  ringMonths: number[];
-  /** 三圈各有多少格（＝那个月的实际天数）。 */
-  ringDays: number[];
-  /** 现在开着哪一圈（`null` ＝ 全收回）。 */
-  ringOpen: number | null;
-  /** 鼠标现在悬在哪一圈上（`null` ＝ 没悬停）。 */
-  ringHover: number | null;
+  blockScreen: { x: number; y: number }[];
+  /**
+   * ⭐ 三块薄壳的上/下口半径 **与**该处主干半径。
+   * 判据是 **壳 > 主干**（批次 1 栽过："取平均"会让最低那圈整个陷进树皮里，
+   * 而且**当时所有断言都是绿的**）。两个数都放进来，脚本才能自己比。
+   */
+  blockShells: { rBase: number; rTop: number; trunkRBase: number; trunkRTop: number }[];
+  /** 三块各是几月。 */
+  blockMonths: number[];
+  /** 三块各有多少格（＝那个月的实际天数）。 */
+  blockDays: number[];
+  /** 现在开着哪一块（`null` ＝ 都收着）。 */
+  blockActive: number | null;
+  /** 鼠标现在悬在哪一块上（`null` ＝ 没悬停）。 */
+  blockHover: number | null;
   /** 拾取**命中**过多少次 —— 证明"指针事件真的接上了"，而不是个死场景。 */
-  ringPickHits: number;
-  /** 这个季度是哪三个月（`["2026-09","2026-10","2026-11"]`）—— 批次 2 接数据要用。 */
-  ringMonthKeys: string[];
+  blockPickHits: number;
+  /** 这个季度是哪三个月（`["2026-09","2026-10","2026-11"]`）。 */
+  blockMonthKeys: string[];
+  /* ── 面板（点开之后右侧那一块） ──────────────────────────────── */
+  /** 面板现在开着没有。 */
+  panelOpen: boolean;
+  /** 面板显示的是哪个月 `"YYYY-MM"`。 */
+  panelMonthKey: string;
+  /** 面板那张圆环图有几格（＝当月天数，验"格数按实际天数"）。 */
+  panelCellCount: number;
+  /** 圆环图里有几格是亮的（＝这个月写过几天）。 */
+  panelLitCount: number;
+  /** 面板读到几条日记（`-1` ＝ 还没读到）。 */
+  panelEntryCount: number;
 };
 
 const hookHost = window as unknown as { __treeStage?: StageHook };
@@ -148,6 +200,115 @@ let frameMs = 0;
 let frameCount = 0;
 /** 卸载时要摘掉的监听（`onMounted` 里装配，`onBeforeUnmount` 里执行）。 */
 let cleanup: (() => void) | null = null;
+/**
+ * "停着的时候补画一帧"。
+ * ⚠️ 面板那套逻辑在 `onMounted` **外面**（模板要用它），所以只能先占个位，
+ *    等 `onMounted` 里把真函数装上去。⛔ 别在这里写业务。
+ */
+let repaintIfStill: () => void = () => {};
+
+// ── 面板（第二期 · 点树干弹出右侧数据） ──────────────────────────────
+/*
+ * ⚠️ 这一坨**故意放在 `onMounted` 外面**：模板要直接读 `panelIndex` / `panelCells`
+ *    并调 `openBlock` / `shiftPanel`，写在里面模板够不着。
+ *    它们跟 3D 的关系只有两条：① `stage.setBlockActive()`；② 停着时补画一帧。
+ */
+const panelIndex = ref<number | null>(null);
+const panelEntries = ref<EntrySummary[] | null>(null);
+const panelLoading = ref(false);
+/**
+ * 这个季度是哪三个月 —— `onMounted` 里算好填进来（要 `new Date()`）。
+ *
+ * ⚠️⚠️ 用 `shallowRef` 而**不是** `ref`：`ref([])` 的 `.value` 拿到的是 Vue 的
+ *    **响应式 Proxy**，塞进 `hook` 之后（验收脚本是通过 CDP 把它序列化出去的）
+ *    会**变成一个 `{0:…,1:…,2:…}` 的普通对象**，`Array.isArray` 直接是 false ——
+ *    脚本里 `keys.map(...)` 当场炸掉（第二期修订版第一次跑就是这么红的）。
+ *    这个数组挂载后**再没被改过**，深层响应式一点用都没有，故而浅层就够。
+ */
+const monthKeys = shallowRef<string[]>([]);
+/** 每个月只读一次（在面板里左右翻来翻去不该反复打后端）。 */
+const monthCache = new Map<string, EntrySummary[]>();
+/** 防"翻太快"：只有最后一次请求的结果才作数。 */
+let panelToken = 0;
+
+const panelMonthKey = computed(() =>
+  panelIndex.value === null ? "" : monthKeys.value[panelIndex.value] ?? ""
+);
+const panelCells = computed(() => monthCells(panelMonthKey.value, panelEntries.value ?? []));
+const panelSummary = computed(() => monthSummary(panelEntries.value ?? []));
+const today = todayKey();
+
+/** 把钩子里那四个面板字段同步一下（验收脚本只读钩子）。 */
+function syncPanelHook(): void {
+  const h = hookHost.__treeStage;
+  if (!h) return;
+  h.panelOpen = panelIndex.value !== null;
+  h.panelMonthKey = panelMonthKey.value;
+  h.panelCellCount = panelCells.value.length;
+  h.panelLitCount = panelCells.value.filter((c) => c.lit).length;
+  h.panelEntryCount = panelEntries.value ? panelEntries.value.length : -1;
+}
+
+/** 读某个月的日记。⚠️ 读过就缓存；翻太快时只有最后一次作数。 */
+async function loadMonth(key: string): Promise<void> {
+  if (!key) return;
+  const cached = monthCache.get(key);
+  if (cached) {
+    // ⚠️ 缓存命中也必须先判"现在还停在那一块上吗" —— 否则会拿旧月份的数据刷屏。
+    if (key !== panelMonthKey.value) return;
+    panelEntries.value = cached;
+    panelLoading.value = false;
+    syncPanelHook();
+    return;
+  }
+  const token = ++panelToken;
+  panelEntries.value = null;
+  panelLoading.value = true;
+  syncPanelHook();
+  try {
+    const list = await listMonth(key);
+    monthCache.set(key, list);
+    // 已经翻到别的月份了 ⇒ 这次结果作废（否则会"点得慢的那次覆盖快的"）
+    if (token !== panelToken || key !== panelMonthKey.value) return;
+    panelEntries.value = list;
+  } catch {
+    // ⚠️ 读不到不算"坏了"：面板照常显示空（⛔ 不白屏、不弹错）
+    if (token !== panelToken || key !== panelMonthKey.value) return;
+    panelEntries.value = [];
+  } finally {
+    if (token === panelToken) {
+      panelLoading.value = false;
+      syncPanelHook();
+    }
+  }
+}
+
+/**
+ * 打开 / 收回面板。
+ * @param i `null` ＝ 收回；否则 ＝ 打开第 i 块（0 ＝ 最下面那块）。
+ */
+function openBlock(i: number | null): void {
+  panelIndex.value = i;
+  const h = hookHost.__treeStage;
+  if (h) h.blockActive = i;
+  stage?.setBlockActive(i);
+  if (i === null) {
+    panelEntries.value = null;
+    panelLoading.value = false;
+  } else {
+    void loadMonth(monthKeys.value[i] ?? "");
+  }
+  syncPanelHook();
+  repaintIfStill(); // 停着的时候得补一帧，否则"提亮"看不见
+}
+
+/** 点左右箭头：`-1` 上一个月 / `+1` 下一个月（到两头就不动）。 */
+function shiftPanel(delta: number): void {
+  const cur = panelIndex.value;
+  if (cur === null) return;
+  const next = Math.min(monthKeys.value.length - 1, Math.max(0, cur + delta));
+  if (next !== cur) openBlock(next);
+}
 
 onMounted(() => {
   const el = host.value;
@@ -158,19 +319,20 @@ onMounted(() => {
   stage = makeStage(tree, foliage);
 
   /*
-   * ⭐ 第二期：把年轮环摆到主干上。
-   *   · **一棵树 ＝ 一个自然季**（今天 10 月 ⇒ 秋 **9 / 10 / 11** 三圈）；
+   * ⭐ 第二期（修订版）：把**年轮块**摆到主干上。
+   *   · **一棵树 ＝ 一个自然季**（今天 10 月 ⇒ 秋 **9 / 10 / 11** 三块）；
+   *   · 一块 ＝ 一个月；块心 15% / 40% / 65%（避开三层侧枝着生的 25/50/75）；
    *   · 位置由 `rings.ts` 的纯函数算 —— 主干长度在 `grow.ts` 里带 ±5% 抖动，
    *     ⛔ 不能写死坐标；
-   *   · ⚠️ 这一批（批次 1）**还没接数据**，环里全是暗格 —— 点亮是批次 2 的事。
+   *   · ⚠️ 平时**不画圈**，只是三段极淡的薄壳（用户 2026-10-14 纠正过）。
    */
   const now = new Date();
-  const ringMonthKeys = seasonMonths(now.getFullYear(), now.getMonth() + 1);
+  monthKeys.value = seasonMonths(now.getFullYear(), now.getMonth() + 1);
   const trunk = tree.branches.find((b) => b.depth === 0);
-  const rings: Ring[] = trunk
-    ? ringLayout(trunk.from, trunk.to, trunk.r0, trunk.r1, ringMonthKeys)
+  const blocks: TrunkBlock[] = trunk
+    ? trunkBlocks(trunk.from, trunk.to, trunk.r0, trunk.r1, monthKeys.value)
     : [];
-  stage.setRings(rings);
+  stage.setBlocks(blocks);
 
   let maxSide = 0;
   for (const b of tree.branches) maxSide = Math.max(maxSide, Math.abs(b.to.x), Math.abs(b.to.z));
@@ -227,19 +389,44 @@ onMounted(() => {
     reducedMotion: false,
     hidden: false,
     frameMs: 0,
-    // ── 第二期 · 年轮环 ──
-    ringCount: rings.length,
-    ringRadii: rings.map((r) => r.radius),
-    ringPositions: rings.map((r) => ({ x: r.center.x, y: r.center.y, z: r.center.z })),
-    ringScreen: [],
-    ringMonths: rings.map((r) => r.month),
-    ringDays: rings.map((r) => r.days),
-    ringOpen: null,
-    ringHover: null,
-    ringPickHits: 0,
-    ringMonthKeys,
+    // ── 第二期 · 年轮块 ──
+    blockCount: blocks.length,
+    blockFracs: blocks.map((b) => b.frac),
+    blockPositions: blocks.map((b) => ({ x: b.center.x, y: b.center.y, z: b.center.z })),
+    blockLengths: blocks.map((b) => b.length),
+    blockTriGeom: 0,
+    blockTriOn: 0,
+    blockTriOff: 0,
+    blockDrawOn: 0,
+    blockDrawOff: 0,
+    blockScreen: [],
+    blockShells: blocks.map((b) => {
+      // ⚠️ 该处主干半径按**线性**插值算 —— 跟 `CylinderGeometry` 的锥面同一个口径。
+      const r0 = trunk ? trunk.r0 : 0;
+      const r1 = trunk ? trunk.r1 : 0;
+      const at = (f: number): number => r0 + (r1 - r0) * f;
+      return {
+        rBase: b.rBase,
+        rTop: b.rTop,
+        trunkRBase: at(b.frac - BLOCK_HALF),
+        trunkRTop: at(b.frac + BLOCK_HALF),
+      };
+    }),
+    blockMonths: blocks.map((b) => b.month),
+    blockDays: blocks.map((b) => b.days),
+    blockActive: null,
+    blockHover: null,
+    blockPickHits: 0,
+    blockMonthKeys: [...monthKeys.value],
+    // ── 面板 ──
+    panelOpen: false,
+    panelMonthKey: "",
+    panelCellCount: 0,
+    panelLitCount: 0,
+    panelEntryCount: -1,
   };
   hookHost.__treeStage = hook;
+  syncPanelHook();
 
   renderer = new THREE.WebGLRenderer({ antialias: true });
   /*
@@ -256,14 +443,14 @@ onMounted(() => {
   el.appendChild(canvas);
 
   /**
-   * 把三圈的**环心**投到屏幕上（页面 CSS 像素），写进钩子。
+   * 把三块的**块心**投到屏幕上（页面 CSS 像素），写进钩子。
    *
    * ⭐ 这是给**自动验收**用的：脚本拿到这个点，就能在画布上**真的派发一次
    *    指针事件** —— 而不是靠猜坐标（猜坐标等于没验）。
-   * ⚠️ 只在 `resize()` 之后更新：它要 `getBoundingClientRect()`，每帧调会拖帧
-   *    （跟环的颜色同一个道理）。
+   * ⚠️ 只在 `resize()` 之后更新：它要 `getBoundingClientRect()`，每帧调会拖帧；
+   *    ⚠️ 而且**面板一开一关画布宽窄就变**，所以必须挂在 `resize()` 这条路上。
    */
-  function updateRingScreen(): void {
+  function updateBlockScreen(): void {
     const st = stage;
     const cv = renderer?.domElement;
     if (!st || !cv) return;
@@ -271,8 +458,8 @@ onMounted(() => {
     if (rect.width <= 0 || rect.height <= 0) return;
     st.camera.updateMatrixWorld();
     const p = new THREE.Vector3();
-    hook.ringScreen = rings.map((r) => {
-      p.set(r.center.x, r.center.y, r.center.z).project(st.camera);
+    hook.blockScreen = blocks.map((b) => {
+      p.set(b.center.x, b.center.y, b.center.z).project(st.camera);
       return {
         x: rect.left + ((p.x + 1) / 2) * rect.width,
         y: rect.top + ((1 - p.y) / 2) * rect.height,
@@ -345,6 +532,8 @@ onMounted(() => {
     if (looping) return; // 动画循环在跑，它下一帧自己会画
     renderNow();
   }
+  // 把真函数交给外面那套面板逻辑（它在 `onMounted` 外面，见文件前头的说明）。
+  repaintIfStill = paintIfStill;
 
   /** 画布尺寸 → 渲染器 + 相机取景。⭐ "全屏时等比例放大"就发生在这一条路上。 */
   function resize(): void {
@@ -373,8 +562,8 @@ onMounted(() => {
     hook.backingW = canvas.width;
     hook.backingH = canvas.height;
     hook.pixelRatio = renderer.getPixelRatio();
-    // 三圈的屏幕位置也跟着尺寸变 —— 验收脚本要靠它定位。
-    updateRingScreen();
+    // 三块的屏幕位置也跟着尺寸变 —— ⚠️ 面板开合也会走到这里（画布变窄了）。
+    updateBlockScreen();
     // 尺寸刚变的那一下先画出来，免得拖窗口时看到一格旧画面。
     renderNow();
   }
@@ -429,11 +618,40 @@ onMounted(() => {
   syncLoop();
 
   /*
-   * ── 第二期 · 指针（点树出年轮） ────────────────────────────────────
+   * ⭐⭐ 一次性"逐个数"（第二期修订版新增）。
+   *
+   * 为什么要有它：`I3`（"多出来的三角形逐个数得上"）是这一套里**最灵的一把尺子** ——
+   * 批次 1 那三圈细环就是被它当场抓出来的（多出 2,304，正好 ＝ 3 × 6 × 64 × 2）。
+   * 这一版把环换成三段薄壳，若只写"几何算出来是 3 × 20 × 2 ＝ 120"，那是**推的**。
+   * ⇒ 这里真的把三块**藏起来再渲染一帧**，拿差值量它们到底占了多少：
+   *   · `blockTriGeom` ＝ 纯几何（`index.count / 3`）；
+   *   · `blockTriOn − blockTriOff` ＝ 渲染器账本上的数（含阴影通道等一切）。
+   * ⚠️ **两个数都报出来**。它们对不上就说明"有别的东西也在画" —— 那正是要找的线索；
+   *    只报一个、再把常数凑上去，就又是"数字全绿、东西不对"。
+   * ⚠️ 只在这里跑一次，⛔ 不进每帧路径。
+   */
+  {
+    const triOn = renderer ? renderer.info.render.triangles : 0;
+    const drawOn = renderer ? renderer.info.render.calls : 0;
+    stage.setBlocksVisible(false);
+    renderer?.render(stage.scene, stage.camera);
+    const triOff = renderer ? renderer.info.render.triangles : 0;
+    const drawOff = renderer ? renderer.info.render.calls : 0;
+    stage.setBlocksVisible(true);
+    renderer?.render(stage.scene, stage.camera);
+    hook.blockTriGeom = stage.blockTriangles();
+    hook.blockTriOn = triOn;
+    hook.blockTriOff = triOff;
+    hook.blockDrawOn = drawOn;
+    hook.blockDrawOff = drawOff;
+  }
+
+  /*
+   * ── 第二期 · 指针（点树干上的块） ─────────────────────────────────
    * ⚠️ 归一化坐标一律用 `getBoundingClientRect()` 换算 —— ⛔ 不用
    *    `canvas.width/height`（那是**背衬**尺寸，差一个屏密度倍率；第一期栽过）。
-   * ⚠️ 要区分**点击**和**拖拽**：位移超过几个像素就当作拖拽、不触发展开
-   *    （不然以后加了转视角，一拖动就把年轮点开了）。
+   * ⚠️ 要区分**点击**和**拖拽**：位移超过几个像素就当作拖拽、不触发打开
+   *    （不然以后加了转视角，一拖动就把面板点开了）。
    */
   const DRAG_PX = 8;
   let pointerDown: { x: number; y: number } | null = null;
@@ -453,10 +671,10 @@ onMounted(() => {
     if (!stage) return;
     const at = toNdc(ev);
     if (!at) return;
-    const hit = stage.pickRing(at.nx, at.ny);
-    hook.ringHover = hit;
-    if (hit !== null) hook.ringPickHits += 1;
-    stage.setRingHover(hit);
+    const hit = stage.pickBlock(at.nx, at.ny);
+    hook.blockHover = hit;
+    if (hit !== null) hook.blockPickHits += 1;
+    stage.setBlockHover(hit);
     // ⚠️ 光标只改在**画布**上（改容器会把整个组件的鼠标样式一起改了）
     canvas.style.cursor = hit === null ? "" : "pointer";
     paintIfStill(); // 停着的时候得补一帧，否则"亮起来"看不见
@@ -474,26 +692,23 @@ onMounted(() => {
     if (Math.hypot(ev.clientX - down.x, ev.clientY - down.y) > DRAG_PX) return;
     const at = toNdc(ev);
     if (!at) return;
-    const hit = stage.pickRing(at.nx, at.ny);
-    if (hit !== null) hook.ringPickHits += 1;
+    const hit = stage.pickBlock(at.nx, at.ny);
+    if (hit !== null) hook.blockPickHits += 1;
     /*
-     * ⭐ 点击口径（第二期指令 B 段）：
-     *   · 点空白（含树干）⇒ 全收回；
-     *   · 点某一圈 ⇒ 开那一圈；**再点同一圈 ⇒ 收回**；点另一圈 ⇒ 换成那一圈；
-     *   · ⚠️ 同时**只开一圈**。
+     * ⭐ 点击口径（第二期修订指令 §4.3）：
+     *   · 点**空白 / 树干别处**（没命中任何一块）⇒ 面板收回；
+     *   · 点某一块 ⇒ 打开那一块；**再点同一块 ⇒ 收回**；点另一块 ⇒ 换成那一块；
+     *   · ⚠️ 同时**只开一块**。
      */
-    const open = hook.ringOpen;
-    const next = hit === null ? null : open === hit ? null : hit;
-    hook.ringOpen = next;
-    stage.setRingOpen(next);
-    paintIfStill(); // 同上：停着的时候得补一帧
+    const cur = hook.blockActive;
+    openBlock(hit === null ? null : cur === hit ? null : hit);
   }
 
-  /** 鼠标离开画布 ⇒ 只是不再"悬停"，⛔ 不收回已经点开的那一圈。 */
+  /** 鼠标离开画布 ⇒ 只是不再"悬停"，⛔ 不收回已经打开的面板。 */
   function onPointerLeave(): void {
     pointerDown = null;
-    hook.ringHover = null;
-    stage?.setRingHover(null);
+    hook.blockHover = null;
+    stage?.setBlockHover(null);
     canvas.style.cursor = "";
     paintIfStill(); // 停着的时候得补一帧，否则"提亮"会留在画面上
   }
@@ -543,7 +758,27 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div ref="host" class="tree-stage" role="img" aria-label="树语：一棵会随风轻摆的树"></div>
+  <!--
+    ⚠️ 外层是个 **flex 行**：左边画布、右边面板。
+    面板出现时**画布真的变窄**（不是压在树上）—— `ResizeObserver` 会看到，
+    相机重新取景，树自动缩到左边那块里，⛔ 不用手动算任何尺寸。
+  -->
+  <div class="tree-wrap">
+    <div ref="host" class="tree-stage" role="img" aria-label="树语：一棵会随风轻摆的树"></div>
+    <TreeMonthPanel
+      v-if="panelIndex !== null"
+      :month-key="panelMonthKey"
+      :index="panelIndex"
+      :count="monthKeys.length"
+      :cells="panelCells"
+      :summary="panelSummary"
+      :entries="panelEntries"
+      :loading="panelLoading"
+      :today="today"
+      @close="openBlock(null)"
+      @shift="shiftPanel"
+    />
+  </div>
 </template>
 
 <style scoped>
@@ -554,8 +789,18 @@ onBeforeUnmount(() => {
      `.stats-wrap--tree`）决定，本组件只负责铺满它。
   ⛔ 别在这儿写死高度：写死了，"全屏时等比放大"就断在这一层了。
 */
-.tree-stage {
+.tree-wrap {
   width: 100%;
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+}
+
+.tree-stage {
+  /* ⭐ 面板一开，画布**让出宽度**（`flex: 1` 会自己缩）—— 树因此不会被挡住。 */
+  flex: 1 1 auto;
+  min-width: 0;
   height: 100%;
   min-height: 0;
   border-radius: 10px;
