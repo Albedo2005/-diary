@@ -25,6 +25,14 @@ import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
 import type { Tree } from "./grow.ts";
 import type { Foliage, FoliageInstance } from "./foliage.ts";
 import {
+  RING_BAND_INNER,
+  RING_BAND_OUTER,
+  RING_PICK_HEIGHT_RATIO,
+  RING_PICK_RADIUS,
+  RING_TUBE_RATIO,
+  type Ring,
+} from "./rings.ts";
+import {
   makeBarkTexture,
   makeBlossomTexture,
   makeGroundTexture,
@@ -67,6 +75,23 @@ export type TreeStage = {
   setTime(seconds: number): void;
   /** 风的大小（1 ＝ 默认的"轻轻摆"）。第五期做天气时会用到。 */
   setWind(level: number): void;
+  /**
+   * 第二期：把年轮环摆到主干上（`rings.ts` 算好位置，这里只管画）。
+   * ⚠️ 幂等 —— 重复调用会先把上一批拆干净，不会越堆越多。
+   */
+  setRings(rings: Ring[]): void;
+  /** 展开某一圈（`null` ＝ 全收回）。⭐ 同时只会有一圈是开的。 */
+  setRingOpen(index: number | null): void;
+  /** 鼠标现在悬在哪一圈上（`null` ＝ 没悬停）。 */
+  setRingHover(index: number | null): void;
+  /**
+   * 屏幕**归一化设备坐标**（NDC：-1~1，画布中心是 0,0，左上角是 -1,+1）
+   * → 命中第几圈（没命中 ＝ `null`）。
+   *
+   * ⚠️ NDC 必须用 `getBoundingClientRect()` 换算，⛔ 不用 `canvas.width/height`
+   *    （那是**背衬**尺寸，差一个屏密度倍率，第一期在这儿栽过）。
+   */
+  pickRing(nx: number, ny: number): number | null;
   dispose(): void;
 };
 
@@ -287,6 +312,100 @@ function paintInstances(
   if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
 }
 
+// ---------------------------------------------------------------------------
+// 年轮环（第二期 · 批次 1）
+// ---------------------------------------------------------------------------
+
+/*
+ * ⚠️ 环的颜色**复用已有的树色变量，不新增 CSS 变量** ——
+ *    这一批只许动 4 个文件（`rings.ts` / `rings.test.ts` / `scene.ts` / `TreePane.vue`），
+ *    `styles/global.css` 不在名单里。
+ *
+ * ⚠️⚠️ **第一次跑完截图之后改过一版**：原来平时态用的是 `--tree-bark-dark`
+ *    （"比树皮深一档"，看着最含蓄）—— 结果**在深色主题下整个看不见**：
+ *    树干本身就差不多是这个色，细环（管径不到 2 像素）压上去等于没画。
+ *    而用户定过"界面上不写解释性小字"⇒ **唯一的提示就只剩"看得见"**，
+ *    看不见 ＝ 这个功能等于不存在。
+ *    ⇒ 改成用**浅黄**（跟花同色系）：两种主题下树皮都是棕色，
+ *      浅黄压上去对比明显，但因为是"细箍"所以并不抢眼。
+ */
+const RING_VARS = {
+  /** 平时那一圈细环 —— ⭐ 必须跟树皮**明显不同色**，否则等于没画（见上）。 */
+  ring: "--tree-blossom",
+  /** 悬停 / 展开时的细环（"亮起来"）—— 接近白的暖白，跟浅黄能分辨。 */
+  hot: "--tree-sun",
+  /** 展开环带里"没写过"的格子（暗底）。 */
+  dim: "--tree-bark-dark",
+  /** 展开环带里"写过"的格子（批次 2 接上数据才会用上）。 */
+  lit: "--tree-blossom",
+} as const;
+
+/** CSS 变量取不到时的兜底色（⛔ 不许让 undefined 进 three）。 */
+const RING_FALLBACK = {
+  ring: "#ffe9a3",
+  hot: "#fff3e0",
+  dim: "#4f4235",
+  lit: "#ffe9a3",
+} as const;
+
+/** 从 CSS 变量读一个颜色；读不到就用兜底。 */
+function readCss(name: string, fallback: string): string {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
+}
+
+/**
+ * 平时态：一圈**细环**（像一道箍贴在树皮上）。
+ * ⚠️ 圆环默认躺在 XY 平面（法线 +Z）⇒ 这里先转成**法线 +Y**，
+ *    好让细环与环带**共用同一套朝向口径**（都按 "+Y → 主干方向" 摆）。
+ */
+function buildRingTorus(radius: number): THREE.BufferGeometry {
+  const g = new THREE.TorusGeometry(radius, radius * RING_TUBE_RATIO, 6, 64);
+  g.rotateX(-Math.PI / 2);
+  return g;
+}
+
+/**
+ * 展开态：一圈**扁环带**，按那个月的天数切成 `cells` 格。
+ *
+ * ⭐ 每格的**顶点色**写进 color 属性 ⇒ 批次 2 只要改颜色就能"点亮某几天"。
+ * ⚠️ 整条环带**合成一个几何体**（`cells` 格 × 2 三角形）——
+ *    ⛔ 不是一格一个 `Mesh`（31 格 × 3 圈 ＝ 93 次绘制，老规矩：合并）。
+ * ⚠️ 格与格之间留一道角向的缝，否则 30 格连成一圈、看不出"一格一格"。
+ */
+function buildRingBand(cells: number, inner: number, outer: number): THREE.BufferGeometry {
+  const n = Math.max(1, Math.round(cells));
+  const pos: number[] = [];
+  const nor: number[] = [];
+  const col: number[] = [];
+  const step = (Math.PI * 2) / n;
+  const gap = step * 0.16;
+
+  for (let i = 0; i < n; i += 1) {
+    const a0 = i * step + gap / 2;
+    const a1 = (i + 1) * step - gap / 2;
+    const quad: [number, number, number][] = [
+      [Math.cos(a0) * inner, 0, Math.sin(a0) * inner],
+      [Math.cos(a0) * outer, 0, Math.sin(a0) * outer],
+      [Math.cos(a1) * outer, 0, Math.sin(a1) * outer],
+      [Math.cos(a1) * inner, 0, Math.sin(a1) * inner],
+    ];
+    // 两个三角形 ＝ 一格（顶点顺序 0-1-2 / 0-2-3）
+    for (const idx of [0, 1, 2, 0, 2, 3]) {
+      const p = quad[idx];
+      pos.push(p[0], p[1], p[2]);
+      nor.push(0, 1, 0);
+      col.push(1, 1, 1); // 先全白，随后由 `paintBand` 按格刷成实际颜色
+    }
+  }
+
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute("normal", new THREE.Float32BufferAttribute(nor, 3));
+  g.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
+  return g;
+}
+
 /**
  * 搭台子。
  *
@@ -474,6 +593,210 @@ export function makeStage(tree: Tree, foliage: Foliage): TreeStage {
   patchWind(leafMat, wind);
   patchWind(blossomMat, wind);
 
+  // ── 年轮环（第二期 · 批次 1） ────────────────────────────────────
+  /*
+   * ⭐ 口径（用户 2026-10-14 拍板）：
+   *   · 三圈**上下排开、一样大**，都套在主干上（位置由 `rings.ts` 纯函数算）；
+   *   · 平时是**三圈细环**（"看得见但含蓄" —— 界面上不写解释性小字，
+   *     唯一的提示就只剩"看得见"）；
+   *   · 点一下 ⇒ 那一圈**原地扩成一圈扁环带**（外径 2 倍），格数 ＝ 当月天数；
+   *   · 同时**只开一圈**；再点收回；点空白收回；点树干不反应。
+   *
+   * ⚠️ **拾取不用细环本身**（太细，点不中），而是每圈配一个**看不见的粗圆柱**
+   *    当热区。这些圆柱只放进 `pickers` 这一个数组里单独检测，
+   *    ⛔ 不去 `intersectObjects(scene.children, true)` 翻全场景。
+   * ⚠️ 圆柱用的是**材质级** `visible = false`（对象本身仍是 visible）——
+   *    这样它不参与渲染，但射线照样打得中，不依赖 `Raycaster` 对 `visible` 的处理。
+   */
+  const ringGroup = new THREE.Group();
+  scene.add(ringGroup);
+
+  let rings: Ring[] = [];
+  let ringOpen: number | null = null;
+  let ringHover: number | null = null;
+  /** 每个环"哪几格亮着"。批次 1 全暗；批次 2 接上数据后才会有点亮的。 */
+  let ringLit: boolean[][] = [];
+  /*
+   * ⚠️ 颜色**读一次、缓存住** —— `getComputedStyle` 会强制一次样式计算，
+   *    挂在 `pointermove`（每动一下就查一次）上会明显卡。
+   *    换主题时由 `applyTheme()` 重读一遍。
+   */
+  let ringColours = {
+    ring: new THREE.Color(),
+    hot: new THREE.Color(),
+    dim: new THREE.Color(),
+    lit: new THREE.Color(),
+  };
+  const ringMats: THREE.MeshBasicMaterial[] = [];
+  const torusMeshes: THREE.Mesh[] = [];
+  const bandMeshes: THREE.Mesh[] = [];
+  const pickers: THREE.Mesh[] = [];
+  const bandGeos: THREE.BufferGeometry[] = [];
+  let torusGeo: THREE.BufferGeometry | null = null;
+  let pickGeo: THREE.BufferGeometry | null = null;
+
+  const ray = new THREE.Raycaster();
+  const ndc = new THREE.Vector2();
+  const ringAxisUp = new THREE.Vector3(0, 1, 0);
+  const ringNormal = new THREE.Vector3();
+  /** 纯草稿纸（算热区高度用）—— ⛔ 别拿 `ringNormal` 凑合。 */
+  const ringScratch = new THREE.Vector3();
+
+  function readRingColours(): void {
+    ringColours = {
+      ring: new THREE.Color(readCss(RING_VARS.ring, RING_FALLBACK.ring)),
+      hot: new THREE.Color(readCss(RING_VARS.hot, RING_FALLBACK.hot)),
+      dim: new THREE.Color(readCss(RING_VARS.dim, RING_FALLBACK.dim)),
+      lit: new THREE.Color(readCss(RING_VARS.lit, RING_FALLBACK.lit)),
+    };
+  }
+
+  /** 把"哪几格亮着"刷进顶点颜色。 */
+  function paintBand(geo: THREE.BufferGeometry, lit: boolean[]): void {
+    const attr = geo.getAttribute("color") as THREE.BufferAttribute | undefined;
+    if (!attr) return;
+    const cells = Math.floor(attr.count / 6);
+    for (let i = 0; i < cells; i += 1) {
+      const c = lit[i] === true ? ringColours.lit : ringColours.dim;
+      for (let k = 0; k < 6; k += 1) attr.setXYZ(i * 6 + k, c.r, c.g, c.b);
+    }
+    attr.needsUpdate = true;
+  }
+
+  /** 按"开没开、悬没悬"把三圈的样子刷一遍。 */
+  function refreshRingLook(): void {
+    rings.forEach((_, i) => {
+      const mat = ringMats[i];
+      if (mat) {
+        const active = ringOpen === i || ringHover === i;
+        mat.color.copy(active ? ringColours.hot : ringColours.ring);
+      }
+      const band = bandMeshes[i];
+      if (band) band.visible = ringOpen === i;
+    });
+  }
+
+  function setRings(next: Ring[]): void {
+    // ① 先把上一批拆干净（幂等 —— 重复调用不会越堆越多）
+    for (const m of torusMeshes) ringGroup.remove(m);
+    for (const m of bandMeshes) ringGroup.remove(m);
+    for (const m of pickers) ringGroup.remove(m);
+    torusMeshes.length = 0;
+    bandMeshes.length = 0;
+    pickers.length = 0;
+    ringMats.length = 0;
+    for (const g of bandGeos) g.dispose();
+    bandGeos.length = 0;
+    torusGeo?.dispose();
+    pickGeo?.dispose();
+    torusGeo = null;
+    pickGeo = null;
+
+    rings = next;
+    ringOpen = null;
+    ringHover = null;
+    ringLit = next.map((r) => new Array<boolean>(Math.max(1, r.days)).fill(false));
+    if (next.length === 0) return;
+
+    readRingColours();
+
+    const radius = next[0].radius;
+    torusGeo = keep(buildRingTorus(radius));
+
+    // ② 平时态：三圈细环。⭐ 三圈**共用同一个几何体**（半径一样）。
+    next.forEach((r) => {
+      const mat = keep(new THREE.MeshBasicMaterial({ color: ringColours.ring.clone() }));
+      const mesh = new THREE.Mesh(torusGeo as THREE.BufferGeometry, mat);
+      mesh.position.set(r.center.x, r.center.y, r.center.z);
+      ringNormal.set(r.normal.x, r.normal.y, r.normal.z);
+      mesh.quaternion.setFromUnitVectors(ringAxisUp, ringNormal);
+      // 整个场景就几个物体，关掉视锥剔除少一类"明明在、就是没画出来"的怪事
+      mesh.frustumCulled = false;
+      ringGroup.add(mesh);
+      ringMats.push(mat);
+      torusMeshes.push(mesh);
+    });
+
+    // ③ 展开态：一圈扁环带（每格一个色块）—— 平时先藏着
+    next.forEach((r, i) => {
+      const geo = keep(buildRingBand(r.days, radius * RING_BAND_INNER, radius * RING_BAND_OUTER));
+      const mat = keep(
+        new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide })
+      );
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.copy(torusMeshes[i].position);
+      mesh.quaternion.copy(torusMeshes[i].quaternion);
+      mesh.frustumCulled = false;
+      mesh.visible = false;
+      ringGroup.add(mesh);
+      bandGeos.push(geo);
+      bandMeshes.push(mesh);
+      paintBand(geo, ringLit[i]);
+    });
+
+    // ④ 热区：一个**看不见的粗圆柱**（环本身太细，直接当热区会点空）
+    const pickR = radius * RING_PICK_RADIUS;
+    /*
+     * 热区**高度** ＝ 相邻两圈的间距 × 0.88。
+     * ⚠️ 必须 < 1 —— 到 1 时上下两个热区正好贴上，再大就会重叠
+     *    （现象：点哪一圈都开同一圈）。
+     * ⚠️ 用**独立的**临时向量算距离，⛔ 别借用 `ringNormal` —— 那个后面还有人读，
+     *    借来当草稿纸的话，下次改的人会以为它还是法线。
+     */
+    const gap =
+      next.length > 1
+        ? ringScratch
+            .set(
+              next[1].center.x - next[0].center.x,
+              next[1].center.y - next[0].center.y,
+              next[1].center.z - next[0].center.z
+            )
+            .length()
+        : radius * 2;
+    pickGeo = keep(
+      new THREE.CylinderGeometry(pickR, pickR, gap * RING_PICK_HEIGHT_RATIO, 16, 1, true)
+    );
+    // ⚠️ 材质级 `visible = false`：不渲染，但射线照样打得中（对象本身仍是 visible）。
+    const pickMat = keep(new THREE.MeshBasicMaterial({ visible: false }));
+    next.forEach((_, i) => {
+      const pick = new THREE.Mesh(pickGeo as THREE.BufferGeometry, pickMat);
+      pick.position.copy(torusMeshes[i].position);
+      pick.quaternion.copy(torusMeshes[i].quaternion);
+      pick.frustumCulled = false;
+      ringGroup.add(pick);
+      pickers.push(pick);
+    });
+
+    refreshRingLook();
+  }
+
+  function setRingOpen(index: number | null): void {
+    ringOpen = index;
+    refreshRingLook();
+  }
+
+  function setRingHover(index: number | null): void {
+    if (ringHover === index) return; // 没变就不刷（`pointermove` 触发得很密）
+    ringHover = index;
+    refreshRingLook();
+  }
+
+  function pickRing(nx: number, ny: number): number | null {
+    if (pickers.length === 0) return null;
+    /*
+     * ⚠️ 拾取前把世界矩阵刷到最新 —— 否则"刚摆好环、还没画第一帧"就去点，
+     *    矩阵还是上一次的，会整片点空。
+     */
+    camera.updateMatrixWorld();
+    for (const p of pickers) p.updateWorldMatrix(true, false);
+    ndc.set(nx, ny);
+    ray.setFromCamera(ndc, camera);
+    const hits = ray.intersectObjects(pickers, false);
+    if (hits.length === 0) return null;
+    const idx = pickers.indexOf(hits[0].object as THREE.Mesh);
+    return idx >= 0 ? idx : null;
+  }
+
   // ── 取景 ────────────────────────────────────────────────────────
   const aimY = tree.height * AIM_RATIO;
   const crown = crownWidth(tree);
@@ -529,6 +852,13 @@ export function makeStage(tree: Tree, foliage: Foliage): TreeStage {
 
     const dc = palette.disc;
     discMat.color.set(dc);
+
+    // 年轮环：颜色也全从 CSS 变量来 ⇒ 换主题要重读一遍并重刷。
+    if (rings.length > 0) {
+      readRingColours();
+      bandGeos.forEach((g, i) => paintBand(g, ringLit[i]));
+      refreshRingLook();
+    }
   }
   applyTheme();
 
@@ -569,5 +899,17 @@ export function makeStage(tree: Tree, foliage: Foliage): TreeStage {
     wind.strength.value = WIND_AMPLITUDE * level;
   }
 
-  return { scene, camera, fit, applyTheme, setTime, setWind, dispose };
+  return {
+    scene,
+    camera,
+    fit,
+    applyTheme,
+    setTime,
+    setWind,
+    setRings,
+    setRingOpen,
+    setRingHover,
+    pickRing,
+    dispose,
+  };
 }

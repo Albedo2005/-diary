@@ -33,6 +33,7 @@ import * as THREE from "three";
 import { growTree } from "../tree/grow.ts";
 import { growFoliage } from "../tree/foliage.ts";
 import { makeStage, type TreeStage } from "../tree/scene.ts";
+import { ringLayout, seasonMonths, type Ring } from "../tree/rings.ts";
 
 const props = defineProps<{
   /**
@@ -94,6 +95,36 @@ type StageHook = {
   hidden: boolean;
   /** 渲染一帧的耗时（毫秒，滚动平均）—— 验"帧时间在预算内"。 */
   frameMs: number;
+
+  /* ── 第二期 · 年轮环 ─────────────────────────────────────────────
+   * ⭐ 为什么要全放进钩子：这一期验的是**看得见的东西**（三圈在不在主干上、
+   *    一样不一样大、点一下开不开）。光靠"看图觉得像"判不了，得能从真实
+   *    DOM 里读数断言。⛔ 这些字段只读不改。
+   */
+  /** 三圈的条数（应当永远是 3）。 */
+  ringCount: number;
+  /** 三圈各自的半径 —— 验"一样大"。 */
+  ringRadii: number[];
+  /** 三圈的世界坐标（环心）—— 验"套在主干上"。 */
+  ringPositions: { x: number; y: number; z: number }[];
+  /**
+   * 三圈**各自在屏幕上的中心点**（页面 CSS 像素）。
+   * ⚠️ 验收脚本要按它在画布上**真的派发一次指针事件** —— 没有这个，
+   *    就只能靠猜坐标，等于验了个寂寞。
+   */
+  ringScreen: { x: number; y: number }[];
+  /** 三圈各是几月。 */
+  ringMonths: number[];
+  /** 三圈各有多少格（＝那个月的实际天数）。 */
+  ringDays: number[];
+  /** 现在开着哪一圈（`null` ＝ 全收回）。 */
+  ringOpen: number | null;
+  /** 鼠标现在悬在哪一圈上（`null` ＝ 没悬停）。 */
+  ringHover: number | null;
+  /** 拾取**命中**过多少次 —— 证明"指针事件真的接上了"，而不是个死场景。 */
+  ringPickHits: number;
+  /** 这个季度是哪三个月（`["2026-09","2026-10","2026-11"]`）—— 批次 2 接数据要用。 */
+  ringMonthKeys: string[];
 };
 
 const hookHost = window as unknown as { __treeStage?: StageHook };
@@ -125,6 +156,21 @@ onMounted(() => {
   const tree = growTree({ seed: SEED });
   const foliage = growFoliage(tree, { seed: SEED });
   stage = makeStage(tree, foliage);
+
+  /*
+   * ⭐ 第二期：把年轮环摆到主干上。
+   *   · **一棵树 ＝ 一个自然季**（今天 10 月 ⇒ 秋 **9 / 10 / 11** 三圈）；
+   *   · 位置由 `rings.ts` 的纯函数算 —— 主干长度在 `grow.ts` 里带 ±5% 抖动，
+   *     ⛔ 不能写死坐标；
+   *   · ⚠️ 这一批（批次 1）**还没接数据**，环里全是暗格 —— 点亮是批次 2 的事。
+   */
+  const now = new Date();
+  const ringMonthKeys = seasonMonths(now.getFullYear(), now.getMonth() + 1);
+  const trunk = tree.branches.find((b) => b.depth === 0);
+  const rings: Ring[] = trunk
+    ? ringLayout(trunk.from, trunk.to, trunk.r0, trunk.r1, ringMonthKeys)
+    : [];
+  stage.setRings(rings);
 
   let maxSide = 0;
   for (const b of tree.branches) maxSide = Math.max(maxSide, Math.abs(b.to.x), Math.abs(b.to.z));
@@ -181,6 +227,17 @@ onMounted(() => {
     reducedMotion: false,
     hidden: false,
     frameMs: 0,
+    // ── 第二期 · 年轮环 ──
+    ringCount: rings.length,
+    ringRadii: rings.map((r) => r.radius),
+    ringPositions: rings.map((r) => ({ x: r.center.x, y: r.center.y, z: r.center.z })),
+    ringScreen: [],
+    ringMonths: rings.map((r) => r.month),
+    ringDays: rings.map((r) => r.days),
+    ringOpen: null,
+    ringHover: null,
+    ringPickHits: 0,
+    ringMonthKeys,
   };
   hookHost.__treeStage = hook;
 
@@ -197,6 +254,31 @@ onMounted(() => {
   const canvas = renderer.domElement;
   canvas.style.display = "block";
   el.appendChild(canvas);
+
+  /**
+   * 把三圈的**环心**投到屏幕上（页面 CSS 像素），写进钩子。
+   *
+   * ⭐ 这是给**自动验收**用的：脚本拿到这个点，就能在画布上**真的派发一次
+   *    指针事件** —— 而不是靠猜坐标（猜坐标等于没验）。
+   * ⚠️ 只在 `resize()` 之后更新：它要 `getBoundingClientRect()`，每帧调会拖帧
+   *    （跟环的颜色同一个道理）。
+   */
+  function updateRingScreen(): void {
+    const st = stage;
+    const cv = renderer?.domElement;
+    if (!st || !cv) return;
+    const rect = cv.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    st.camera.updateMatrixWorld();
+    const p = new THREE.Vector3();
+    hook.ringScreen = rings.map((r) => {
+      p.set(r.center.x, r.center.y, r.center.z).project(st.camera);
+      return {
+        x: rect.left + ((p.x + 1) / 2) * rect.width,
+        y: rect.top + ((1 - p.y) / 2) * rect.height,
+      };
+    });
+  }
 
   /** 画一帧，并把它记进账（帧数＋耗时＋三角形数）。 */
   function renderNow(): void {
@@ -250,6 +332,20 @@ onMounted(() => {
     renderNow();
   }
 
+  /**
+   * 年轮环的状态刚变了一下 —— 如果现在**是停着的**，必须补画一帧。
+   *
+   * ⚠️ 停着的原因有三种（系统「减弱动态效果」／设置页那个开关关了／切到别的 tab），
+   *    那时**没有任何东西在画**。不补这一帧，用户点半天画面纹丝不动 ——
+   *    看着就像"点不动"，功能其实是对的。
+   * ⚠️ 这也是验收脚本 M14 能成立的前提：静止态下比"点开前 / 点开后"两张像素，
+   *    画面必须真的变（否则那条会红，而且红得莫名其妙）。
+   */
+  function paintIfStill(): void {
+    if (looping) return; // 动画循环在跑，它下一帧自己会画
+    renderNow();
+  }
+
   /** 画布尺寸 → 渲染器 + 相机取景。⭐ "全屏时等比例放大"就发生在这一条路上。 */
   function resize(): void {
     const box = host.value;
@@ -277,6 +373,8 @@ onMounted(() => {
     hook.backingW = canvas.width;
     hook.backingH = canvas.height;
     hook.pixelRatio = renderer.getPixelRatio();
+    // 三圈的屏幕位置也跟着尺寸变 —— 验收脚本要靠它定位。
+    updateRingScreen();
     // 尺寸刚变的那一下先画出来，免得拖窗口时看到一格旧画面。
     renderNow();
   }
@@ -330,8 +428,89 @@ onMounted(() => {
   hook.motionPref = props.motion;
   syncLoop();
 
+  /*
+   * ── 第二期 · 指针（点树出年轮） ────────────────────────────────────
+   * ⚠️ 归一化坐标一律用 `getBoundingClientRect()` 换算 —— ⛔ 不用
+   *    `canvas.width/height`（那是**背衬**尺寸，差一个屏密度倍率；第一期栽过）。
+   * ⚠️ 要区分**点击**和**拖拽**：位移超过几个像素就当作拖拽、不触发展开
+   *    （不然以后加了转视角，一拖动就把年轮点开了）。
+   */
+  const DRAG_PX = 8;
+  let pointerDown: { x: number; y: number } | null = null;
+
+  function toNdc(ev: PointerEvent): { nx: number; ny: number } | null {
+    const el = renderer?.domElement;
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    return {
+      nx: ((ev.clientX - rect.left) / rect.width) * 2 - 1,
+      ny: -((ev.clientY - rect.top) / rect.height) * 2 + 1,
+    };
+  }
+
+  function onPointerMove(ev: PointerEvent): void {
+    if (!stage) return;
+    const at = toNdc(ev);
+    if (!at) return;
+    const hit = stage.pickRing(at.nx, at.ny);
+    hook.ringHover = hit;
+    if (hit !== null) hook.ringPickHits += 1;
+    stage.setRingHover(hit);
+    // ⚠️ 光标只改在**画布**上（改容器会把整个组件的鼠标样式一起改了）
+    canvas.style.cursor = hit === null ? "" : "pointer";
+    paintIfStill(); // 停着的时候得补一帧，否则"亮起来"看不见
+  }
+
+  function onPointerDown(ev: PointerEvent): void {
+    pointerDown = { x: ev.clientX, y: ev.clientY };
+  }
+
+  function onPointerUp(ev: PointerEvent): void {
+    const down = pointerDown;
+    pointerDown = null;
+    if (!down || !stage) return;
+    // ⚠️ 位移 > 8px ⇒ 当作拖拽，不算点击（见上面那条说明）
+    if (Math.hypot(ev.clientX - down.x, ev.clientY - down.y) > DRAG_PX) return;
+    const at = toNdc(ev);
+    if (!at) return;
+    const hit = stage.pickRing(at.nx, at.ny);
+    if (hit !== null) hook.ringPickHits += 1;
+    /*
+     * ⭐ 点击口径（第二期指令 B 段）：
+     *   · 点空白（含树干）⇒ 全收回；
+     *   · 点某一圈 ⇒ 开那一圈；**再点同一圈 ⇒ 收回**；点另一圈 ⇒ 换成那一圈；
+     *   · ⚠️ 同时**只开一圈**。
+     */
+    const open = hook.ringOpen;
+    const next = hit === null ? null : open === hit ? null : hit;
+    hook.ringOpen = next;
+    stage.setRingOpen(next);
+    paintIfStill(); // 同上：停着的时候得补一帧
+  }
+
+  /** 鼠标离开画布 ⇒ 只是不再"悬停"，⛔ 不收回已经点开的那一圈。 */
+  function onPointerLeave(): void {
+    pointerDown = null;
+    hook.ringHover = null;
+    stage?.setRingHover(null);
+    canvas.style.cursor = "";
+    paintIfStill(); // 停着的时候得补一帧，否则"提亮"会留在画面上
+  }
+
+  canvas.addEventListener("pointermove", onPointerMove);
+  canvas.addEventListener("pointerdown", onPointerDown);
+  canvas.addEventListener("pointerup", onPointerUp);
+  canvas.addEventListener("pointerleave", onPointerLeave);
+  canvas.addEventListener("pointercancel", onPointerLeave);
+
   cleanup = () => {
     document.removeEventListener("visibilitychange", onVisibility);
+    canvas.removeEventListener("pointermove", onPointerMove);
+    canvas.removeEventListener("pointerdown", onPointerDown);
+    canvas.removeEventListener("pointerup", onPointerUp);
+    canvas.removeEventListener("pointerleave", onPointerLeave);
+    canvas.removeEventListener("pointercancel", onPointerLeave);
     reduceCleanup?.();
     themeCleanup?.();
   };
